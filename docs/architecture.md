@@ -1,0 +1,1228 @@
+# AiTodos 架构设计基线
+
+- 状态：Draft，ADR-0001 至 ADR-0007 已接受；Topic/Task 讨论、Task Workspace 与本地 Release Tag 已实现，Plan/Context/Run 主体扩展尚未同步
+- Go module：`github.com/light-speak/aitodos`
+- 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
+- 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
+
+## 1. 目标与非目标
+
+AiTodos 的核心不是复刻 Jira，而是为本地 Coding Agent 提供一个可审计、可恢复、隔离执行的工作流：
+
+```text
+Topic Discussion
++ Versioned Plan
++ Searchable Decisions
++ Task Kanban / State Machine
++ Human Review
++ Agent Scheduler
++ Agent Runtime
++ Git Workspace
++ Local Release / Annotated Tag
+```
+
+系统必须始终能够回答：
+
+- 某个需求当前在讨论、待澄清、方案审批还是执行阶段。
+- 当前批准的是哪个 Plan Revision，Task 为什么被这样拆分。
+- 哪些 Decision 仍然有效，哪些设定已经被替代。
+- 某个 Task 当前是否正在执行。
+- 哪个 Runner 正在执行哪个 Run。
+- 当前是 Task 的第几轮 AI 执行。
+- 一个新 Agent Session 如何在有界 Token 内恢复必要上下文。
+- 最近一次执行停在哪个阶段、为什么失败。
+- Workspace 当前是否可信、是否被污染。
+- 某个 Release 对应哪个不可变 Commit，以及本地 annotated tag 是否创建成功。
+- 当前状态是否允许安全重试。
+
+MVP 不考虑多租户、RBAC、团队协作、任意自定义工作流、SaaS、自动 push 和自动合并主分支。Topic、Plan、Label、关系和搜索只服务于 Agent Workflow，不扩展成通用 Jira 替代品。
+
+## 2. 核心架构
+
+```text
+Project-local React Web UI
+    │ REST commands / SSE events
+    ▼
+Project-local Go Control Plane
+├── Topic / Plan / Task / Review API
+├── Domain State Machines / Decision Log
+├── Scheduler
+├── Recovery Manager
+├── Workspace Manager
+├── Agent Profile Manager
+├── Context Builder / Search Projection
+├── Project-local MCP Read Server
+└── Artifact Index
+    │
+    ├── .ats/state.db (SQLite WAL)
+    ├── .ats/artifacts
+    └── spawn
+         ▼
+Per-Run Go Runner
+├── Lease heartbeat
+├── Agent Adapter
+├── Process group / timeout / cancel
+├── stdout / stderr / event capture
+├── Git snapshot and policy check
+└── Idempotent finalization
+         │
+         ▼
+Codex / other Agent CLI
+```
+
+Control Plane 管理当前项目的业务状态和调度，不直接持有长时间运行的 Agent stdout/stderr 管道。每个 Run 启动一个独立 Runner 进程，一个活跃 Runner 占用一个 Worker 并发槽。不同项目分别执行 `ats start`，在各自保持开启的终端中以前台方式运行，拥有不同 Daemon、SQLite、端口和 Worker 配额，互不发现、互不控制。关闭启动终端或按 `Ctrl+C` 时，对应项目 Daemon 退出。
+
+项目服务的前台生命周期决策见 [ADR-0005](adr/0005-foreground-only-project-daemon.md)，固定端口和显式打开浏览器决策见 [ADR-0006](adr/0006-stable-local-port-and-explicit-browser-open.md)。`ats start` 不自动打开浏览器；`.ats/local.toml` 的 `server.port` 可以固定当前项目端口，`0` 表示随机端口，命令行 `--port` 仅作单次覆盖。
+
+Runner 与 Control Plane 使用同一个 Go module 和二进制：
+
+```text
+ats start
+ats runner --run-id <id>
+```
+
+Claim token 不放入命令行参数，避免出现在进程列表中。Control Plane 通过继承 pipe 向 Runner 传递一次性启动凭据；Runner 启动后使用数据库中的 fencing token 完成心跳和状态更新。
+
+## 3. 模块边界
+
+### Control Plane
+
+负责：
+
+- 当前 Project 配置、Topic、Plan、Task、Message、Decision、Clarification 和 Review 的命令与查询。
+- Topic、Plan 和 Task 状态机校验。
+- Agent Profile Revision、职责默认值和权限策略。
+- Search Projection、Context Builder 和项目级只读 MCP。
+- Run 排队、并发配额和公平调度。
+- Runner 启动与取消请求。
+- 启动恢复和周期性对账。
+- REST API、SSE 事件和 UI 静态资源。
+
+不负责：
+
+- 解析具体 Agent CLI 输出。
+- 直接修改 Task worktree 中的业务代码。
+- 长期持有 Agent CLI 的进程管道。
+
+### Runner
+
+负责一个 Run 的完整执行：
+
+- 获取并续租 Workspace Lease 和 Run Lease。
+- 校验 Workspace、Branch、HEAD 和 Git 操作状态。
+- 调用 Agent Adapter 构造进程。
+- 管理进程组、超时、取消和强制终止。
+- 持续写入 stdout、stderr 和规范化事件。
+- 采集最终消息、Usage、Git Diff、Commit 和文件变化。
+- 使用 claim token 和 lease generation 幂等完成 Run。
+
+### Scheduler
+
+Scheduler 只创建执行决策，不执行 Agent。它必须同时满足：
+
+```text
+Project 剩余并发 > 0
+Run 业务主体没有其他活跃 Run
+需要写代码的 Task Run 拥有可用 Workspace
+Run 状态为 QUEUED
+```
+
+PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。当前项目内按优先级和排队时间排序。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
+
+### Workspace Manager
+
+负责所有 Git worktree 生命周期操作和仓库级互斥。普通代码编辑可在不同 worktree 并发；`worktree add/remove/repair/prune` 等共享 Git 管理数据的操作必须按规范化后的 `gitCommonDir` 串行化。
+
+### Artifact Store
+
+日志、大 Diff、上下文和最终消息存入当前项目的 `.ats/artifacts`。SQLite 仅保存 Artifact 元数据、索引和校验值，避免日志流导致数据库长期写锁。
+
+用户在 Markdown 输入框粘贴的图片也作为不可变 Artifact 保存。原图用于人工全屏查看和审计；最长边不超过 2000 px 的优化版本用于紧凑预览和后续 Agent Context。Markdown 只保存 `artifact://<id>` 稳定引用，不保存 Base64、绝对路径或临时 URL。默认 Context 只装入当前内容明确引用的优化版本，其他图片按需读取。
+
+## 4. Domain Model
+
+```text
+Project
+├── Topic
+│   ├── Thread / Message
+│   ├── Clarification
+│   ├── Decision
+│   ├── Plan / immutable Revision
+│   ├── Planning Run / Agent Session
+│   └── derived Task
+├── Task
+│   ├── Thread / Message
+│   ├── Clarification / Decision
+│   ├── Workspace / Task Branch
+│   ├── Implementation / Revision / Review Run
+│   ├── ReviewDecision
+│   └── TaskEvent
+├── Label
+├── Release / annotated Git Tag
+└── Search Projection
+
+AgentProfile
+├── immutable Revision
+├── Purpose / prompt template
+├── Adapter / Model / arguments
+├── Context / Workspace / Approval policy
+└── Environment / Proxy / Provider policy
+```
+
+### Project
+
+一个执行过 `ats init` 的本地 Git 仓库，保存默认分支、各 Run purpose 的默认 Agent Profile、默认模型、并发限制、环境变量引用、项目说明和文件策略。每个 Project 自己持有 `.ats/state.db`，不存在全局业务数据库或项目注册表。
+
+Project 的仓库身份不能只依赖用户输入路径。初始化和启动时解析：
+
+- `repoPath`：用户看到的路径。
+- `canonicalRepoPath`：规范化绝对路径。
+- `gitCommonDir`：Git 共享管理目录。
+- `projectInstanceId`：保存在项目本地数据库中的本机实例标识。
+
+### Topic
+
+代表需要持续讨论、澄清和规划的问题。Topic 可以经历多轮 Planning Run 和多个 Plan Revision，不获得 Git Workspace。Topic 的 Message 是历史事实，当前约束由有效 Decision、开放 Clarification 和批准 Plan 表达。
+
+### Plan
+
+代表 Topic 下的版本化拆分方案。Revision 不可原地覆盖；Planner 只能创建草案，用户批准后才原子生成正式 Task、来源关系和审计事件。
+
+### Task
+
+代表边界明确、可执行和可验收的工作。Task 可以直接创建，也可以从批准的 Plan 或其他 Task 派生。Task 不保存独立的“Agent 是否运行中”布尔值，该信息从活跃 Run 派生，避免双写不一致。
+
+### Thread、Clarification 与 Decision
+
+Topic 和 Task 可以拥有 Thread。Clarification 表示 Agent 等待用户回答的明确问题；Decision 表示当前有效、可被替代或撤销的结论。普通 Message 不自动获得 Project Instructions 或 Decision 的指令优先级。
+
+### Label 与关系
+
+Label 是 Project 内可自定义的人类分类，只用于展示、搜索、筛选和分组。Task 关系限制为 `DERIVED_FROM`、`PARENT_OF`、`BLOCKS`、`RELATES_TO` 和 `SUPERSEDES`；关系不自动改变调度，除非存在显式策略。
+
+### Workspace
+
+一个 Task 默认拥有一个长期 worktree 和一个 Task Branch。Task 被驳回后，新 Run 继续使用同一 Workspace；需要全新尝试时，由用户显式创建新 Workspace 或新 Task。
+
+### Release
+
+代表 Project 仓库中的一个 SemVer 发布事实。Release 固定保存规范版本、`v<semver>` Tag、来源本地分支和解析后的不可变 Commit SHA；来源分支只用于审计，分支后续移动不会改变 Release。创建 Release 会在本地创建 annotated tag，但不会 push、merge 或自动提交 Workspace 修改。
+
+### Run
+
+一次独立 AI CLI 执行。Run purpose 为 `PLANNING`、`IMPLEMENTATION`、`REVISION` 或 `REVIEW`，并通过受外键和 CHECK 约束的字段绑定恰好一个 Topic 或 Task。Run 从排队开始形成完整审计记录。Run 创建后，其 Agent Profile Revision、Model、Prompt、Context、环境配置、Workspace 和执行策略快照不可变。
+
+### AgentSession
+
+AgentSession 可以在同一 Topic 或 Task 的多个 Run 之间复用，但不是事实来源。Profile Prompt、Model 或关键 Project Instructions 不兼容变化时默认创建新 Session；Resume 不可用时从持久数据重建 Context。
+
+### ReviewDecision
+
+记录 ACCEPTED 或 REJECTED，以及评论和关联 Run。驳回不是永久终态；它让 Task 进入 `CHANGES_REQUESTED`。
+
+### Event
+
+状态表保存当前状态，事件表保存发生过什么。事件用于审计和 UI 时间线，但 MVP 不采用纯 Event Sourcing；当前状态仍由事务表直接维护。
+
+## 5. 核心不变量
+
+1. 一个 Task 同一时刻最多存在一个活跃 Run。
+2. 一个 Workspace 同一时刻最多被一个 Run Lease 持有。
+3. Agent 永远不能在 Project 的主 Working Tree 中运行。
+4. Run 配置创建后不可变，只允许追加事件和最终结果。
+5. `SUCCEEDED` Run 不等于 `ACCEPTED` Task。
+6. 所有状态迁移通过领域命令执行，API 不接受任意状态字符串覆盖。
+7. 所有 Runner 写操作必须携带当前 claim token 和 lease generation。
+8. 系统不自动 push；MVP 不自动 merge 到目标分支。
+9. Dirty Workspace 不得被自动强制删除或重置。
+10. 无法证明安全的重试必须进入人工处理，而不是自动重复执行。
+11. 一个 Topic 同一时刻最多有一个活跃 PLANNING Run。
+12. Plan Revision、Agent Profile Revision 和 Run Snapshot 创建后不可原地修改。
+13. Planner 只能提出 Plan 和 Task 草案；未经批准不得创建并执行正式 Task。
+14. Label 不得隐式改变权限、Agent、状态或调度。
+15. Agent Session、Summary 和 Search Projection 都不是事实来源，必须能够从规范数据恢复。
+16. Release 创建后不得改绑其他 Branch、Commit 或 Task 集合；同名 Git Tag 必须是指向同一 Commit 的 annotated tag。
+17. 领域对象的 `version` 只用于乐观锁，不作为产品 Release 版本展示。
+
+## 6. 数据模型
+
+每个项目的 `.ats/state.db` 独立开启 WAL。所有状态事务应短小，不在事务中执行 Git、文件系统或 Agent CLI 操作。
+
+### project_metadata
+
+```text
+id, key, name
+canonical_repo_path, git_common_dir, project_instance_id
+default_branch, workspace_root
+default_planner_profile_id, default_implementer_profile_id
+default_revision_profile_id, default_reviewer_profile_id
+max_concurrent_runs
+environment_config, instructions, file_policy
+created_at, updated_at, version
+```
+
+### topics / threads / messages
+
+```text
+topics:
+id, topic_key, title, description, status
+current_plan_id, current_summary_id
+created_at, updated_at, version
+
+threads:
+id, topic_id XOR task_id
+created_at, updated_at
+
+messages:
+id, thread_id, sequence, author_kind
+content, created_at
+
+message_task_links:
+message_id, task_id, created_at
+
+topic_task_links:
+topic_id, task_id, source_message_id, created_at
+
+task_links:
+task_a_id, task_b_id, source_message_id, created_at
+```
+
+Thread 使用 Topic/Task 外键和 CHECK 约束表达恰好一个主体。评论归属和内容引用分开：每条 Message 恰好属于一个 Topic 或 Task Thread，但可以引用零到多个 Task。Topic–Task 和 Task–Task 关系使用显式外键表；Task–Task 当前为对称的“相关”关系，不隐式改变依赖调度。由 Message 引用产生的主体关系在同一短事务中幂等建立，并保留 `source_message_id`；解除主体关系不删除历史消息引用。
+
+Schema v8 已开放 Topic 与 Task 讨论、评论引用 Task、双向可见的 Topic–Task 关联、Task–Task 关联、Task Workspace 和本地 Release。当前 Message 不支持编辑；后续若开放编辑，必须增加 Revision 或审计事件，不静默改写已经进入 Run Context 的历史内容。Agent 消息的来源 Run 外键在 Run Schema 落地后通过新 migration 增加。
+
+### plans / plan_revisions / plan_task_drafts
+
+```text
+plans:
+id, plan_key, topic_id, status
+current_revision_id, approved_revision_id
+created_at, updated_at, version
+
+plan_revisions:
+id, plan_id, revision_number
+summary, rationale, risks
+source_run_id, previous_revision_id
+created_at
+
+plan_task_drafts:
+id, plan_revision_id, draft_key
+title, description, acceptance_criteria, priority
+recommended_agent_profile_id, proposed_order
+```
+
+Plan Revision 和 Task Draft 创建后不可原地修改。批准 Plan 时以一个短事务创建正式 Task、关系和审计事件。
+
+### clarifications / decisions
+
+```text
+clarifications:
+id, topic_id XOR task_id, source_run_id
+question, status, answer_message_id
+created_at, answered_at, version
+
+decisions:
+id, scope_type, project/topic/task scope foreign key
+statement, rationale, status
+source_message_id, source_plan_revision_id
+superseded_by_id
+created_at, updated_at, version
+```
+
+Decision 状态为 `ACTIVE`、`SUPERSEDED` 或 `REVOKED`。普通 Message 不替代结构化 Decision。
+
+### labels / topic_labels / task_labels
+
+```text
+labels:
+id, name, color, description
+created_at, updated_at, version
+
+topic_labels: topic_id, label_id
+task_labels: task_id, label_id
+```
+
+Label 名称在当前 Project 内规范化后唯一。Plan 通过 Topic 继承 Label。
+
+### tasks
+
+```text
+id, task_key
+title, description, acceptance_criteria
+status, priority
+source_plan_revision_id, source_plan_task_draft_id
+preferred_agent_profile_id
+target_branch, base_commit_sha
+current_workspace_id, latest_run_id
+created_at, updated_at, version
+```
+
+Task 更新使用 `version` 乐观锁，避免 UI 重复提交覆盖较新的状态。
+
+### workspaces
+
+```text
+id, task_id
+path, branch_name, target_branch, base_commit_sha
+state, head_sha, dirty
+leased_by_run_id, lease_generation, lease_expires_at
+last_verified_at
+created_at, updated_at
+```
+
+Workspace 状态：
+
+```text
+PROVISIONING, READY, LEASED, DIRTY, QUARANTINED,
+CLEANING, REMOVED, ERROR
+```
+
+Schema v7 当前落地 `PROVISIONING`、`READY`、`DIRTY`、`QUARANTINED` 和 `ERROR`；Lease、清理和移除状态随 Run 生命周期实现增加，不能用临时字符串绕过 migration。
+
+### releases / release_tasks
+
+```text
+releases:
+id, version, tag_name
+source_branch, commit_sha
+status, failure_message
+created_at, updated_at, tagged_at
+
+release_tasks:
+release_id, task_id, created_at
+```
+
+Release 状态为 `CREATING`、`TAGGED` 或 `FAILED`。数据库先保留 `CREATING` 记录并固定 Commit，再执行 Git；失败可在相同输入下安全重放。`release_tasks` 是可选审计关联，不代表系统已经验证某 Task 的全部修改被合入该 Commit。
+
+### runs
+
+```text
+id, purpose
+topic_id XOR task_id, workspace_id
+agent_profile_id, agent_profile_revision_id
+agent_session_id, parent_run_id
+adapter_type, adapter_version
+agent_config_snapshot, model
+attempt_number, retry_of_run_id
+prompt_artifact_id, context_manifest, context_artifact_id
+logical_context_revision, context_delta_artifact_id
+
+status, failure_kind, failure_code, failure_message, retryable
+worker_id, claim_token_hash, lease_generation, lease_expires_at
+
+queued_at, claimed_at, process_started_at
+started_at, finished_at, duration_ms
+pid, process_group_id, process_started_identity
+exit_code, exit_signal
+
+stdout_artifact_id, stderr_artifact_id, events_artifact_id
+final_message_artifact_id, diff_artifact_id
+
+input_tokens, cached_input_tokens, output_tokens
+reasoning_tokens, total_tokens
+context_estimated_tokens
+context_included_items, context_omitted_items
+cost_amount, cost_currency, cost_source, cost_estimated
+pricing_snapshot
+
+git_branch, git_base_sha, git_head_before, git_head_after
+commit_shas, changed_files_manifest
+
+cancel_requested_at, cancel_requested_by
+created_at, updated_at
+```
+
+Token 和 Cost 无法获取时保存 `NULL`，不能用零代替未知值。估算 Cost 必须保存价格快照和 `cost_estimated=true`。
+
+Run 使用数据库约束保证恰好绑定一个 Topic 或 Task。PLANNING Run 不得设置 Workspace；需要写代码的 Task Run 必须设置受管 Workspace。
+
+### agent_profiles / agent_profile_revisions / agent_sessions
+
+```text
+agent_profiles:
+id, name, role, current_revision_id
+created_at, updated_at, version
+
+agent_profile_revisions:
+id, profile_id, revision_number
+prompt_template, model, adapter_config
+context_policy, workspace_policy, approval_policy
+provider_profile_id, environment_policy
+created_at
+
+agent_sessions:
+id, topic_id XOR task_id
+agent_profile_revision_id, model
+adapter_type, external_session_id
+status, last_run_id
+created_at, updated_at
+```
+
+Profile Revision 创建后不可修改。Session 只保存恢复身份和兼容性信息，不保存唯一业务事实。
+
+### task_reviews
+
+验收记录独立保存，不混入 Task description。Review 记录决定、原因、关联 Run 和时间；讨论统一使用 Thread/Message。
+
+### task_relations
+
+```text
+from_task_id, to_task_id, relation_type
+source_plan_revision_id
+created_at
+```
+
+关系类型受枚举约束。互斥或对称关系由领域命令验证，不允许 API 任意写字符串。
+
+### topic_events / plan_events / task_events / run_events / workspace_events
+
+每个聚合内使用递增 `sequence`，并建立 `(aggregate_id, sequence)` 唯一索引。事件 payload 使用版本化 JSON，便于以后增加字段。
+
+### artifacts / run_artifacts
+
+图片 Artifact Index 保存：
+
+```text
+id, kind, original_name
+original_media_type, original_relative_path, original_size, original_sha256
+optimized_media_type, optimized_relative_path, optimized_size, optimized_sha256
+created_at
+```
+
+Run Artifact 关联保存：
+
+```text
+id, run_id, kind
+relative_path, mime_type
+size_bytes, sha256
+segment_index, truncated
+created_at
+```
+
+Artifact 路径必须是数据目录下的相对路径，读取时再次校验解析结果没有逃逸 Artifact Root。
+
+### summaries / search_documents
+
+Summary 保存主体、来源序号范围、内容哈希、生成 Run 和人工修正信息。Search Document 是可重建的只读 FTS 投影，覆盖 Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary；原始日志与完整 Diff 不进入默认全文索引。
+
+### worker_leases
+
+保存 Runner 身份、Run、PID 身份、heartbeat、租约过期时间和最后错误。PID 身份至少包含 PID、可用时的进程启动时间和 Run nonce，不能只依赖 PID。
+
+### 必要索引和约束
+
+- `project_metadata` 只允许一个当前项目记录。
+- `topics(topic_key)`、`plans(plan_key)` 和 `tasks(task_key)` 分别唯一。
+- 一个 Topic 最多一个活跃 PLANNING Run，使用部分唯一索引表达。
+- 一个 Task 最多一个未终止 Run，使用部分唯一索引表达。
+- 一个 Task 最多一个未移除 Workspace。
+- `releases(version)` 和 `releases(tag_name)` 分别唯一；同一版本不得改绑 Git 事实。
+- Plan 的 `(plan_id, revision_number)` 唯一，批准 Revision 必须属于同一个 Plan。
+- Label 规范化名称唯一，所有 Label 关联表使用复合主键。
+- Run、Thread、Clarification 和 AgentSession 的主体外键满足恰好一个 Topic 或 Task。
+- `runs(status, queued_at)` 调度索引。
+- `runs(status)` 和 `runs(agent_profile_id, status)` 并发计数索引。
+- 所有外键启用并接受数据库约束校验。
+
+## 7. 状态机
+
+### Topic 与 Plan 状态
+
+```text
+Topic OPEN
+  ├── Planning Run 需要输入 → NEEDS_CLARIFICATION
+  │                              ↓ answer / start new Run
+  │                            OPEN
+  ├── 提交 Plan Revision ─────→ PLAN_REVIEW
+  │                              ├── approve → PLANNED
+  │                              └── revise ─→ OPEN
+  └── close ──────────────────→ CLOSED
+
+Plan DRAFT → IN_REVIEW → APPROVED → SUPERSEDED
+                       └──────────→ CANCELLED
+```
+
+Topic 的活跃 Planning Run 作为派生执行信息展示，不额外维护 `agent_running` 布尔值。批准 Plan Revision 和批量创建 Task 必须经过领域命令；Planner Run 只能提交草案。
+
+### Task 状态
+
+```text
+BACKLOG
+   ↓ queue
+READY
+   ↓ run claimed
+RUNNING
+   ├── needs input ─→ NEEDS_CLARIFICATION
+   │                        ↓ answer / new run
+   │                      READY
+   ├── run failed ───────→ BLOCKED
+   ├── cancel ───────────→ CANCELLED
+   └── run succeeded
+              ↓
+            REVIEW
+        ┌─────┴──────────┐
+      accept           reject
+        ↓                ↓
+    ACCEPTED       CHANGES_REQUESTED
+                           ↓ rerun
+                         READY
+```
+
+`BLOCKED` 恢复到 `READY` 必须由人工确认，或者由一个已证明安全的基础设施重试策略触发。
+
+### Run 状态
+
+```text
+QUEUED → CLAIMED → PREPARING → RUNNING → FINALIZING → SUCCEEDED
+```
+
+终态：
+
+```text
+SUCCEEDED, NEEDS_INPUT, FAILED, TIMED_OUT,
+CANCELLED, LOST, POLICY_VIOLATED
+```
+
+取消请求使用独立字段表示。只有 Runner 确认 Agent 进程组退出并完成 Git/日志采集后，Run 才进入 `CANCELLED`。
+
+### 关键迁移规则
+
+| 当前状态 | 命令/事件 | 目标状态 | 关键条件 |
+|---|---|---|---|
+| BACKLOG | QueueTask | READY | Project 和 Task 配置有效 |
+| READY | RunClaimed | RUNNING | 原子 Claim 且 Workspace 可租用 |
+| RUNNING | ClarificationRequested | NEEDS_CLARIFICATION | Run 已保存问题并终止，不继续占用 Lease |
+| NEEDS_CLARIFICATION | AnswerAndQueue | READY | 保存回答并创建新 Run，不复用旧 Run |
+| RUNNING | RunSucceeded | REVIEW | Finalization 完成 |
+| RUNNING | RunFailed | BLOCKED | 没有安全自动重试 |
+| REVIEW | AcceptTask | ACCEPTED | 用户确认验收 |
+| REVIEW | RejectTask | CHANGES_REQUESTED | 必须记录驳回原因 |
+| CHANGES_REQUESTED | QueueTask | READY | 创建新 Run，不复用旧 Run |
+
+## 8. Run Claim 与并发
+
+并发限制只在当前项目内配置：
+
+```text
+project.maxConcurrentRuns = 2（默认）
+```
+
+减少并发配置只阻止当前项目的新 Claim，不终止已运行的 Runner。不同项目之间没有共享配额或全局 Claim。一个 Topic 最多一个活跃 PLANNING Run，一个 Task 最多一个活跃 Run；同一项目的并发可以发生在不同 Topic 或 Task 之间。
+
+SQLite Claim 在短事务中完成：
+
+```sql
+BEGIN IMMEDIATE;
+
+UPDATE runs
+SET status = 'CLAIMED',
+    worker_id = ?,
+    claim_token_hash = ?,
+    lease_generation = lease_generation + 1,
+    lease_expires_at = ?,
+    claimed_at = ?
+WHERE id = ?
+  AND status = 'QUEUED'
+RETURNING *;
+
+COMMIT;
+```
+
+Scheduler 不得在这个事务中启动进程。Runner 后续更新必须使用类似条件：
+
+```text
+WHERE id = run_id
+  AND lease_generation = expected_generation
+  AND claim_token_hash = expected_hash
+```
+
+这可以阻止过期 Runner 覆盖新的执行结果。
+
+## 9. Runner 执行协议
+
+### 准备阶段
+
+1. 验证启动凭据并登记 Runner PID 身份。
+2. 校验 Run purpose、业务主体、Agent Profile Revision 和 Session 兼容性。
+3. 通过 Context Builder 生成有界最终 Prompt、Context Manifest 和必要 Delta。
+4. 对需要 Workspace 的 Task Run 获取 Lease。
+5. 校验 worktree path、`gitCommonDir`、Branch、HEAD。
+6. 检查是否存在未完成的 merge、rebase、cherry-pick 或 bisect。
+7. 记录 `git_head_before` 和初始文件状态。
+8. 由 Adapter 构造不经过 shell 拼接的 Invocation。
+
+PLANNING Run 不执行 Workspace 步骤，且其 Invocation 不得获得可写 Task worktree。REVIEW Run 是否需要只读 Workspace 由 Profile Revision 的 Workspace Policy 明确指定。
+
+### 运行阶段
+
+1. 创建独立进程组并登记 `process_started_at`。
+2. 分别捕获 stdout 和 stderr。
+3. Adapter 将 JSONL 或文本解析为规范化 AgentEvent。
+4. Runner 周期性续租并检查取消请求。
+5. 达到运行超时、空闲超时或策略限制时终止进程组。
+
+### Finalization
+
+1. 确认 Agent 进程已退出。
+2. flush、关闭并校验日志 Artifact。
+3. 对使用 Workspace 的 Run 获取 HEAD、Commit、tracked/staged Diff、untracked manifest。
+4. 对使用 Workspace 的 Run 执行文件策略检查。
+5. 收集 Usage、Cost、最终消息、Clarification 或 Plan Draft。
+6. 使用 fencing token 原子写入 Run 终态和事件。
+7. 更新 Topic 或 Task 的派生状态。
+8. 释放 Workspace Lease。
+
+Finalization 必须幂等。重复执行不得重复创建 Review、Run 或状态迁移。
+
+## 10. Agent Adapter
+
+Adapter 只隔离 Agent CLI 差异，不管理 Git、调度或业务状态。
+
+概念接口：
+
+```text
+Probe(ctx, profile) -> AgentCapabilities
+BuildInvocation(runSpec) -> ProcessInvocation
+ParseEvent(stream, bytes) -> AgentEvent[]
+CollectResult(exit, artifacts) -> AgentResult
+ClassifyFailure(exit, stderr, events) -> FailureClassification
+```
+
+`ProcessInvocation` 包含：
+
+```text
+executable
+argv[]
+stdin
+cwd
+environment
+outputProtocol
+```
+
+参数必须以 argv 数组传递，不能拼接 shell 命令字符串。
+
+### Capability
+
+- 非交互执行
+- JSONL/结构化事件
+- Model Override
+- Usage/Cost 上报
+- Session Resume
+- 内置 Sandbox
+- Approval Policy
+- Structured Final Output
+
+### 首批 Adapter
+
+1. `codex`：结构化 Adapter，使用非交互和 JSONL 输出。
+2. `generic-process`：可配置 executable、argv template、stdin 和 raw/JSONL 模式。
+
+Generic Process Adapter 只保证基本进程、日志、超时和 Git 采集；无法解析的信息保持未知。
+
+### Agent Profile
+
+Adapter 是代码能力，Agent Profile 是用户配置。一个 Adapter 可以对应多个 Profile，例如 Planner、Implementer、Reviewer 或使用不同模型、Provider、Proxy 和 Sandbox 策略的同类 Profile。并发只由当前 Project 配置。
+
+Profile 至少包含：
+
+```text
+name, role, adapter_type, executable
+current_revision_id
+
+Revision:
+prompt_template, model, argument_config
+context_policy, timeout_config
+sandbox_policy, workspace_policy, approval_policy
+proxy_profile_id, provider_profile_id
+environment_policy
+```
+
+Profile 在 UI 中可编辑，但编辑必须创建新 Revision。内置职责 Prompt 可以查看、比较和恢复默认值；系统安全约束不可被 Profile Prompt 覆盖。模板变量使用固定白名单，不允许执行代码、读取任意文件或展开 Secret。Profile 启用前必须执行 Probe，记录 CLI 路径、版本和能力。CLI 版本改变后重新 Probe；解析器必须按版本容错，不能把未知事件当成成功。
+
+Project 分别保存 PLANNING、IMPLEMENTATION、REVISION 和 REVIEW 的默认 Profile。最终 Prompt 的固定分层、Revision 兼容性和权限边界遵循 [ADR-0003](adr/0003-topic-plan-task-and-role-based-agent-runs.md)。
+
+## 11. Context、Search 与 MCP
+
+Agent Session 只用于尽力恢复对话，不是事实来源。规范领域数据、Artifact Index、Search Projection、Web Search、Run Context Builder 和 Project-local MCP 使用同一套读取服务：
+
+```text
+Domain Data / Artifact Index
+           ↓
+Search Projection / Context Read Service
+      ├── Web Search
+      ├── Context Builder
+      └── Project-local MCP
+```
+
+Context 按 L0 固定规则、L1 当前工作集、L2 近期增量和 L3 历史档案分层。默认只装入有界的 L0、L1 和 L2；旧 Plan、旧 Run、完整日志和完整 Diff 通过搜索或工具按需读取。Acceptance Criteria、有效 Decision、开放 Clarification 和批准 Plan 不得只存在于自动 Summary 中。
+
+每个 Profile Revision 定义输入上限、输出预留、安全余量、近期 Message 数量、检索数量、关联对象数量和 Artifact 片段上限。Context Builder 按规则、当前对象、有效 Decision、批准 Plan、开放问题、近期增量、检索摘要和 Artifact 片段的顺序装入，并记录每项内容的来源、Revision、哈希、Token 估算、是否采用和省略原因。
+
+Search Projection 使用项目 SQLite FTS5，覆盖 Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary。它是可重建的只读投影，不是事实来源；原始日志和完整 Diff 不进入默认全文索引。
+
+MCP 第一阶段只提供当前项目的有界只读搜索和读取能力，不直接暴露数据库，也不提供批准 Plan、启动 Run、验收 Task 或删除对象等高影响命令。检索内容始终视为不可信数据，不得提升到系统安全或 Project Instructions 层。
+
+详细决策见 [ADR-0004](adr/0004-durable-context-search-mcp-and-token-budget.md)。
+
+## 12. Proxy、Provider 与环境变量
+
+Network Proxy 和 LLM Provider/Gateway 必须分开建模。
+
+### Network Proxy Profile
+
+模式：
+
+```text
+INHERIT  继承 AiTodos/Runner 进程环境
+EXPLICIT 使用 Profile 显式配置
+OFF      清除代理变量
+```
+
+可映射的变量：
+
+```text
+HTTP_PROXY, HTTPS_PROXY, ALL_PROXY, NO_PROXY
+SSL_CERT_FILE, NODE_EXTRA_CA_CERTS
+```
+
+默认使用 `INHERIT`，使 Agent 沿用执行当前项目 `ats start` 时已有的代理。每个项目可以在 `.ats/local.toml` 中选择不同的 Server 端口、Agent 命令、模型、Worker 数量、Proxy 和 Provider。
+
+### Provider Profile
+
+用于表达：
+
+```text
+base_url
+API key environment reference
+static/dynamic headers
+provider-specific model mapping
+```
+
+MVP 不在 SQLite 或 TOML 保存 API Key 明文。只允许引用已有环境变量或 Agent CLI 登录状态。后续再接操作系统 Keychain。
+
+### 环境优先级
+
+```text
+Runner 安全基础环境
+→ Global environment
+→ Project environment
+→ Agent Profile environment
+→ Run-specific override
+```
+
+Run 快照只保存变量名、来源、是否存在和脱敏哈希，不保存秘密值。保留变量覆盖审计，但日志和错误输出仍需做最佳努力脱敏。
+
+## 13. Git Workspace 生命周期
+
+### 创建
+
+```text
+验证 Git 仓库
+→ 解析目标分支为固定 Base SHA
+→ 获取 gitCommonDir 仓库锁
+→ 创建唯一 Task Branch
+→ 创建 linked worktree
+→ 校验 worktree 和共享 Git 目录
+→ 保存 Workspace=READY
+```
+
+推荐命名：
+
+```text
+branch: aitodos/<project-key>/<task-key>-<short-id>
+path:   <repo-root>/.ats/worktrees/<task-id>
+```
+
+### Run 前校验
+
+- Workspace 路径在受管根目录内。
+- `.git` 指向预期 `gitCommonDir`。
+- 当前 Branch 与数据库一致。
+- HEAD 与上一个 Finalization 记录一致。
+- Workspace 没有其他有效 Lease。
+- Git 没有进行中的危险操作。
+
+### Run 后采集
+
+- HEAD before/after。
+- 新增 Commit SHA。
+- tracked、staged 和二进制变化。
+- untracked 文件清单及受限大小内的内容 Artifact。
+- changed file manifest。
+- allow/deny path policy 违规。
+
+### 验收和清理
+
+`.ats/worktrees` 被项目本地 `.ats/.gitignore` 忽略。Workspace 虽位于项目目录内，Run 前仍必须通过真实路径和 `gitCommonDir` 校验，删除时只允许操作 `.ats/worktrees` 下的已登记路径。
+
+MVP 默认不允许 Agent commit 或 push，不自动 merge，也不自动删除 Workspace。当前 Release 只接受已经存在于来源分支上的 Commit；后续“验收并提交”必须作为显式的人类领域命令实现，不能由 Agent 静默提交。
+
+Dirty Workspace 清理前必须保存恢复 Artifact；无法证明目标路径和 Git 身份时，将 Workspace 标记为 `QUARANTINED`，禁止自动删除。
+
+### 安全边界
+
+Worktree 只能隔离 Git 工作目录，不能阻止进程写 Workspace 外路径。MVP 依赖 Agent 内置 Sandbox、文件策略和前后状态检查；容器、VM 或 OS 级强隔离属于后续扩展。
+
+## 14. 日志与执行事件
+
+stdout、stderr 分别保存，同时产生统一顺序的事件流：
+
+```text
+sequence, timestamp, stream, event_type, payload
+```
+
+建议每个日志 segment 上限 10 MiB，每个 Run 配置总日志上限。达到上限后记录 `truncated=true`，保留头部摘要和末尾诊断信息，不能让无限输出耗尽磁盘。
+
+Artifact 使用临时文件写入，完成后 flush、校验并原子 rename。SSE 从 RunEvent 和日志 offset 增量读取，使用 SSE `id` 支持浏览器断线续传。
+
+## 15. Cancel、Timeout 与资源限制
+
+Runner 为 Agent 创建独立进程组：
+
+1. 收到取消或超时后发送温和终止信号。
+2. 等待配置的 grace period。
+3. 仍未退出则终止整个进程组。
+4. 确认退出后采集日志和 Git 状态。
+5. Finalize 为 `CANCELLED` 或 `TIMED_OUT`。
+
+限制至少包括：
+
+```text
+runTimeout
+idleOutputTimeout（可选，默认关闭）
+maxLogBytes
+maxAutomaticRetries
+maxRunsPerTask
+maxCumulativeDurationPerTask
+maxCumulativeTokensPerTask（Usage 可用时）
+maxCumulativeCostPerTask（Cost 可用时）
+maxInputTokens
+reservedOutputTokens
+contextSafetyMarginTokens
+```
+
+## 16. Crash Recovery 与安全重试
+
+进程启动和数据库更新之间无法做到严格 exactly-once，因此恢复策略必须保守。
+
+### 启动恢复
+
+```text
+扫描所有非终态 Run
+→ 检查 Runner heartbeat 和 lease
+→ 校验 PID、进程启动身份和 Run nonce
+→ 检查 Agent 子进程组
+→ 对账日志 Artifact
+→ git worktree list 对账
+→ 校验 Workspace Branch / HEAD / dirty 状态
+→ 恢复跟踪、标记 LOST 或隔离 Workspace
+→ 修复 Topic/Task 派生状态
+```
+
+### 重试矩阵
+
+| 情况 | 自动处理 |
+|---|---|
+| CLI 明确未启动 | 可重新进入队列 |
+| Spawn 临时失败且 Workspace 未变化 | 可有限自动重试 |
+| CLI 已启动、已确认退出、Workspace 未变化 | 创建新的 Retry Run |
+| CLI 已修改 Workspace | 不自动重试，人工确认 |
+| CLI 是否启动不明确 | 标记 LOST，人工确认 |
+| Policy violation | 不自动重试 |
+| Agent/测试业务失败 | 默认不自动重试 |
+
+每次真正重新调用 AI 都创建新 Run，并通过 `retry_of_run_id` 建立关系。只有能证明 CLI 从未启动时，原 Run 才能重新排队。
+
+## 17. API 草案
+
+API 使用领域命令，避免通用 PATCH 任意改状态。
+
+```text
+GET    /api/project
+GET    /api/board
+GET    /api/search
+
+POST   /api/topics
+GET    /api/topics
+GET    /api/topics/{topicId}
+GET    /api/topics/{topicId}/messages
+POST   /api/topics/{topicId}/messages
+GET    /api/topics/{topicId}/relations
+POST   /api/topics/{topicId}/relations
+DELETE /api/topics/{topicId}/relations/{taskId}
+POST   /api/topics/{topicId}/plan-runs
+POST   /api/topics/{topicId}/clarifications/{clarificationId}/answer
+
+GET    /api/topics/{topicId}/plans
+GET    /api/plans/{planId}
+POST   /api/plans/{planId}/submit
+POST   /api/plans/{planId}/approve
+POST   /api/plans/{planId}/request-changes
+
+POST   /api/tasks
+GET    /api/tasks
+GET    /api/tasks/{taskId}
+PUT    /api/tasks/{taskId}
+POST   /api/tasks/{taskId}/queue
+POST   /api/tasks/{taskId}/cancel
+GET    /api/tasks/{taskId}/messages
+POST   /api/tasks/{taskId}/messages
+GET    /api/tasks/{taskId}/topics
+POST   /api/tasks/{taskId}/topics
+DELETE /api/tasks/{taskId}/topics/{topicId}
+GET    /api/tasks/{taskId}/relations
+POST   /api/tasks/{taskId}/relations
+DELETE /api/tasks/{taskId}/relations/{relatedTaskId}
+POST   /api/tasks/{taskId}/clarifications/{clarificationId}/answer
+POST   /api/tasks/{taskId}/accept
+POST   /api/tasks/{taskId}/reject
+GET    /api/tasks/{taskId}/runs
+GET    /api/runs/{runId}
+POST   /api/runs/{runId}/cancel
+POST   /api/runs/{runId}/retry
+GET    /api/runs/{runId}/events
+GET    /api/runs/{runId}/stream
+GET    /api/runs/{runId}/diff
+
+GET    /api/agent-profiles
+POST   /api/agent-profiles
+GET    /api/agent-profiles/{profileId}/revisions
+POST   /api/agent-profiles/{profileId}/revisions
+POST   /api/agent-profiles/{profileId}/probe
+
+GET    /api/labels
+POST   /api/labels
+
+GET    /api/settings/concurrency
+PUT    /api/settings/concurrency
+```
+
+写命令携带目标聚合的 `version` 或 `If-Match`，冲突返回 409。批准 Plan、批量生成 Task、回答 Clarification 和状态迁移必须使用领域命令，不提供通用状态 PATCH。
+
+MCP 复用同一应用读取服务，但不等同于 REST 数据库镜像。第一阶段提供 `search_items`、`get_topic`、`get_plan`、`get_task`、`get_thread`、`get_decisions`、`get_related_items`、`get_task_runs`、`get_run_summary` 和 `get_context_bundle`。
+
+## 18. UI 信息架构
+
+### Project Header
+
+- 当前 Project 名称、仓库路径和健康状态。
+- 活跃/排队 Run 数和本项目并发使用情况。
+- 当前项目各 purpose 的默认 Agent、Model 和 Proxy 模式。
+
+### Topic 与 Plan
+
+- 全局创建入口只要求用户描述“想做什么”，默认创建 Topic，同时保留显式“直接创建 Task”选项。
+- 创建时不要求用户填写标题；领域层从内容首个非空行生成临时标题。后续 Agent 可在 Planning Run 的结构化结果中同时建议更好的标题，不为标题单独调用模型。
+- Topic 与 Task 概念对用户可见，用于明确“讨论/规划”和“可执行/可验收”的边界；Plan 作为 Topic Detail 内的版本化方案展示，不作为顶层导航。
+- Topic 列表展示状态、Label、开放 Clarification、当前 Plan 和最近活动。
+- Topic Detail 当前展示描述与持久 Thread，并允许用户发布消息；有效 Decision、Clarification、Planning Run 和 Plan Revision 随对应领域能力补齐。
+- Topic Detail 展示关联 Task；Task Detail 展示关联 Topic 和关联 Task。两侧均可搜索、添加、移除和点击跳转，Topic–Task 关系双向可见。
+- Topic 和 Task 评论均可引用多个 Task；发送后自动建立对应 Topic–Task 或 Task–Task 主体关系，消息内保留可点击的来源引用。
+- Topic、Task 和 Message 内容使用无工具栏 Markdown 输入，不引入富文本文档模型。粘贴自 `<pre>/<code>` 或明显为代码的多行文本时自动插入 fenced code block；长代码块默认只显示前 4 行，可手动展开和收起。
+- 粘贴图片时保留原图并生成优化版本，正文只显示紧凑的 `[图片]` 入口；桌面悬停显示不超过 `320 × 240` 的预览区域，点击后在视口范围内全屏查看原图。原始 HTML 不执行，外部链接只允许 `http`、`https` 和 `mailto`。
+- Markdown 输入采用无内层边框、不可手动拖拽尺寸的 composer 画布；新建事项使用大尺寸画布，讨论回复使用紧凑画布。页面未处于输入或弹窗状态时按 `N` 打开新建事项；`Ctrl+N` / `Cmd+N` 保留给浏览器；输入画布中使用 `Ctrl+Enter` / `Cmd+Enter` 提交。
+- Plan Review 展示方案差异、Task Draft、关系、推荐 Agent、顺序、风险和批准操作。
+- Planner 输出默认是草案；正式创建 Task 前必须显示将创建的对象和关系。
+
+### Project Kanban
+
+UI 使用四列投影，不直接把内部状态机全部暴露为列：
+
+```text
+待办      = BACKLOG | READY | CHANGES_REQUESTED | BLOCKED
+进行中    = RUNNING
+待验收    = REVIEW
+已完成    = ACCEPTED
+归档筛选  = CANCELLED
+```
+
+卡片继续显示“待完善、可执行、需修改、已阻塞”等精确状态标签。拖动或操作仍必须转换成领域命令，UI 分组不得覆盖内部状态字符串。
+
+拖动卡片必须转换成明确领域命令；不允许绕过状态机直接写目标状态。
+
+### Task Detail
+
+- Description 和 Acceptance Criteria。
+- Status、持久讨论、关联 Topic、关联 Task、Clarification、Decision 和 Review History。
+- Workspace、Branch 和 Base SHA。
+- Run History。
+- 当前 Agent、Model、Runner 和执行阶段。
+- 实时日志与结构化事件。
+- Git Diff、Commit、Changed Files。
+- Accept、Reject、Cancel、Retry 操作。
+
+### Search 与 Agent Settings
+
+- 全局搜索统一检索 Topic、Plan、Task、Message、Decision、Clarification 和 Run Summary。
+- 支持类型、Label、状态、更新时间和“仅当前有效内容”过滤。
+- 结果显示匹配片段、来源、Revision、更新时间和稳定链接。
+- Agent Settings 可编辑 Profile Revision、职责 Prompt、Model、Context Budget 和权限策略，并支持查看最终 Prompt、与内置默认值对比和恢复默认值。
+- Run Detail 显示 Context Manifest、Token 预算、采用/省略原因、Session Resume 和实际 Usage。
+
+## 19. 仓库结构草案
+
+```text
+AiTodos/
+├── cmd/
+│   └── aitodos/
+├── internal/
+│   ├── controlplane/
+│   ├── domain/
+│   │   ├── topic/
+│   │   ├── plan/
+│   │   └── task/
+│   ├── scheduler/
+│   ├── runner/
+│   ├── agent/
+│   ├── contextbuilder/
+│   ├── search/
+│   ├── mcp/
+│   ├── workspace/
+│   ├── artifact/
+│   ├── storage/
+│   └── transport/
+├── migrations/
+├── web/
+│   ├── src/
+│   └── package.json
+├── docs/
+│   └── adr/
+├── go.mod
+├── pnpm-workspace.yaml
+└── README.md
+```
+
+被管理项目运行时目录：
+
+```text
+<project-root>/.ats/
+├── project.toml       # 可提交的项目配置
+├── local.toml         # 本机 Server/Agent/Proxy 配置，忽略
+├── .gitignore
+├── state.db           # 当前项目业务数据库，忽略
+├── artifacts/         # 当前项目 Run Artifact，忽略
+├── runtime/           # Daemon metadata 与 lock，忽略
+└── worktrees/         # Task linked worktrees，忽略
+```
+
+领域层不能依赖 HTTP、SQLite、Git CLI 或具体 Agent Adapter。Control Plane 和 Runner 可以共享领域类型，但进程间只通过持久化状态和版本化启动协议通信。
+
+## 20. 测试策略
+
+默认按 TDD 实施。
+
+### Domain
+
+- Topic/Plan/Task/Run/Workspace 状态迁移表驱动测试。
+- 非法迁移、重复命令和幂等测试。
+- 并发限制和重试判定测试。
+- Plan 批准后批量创建 Task、关系和事件的原子性测试。
+
+### Storage
+
+- 真实 SQLite 临时数据库迁移测试。
+- 并发 Claim 测试，证明同一 Run 只能被一个 Runner Claim。
+- fencing token 和过期 Lease 测试。
+- Topic/Task 单活跃 Run 约束和 Run 主体 CHECK 约束测试。
+- Search Projection 增量更新、删除和全量重建一致性测试。
+
+### Git Workspace
+
+- 每个测试创建独立临时 Git 仓库。
+- 并发 worktree、dirty Workspace、Branch 错位和恢复测试。
+- 所有删除测试验证目标始终位于受管 Workspace Root。
+
+### Runner
+
+- 使用可控 fake Agent executable。
+- 覆盖正常退出、超时、无输出、日志爆量、忽略终止信号和崩溃。
+- 覆盖 Control Plane 重启、Runner 重启和 Finalization 重放。
+
+### Adapter Contract
+
+- 固定 CLI 事件 fixture。
+- 未知事件、破损 JSONL、版本差异和 Usage 缺失测试。
+- Session Resume、Session 失效和 Prompt/Profile 不兼容时新建 Session 测试。
+
+### Context、Search 与 MCP
+
+- Context 优先级、职责隔离、预算截断、稳定排序和内容去重测试。
+- Summary 来源范围、增量更新、过期和人工修正测试。
+- 检索内容不能提升为系统指令的 Prompt Injection 边界测试。
+- MCP 分页、结果上限、项目隔离、只读能力和敏感数据测试。
+- Usage 可用和不可用时的 Token、Cache 与未知值展示测试。
+
+### UI
+
+- 状态命令和冲突处理组件测试。
+- Kanban 关键流程端到端测试。
+- Topic 讨论、Clarification、Plan Review、批准拆 Task、Label 和全局搜索流程。
+- 实际验证 SSE 断线重连、Run 日志和 Cancel 行为。
+
+## 21. MVP 边界
+
+MVP 包含：
+
+- `ats init/start/status/stop` 和仓库健康检查。
+- 每项目独立 Kanban、SQLite、Daemon 和本机可配置端口。
+- Topic、Thread、Clarification、Decision、Plan Revision 和人工批准流程。
+- Task CRUD、Message、Review、Label、关系和状态机。
+- SQLite 持久 Queue、Claim、Lease 和 Recovery。
+- Planner、Implementer、Reviewer 职责编排。
+- Project 默认职责 Profile、版本化 Prompt、Context Policy 和并发配置。
+- 每 Task 一个 worktree。
+- 绑定不可变 Commit 的本地 SemVer Release 与 annotated tag。
+- Codex 和 Generic Process Adapter。
+- Model、环境、Proxy 和 Provider Profile。
+- Agent Session Resume 与无法恢复时的 Context 重建。
+- SQLite FTS 全文搜索、结构化过滤和可重建 Search Projection。
+- 分层 Context Builder、增量 Summary、Token Budget 和 Context Manifest。
+- 当前项目只读 MCP 搜索与 Context Bundle。
+- Run History、日志、Diff、Commit 和 Usage。
+- Timeout、Cancel、Kill、手工 Retry。
+- SSE 实时事件。
+
+MVP 不包含：
+
+- 自动 push、自动 merge 和 PR。
+- 远程 Worker。
+- 全局 Project Hub、跨项目统一调度和全局并发上限。
+- Docker/VM 强隔离。
+- 多用户、RBAC。
+- 任意自定义 WorkItem 类型和自定义状态机。
+- 根据 Label 隐式触发 Agent 或调度。
+- 无人批准的 Planner 自动建 Task、自动分配和自动执行链。
+- 自动依赖 DAG 调度；Task 关系第一阶段只用于追溯和展示。
+- MCP 高影响写命令。
+- 向量数据库和语义 Embedding 搜索。
+- Agent 内部自主多 Agent 编排。
+- 无限自动修复循环。
+- 桌面壳和系统 Keychain 集成。
+
+## 22. 实施阶段
+
+1. 固化项目级 Daemon ADR、CLI 协议和 `.ats` 目录格式。
+2. TDD 实现 `ats init/start/status/stop`、SQLite migration 和进程生命周期。
+3. 初始化 React workspace，实现项目级 Kanban 纵向切片。
+4. TDD 实现 Topic、Plan、Task、Clarification、Decision、Label、关系和状态机。
+5. 实现 Thread、Plan Review、人工批准和批量创建 Task 的纵向切片。
+6. 实现版本化 Agent Profile、职责默认值和 Prompt 配置 UI。
+7. 实现 SQLite FTS Search Projection、Web Search 和只读 MCP。
+8. 实现分层 Context Builder、Summary、Token Budget、Context Manifest 和 Session 模型。
+9. TDD 实现 SQLite Claim 和 Git Workspace Manager。
+10. 实现本地 Release、annotated tag 和 Git 审计 UI。
+11. 实现 Runner、进程组、Artifact 和 Recovery。
+12. 实现 Codex Adapter 与 Generic Process Adapter。
+13. 实现 Review API、SSE、Task Detail 和 Run Detail。
+14. 完成并发、Context、MCP、Proxy、取消、重启和磁盘限制验证。
+
+## 23. 尚待后续 ADR 决定
+
+- SQLite Go driver 和迁移工具。
+- HTTP router 和 OpenAPI 生成方式。
+- React Router、数据请求和拖拽库。
+- “验收并提交”领域命令的 Commit 作者、消息模板和失败恢复细节；Agent 不得静默 commit 的边界已由 ADR-0007 确定。
+- macOS/Linux/Windows 的第一阶段支持范围。
+- 桌面封装采用 Wails、Tauri 或保持本地 Web。
+
+这些决定涉及第三方依赖或产品行为，进入实现前分别评审，不在本设计中默认安装依赖。

@@ -1,0 +1,209 @@
+package gitworkflow
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/light-speak/aitodos/internal/domain/release"
+	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/workspace"
+	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/storage"
+)
+
+func TestManagerCreatesAndReusesTaskWorkspace(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	taskStore := storage.NewTaskStore(database)
+	createdTask, err := taskStore.Create(ctx, task.CreateInput{Title: "实现发布面板"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(repository, database)
+
+	created, err := manager.CreateTaskWorkspace(ctx, createdTask.ID)
+	if err != nil {
+		t.Fatalf("CreateTaskWorkspace() error = %v", err)
+	}
+	if created.TaskID != createdTask.ID || created.BranchName == "" || created.BaseCommitSHA == "" {
+		t.Fatalf("workspace = %#v", created)
+	}
+	if !strings.HasPrefix(created.BranchName, "aitodos/") {
+		t.Fatalf("branch = %q", created.BranchName)
+	}
+	if created.Path != filepath.Join(repository.Paths.Worktrees, createdTask.ID) {
+		t.Fatalf("path = %q", created.Path)
+	}
+	if head := git(t, created.Path, "rev-parse", "HEAD"); head != created.HeadSHA {
+		t.Fatalf("workspace HEAD = %q, stored = %q", head, created.HeadSHA)
+	}
+
+	again, err := manager.CreateTaskWorkspace(ctx, createdTask.ID)
+	if err != nil || again.ID != created.ID {
+		t.Fatalf("second CreateTaskWorkspace() = %#v, %v", again, err)
+	}
+	updatedTask, err := taskStore.Get(ctx, createdTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updatedTask.CurrentWorkspaceID != created.ID || updatedTask.TargetBranch != "main" || updatedTask.BaseCommitSHA != created.BaseCommitSHA {
+		t.Fatalf("updated task = %#v", updatedTask)
+	}
+	if updatedTask.Version != 2 {
+		t.Fatalf("task version after idempotent refresh = %d, want 2", updatedTask.Version)
+	}
+}
+
+func TestManagerCreatesAnnotatedReleaseTagIdempotently(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	input := release.CreateInput{Version: "v1.0.1", SourceBranch: "main"}
+
+	created, err := manager.CreateRelease(ctx, input)
+	if err != nil {
+		t.Fatalf("CreateRelease() error = %v", err)
+	}
+	if created.Status != release.StatusTagged || created.TagName != "v1.0.1" {
+		t.Fatalf("release = %#v", created)
+	}
+	if objectType := git(t, repository.Root, "cat-file", "-t", "refs/tags/v1.0.1"); objectType != "tag" {
+		t.Fatalf("tag object type = %q", objectType)
+	}
+	if commit := git(t, repository.Root, "rev-parse", "refs/tags/v1.0.1^{commit}"); commit != created.CommitSHA {
+		t.Fatalf("tag commit = %q, release commit = %q", commit, created.CommitSHA)
+	}
+	again, err := manager.CreateRelease(ctx, input)
+	if err != nil || again.ID != created.ID {
+		t.Fatalf("second CreateRelease() = %#v, %v", again, err)
+	}
+	runGit(t, repository.Root, "tag", "-d", "v1.0.1")
+	recovered, err := manager.CreateRelease(ctx, input)
+	if err != nil || recovered.ID != created.ID {
+		t.Fatalf("recovered CreateRelease() = %#v, %v", recovered, err)
+	}
+	if objectType := git(t, repository.Root, "cat-file", "-t", "refs/tags/v1.0.1"); objectType != "tag" {
+		t.Fatalf("recovered tag object type = %q", objectType)
+	}
+
+	listed, err := manager.ListReleases(ctx)
+	if err != nil || len(listed) != 1 || listed[0].ID != created.ID {
+		t.Fatalf("ListReleases() = %#v, %v", listed, err)
+	}
+}
+
+func TestManagerReportsRepositoryBranchesAndHead(t *testing.T) {
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	info, err := manager.RepositoryInfo(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.CurrentBranch != "main" || info.HeadSHA == "" || len(info.Branches) != 1 || info.Branches[0].Name != "main" {
+		t.Fatalf("repository info = %#v", info)
+	}
+}
+
+func TestManagerRejectsConflictingExistingTagAndRecordsFailure(t *testing.T) {
+	repository, database := initializeRepository(t)
+	runGit(t, repository.Root, "tag", "v2.0.0")
+	manager := New(repository, database)
+
+	_, err := manager.CreateRelease(context.Background(), release.CreateInput{Version: "2.0.0", SourceBranch: "main"})
+	if !errors.Is(err, ErrTagConflict) {
+		t.Fatalf("CreateRelease() error = %v, want ErrTagConflict", err)
+	}
+	releases, err := manager.ListReleases(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(releases) != 1 || releases[0].Status != release.StatusFailed {
+		t.Fatalf("releases = %#v", releases)
+	}
+}
+
+func TestManagerQuarantinesWorkspaceSymlinkOutsideManagedRoot(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	taskStore := storage.NewTaskStore(database)
+	createdTask, err := taskStore.Create(ctx, task.CreateInput{Title: "校验工作区路径"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branchName := taskBranchName(repository.Config.Name, createdTask.Key, createdTask.ID)
+	outsidePath := filepath.Join(filepath.Dir(repository.Root), filepath.Base(repository.Root)+"-outside")
+	t.Cleanup(func() { _ = os.RemoveAll(outsidePath) })
+	runGit(t, repository.Root, "worktree", "add", "--quiet", "-b", branchName, outsidePath, "main")
+	managedPath := filepath.Join(repository.Paths.Worktrees, createdTask.ID)
+	if err := os.Symlink(outsidePath, managedPath); err != nil {
+		t.Fatal(err)
+	}
+
+	manager := New(repository, database)
+	_, err = manager.CreateTaskWorkspace(ctx, createdTask.ID)
+	if !errors.Is(err, ErrWorkspaceIdentity) {
+		t.Fatalf("CreateTaskWorkspace() error = %v, want ErrWorkspaceIdentity", err)
+	}
+	stored, err := storage.NewWorkspaceStore(database).GetByTask(ctx, createdTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stored.State != workspace.StateQuarantined {
+		t.Fatalf("workspace state = %q, want %q", stored.State, workspace.StateQuarantined)
+	}
+}
+
+func initializeRepository(t *testing.T) (*project.Project, *sql.DB) {
+	t.Helper()
+	temporaryRoot, err := filepath.Abs(filepath.Join("..", "..", ".tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(temporaryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repoRoot, err := os.MkdirTemp(temporaryRoot, "gitworkflow-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(repoRoot) })
+	runGit(t, repoRoot, "init", "--quiet", "--initial-branch=main")
+	runGit(t, repoRoot, "config", "user.name", "AiTodos Test")
+	runGit(t, repoRoot, "config", "user.email", "aitodos@example.invalid")
+	if err := os.WriteFile(filepath.Join(repoRoot, "README.md"), []byte("# test\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repoRoot, "add", "README.md")
+	runGit(t, repoRoot, "commit", "--quiet", "-m", "initial")
+	repository, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), repository.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return repository, database
+}
+
+func git(t *testing.T, directory string, args ...string) string {
+	t.Helper()
+	commandArgs := append([]string{"-C", directory}, args...)
+	output, err := exec.Command("git", commandArgs...).CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %v: %v: %s", args, err, output)
+	}
+	return strings.TrimSpace(string(output))
+}
+
+func runGit(t *testing.T, directory string, args ...string) {
+	t.Helper()
+	_ = git(t, directory, args...)
+}
