@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 8
+const currentSchemaVersion = 20
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -72,9 +72,9 @@ func openDatabase(ctx context.Context, path string) (*sql.DB, error) {
 
 func configure(ctx context.Context, database *sql.DB) error {
 	pragmas := []string{
+		"PRAGMA busy_timeout = 5000",
 		"PRAGMA journal_mode = WAL",
 		"PRAGMA foreign_keys = ON",
-		"PRAGMA busy_timeout = 5000",
 	}
 	for _, statement := range pragmas {
 		if _, err := database.ExecContext(ctx, statement); err != nil {
@@ -121,6 +121,9 @@ func applyMigration(ctx context.Context, database *sql.DB, version int) error {
 	if !ok {
 		return fmt.Errorf("unsupported schema migration: %d", version)
 	}
+	if version == 16 || version == 17 {
+		return applyRebuildMigration(ctx, database, version, statement)
+	}
 
 	transaction, err := database.BeginTx(ctx, nil)
 	if err != nil {
@@ -143,6 +146,71 @@ func applyMigration(ctx context.Context, database *sql.DB, version int) error {
 		return fmt.Errorf("commit schema migration %d: %w", version, err)
 	}
 	return nil
+}
+
+func applyRebuildMigration(ctx context.Context, database *sql.DB, version int, statement string) error {
+	if _, err := database.ExecContext(ctx, "PRAGMA foreign_keys = OFF"); err != nil {
+		return fmt.Errorf("disable foreign keys for migration %d: %w", version, err)
+	}
+	if _, err := database.ExecContext(ctx, "PRAGMA legacy_alter_table = ON"); err != nil {
+		_, _ = database.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+		return fmt.Errorf("enable legacy alter table for migration %d: %w", version, err)
+	}
+	restore := func() error {
+		if _, err := database.ExecContext(ctx, "PRAGMA legacy_alter_table = OFF"); err != nil {
+			return err
+		}
+		_, err := database.ExecContext(ctx, "PRAGMA foreign_keys = ON")
+		return err
+	}
+	transaction, err := database.BeginTx(ctx, nil)
+	if err != nil {
+		_ = restore()
+		return fmt.Errorf("begin schema migration %d: %w", version, err)
+	}
+	rollback := func(cause error) error {
+		_ = transaction.Rollback()
+		_ = restore()
+		return cause
+	}
+	if _, err := transaction.ExecContext(ctx, statement); err != nil {
+		return rollback(fmt.Errorf("apply schema migration %d: %w", version, err))
+	}
+	if err := checkForeignKeys(ctx, transaction); err != nil {
+		return rollback(fmt.Errorf("validate schema migration %d: %w", version, err))
+	}
+	if _, err := transaction.ExecContext(ctx,
+		"INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)",
+		version, time.Now().UTC().Format(time.RFC3339Nano)); err != nil {
+		return rollback(fmt.Errorf("record schema migration %d: %w", version, err))
+	}
+	if err := transaction.Commit(); err != nil {
+		_ = transaction.Rollback()
+		_ = restore()
+		return fmt.Errorf("commit schema migration %d: %w", version, err)
+	}
+	if err := restore(); err != nil {
+		return fmt.Errorf("restore sqlite constraints after migration %d: %w", version, err)
+	}
+	return nil
+}
+
+func checkForeignKeys(ctx context.Context, transaction *sql.Tx) error {
+	rows, err := transaction.QueryContext(ctx, "PRAGMA foreign_key_check")
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	if rows.Next() {
+		var table, parent string
+		var rowID sql.NullInt64
+		var foreignKeyID int
+		if err := rows.Scan(&table, &rowID, &parent, &foreignKeyID); err != nil {
+			return err
+		}
+		return fmt.Errorf("foreign key violation in %s row %v referencing %s constraint %d", table, rowID, parent, foreignKeyID)
+	}
+	return rows.Err()
 }
 
 func migrationStatement(version int) (string, bool) {
@@ -348,6 +416,580 @@ CREATE TABLE release_tasks (
 );
 
 CREATE INDEX release_tasks_task_idx ON release_tasks(task_id, created_at);`, true
+	case 9:
+		return `CREATE TABLE task_reviews (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    decision TEXT NOT NULL CHECK (decision IN ('ACCEPTED', 'REJECTED')),
+    comment TEXT NOT NULL,
+    commit_sha TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX task_reviews_task_idx ON task_reviews(task_id, created_at DESC);`, true
+	case 10:
+		return `UPDATE tasks
+SET priority = CASE
+    WHEN priority = 0 THEN 2
+    WHEN priority > 3 THEN 0
+    WHEN priority < 0 THEN 3
+    ELSE priority
+END;
+
+DROP INDEX IF EXISTS tasks_board_order_idx;
+CREATE INDEX tasks_board_order_idx
+ON tasks(status, priority ASC, created_at ASC);`, true
+	case 11:
+		return `CREATE TABLE agent_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL UNIQUE CHECK (role IN ('PLANNER', 'IMPLEMENTER', 'REVISION', 'REVIEWER')),
+    current_revision_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(current_revision_id) REFERENCES agent_profile_revisions(id) DEFERRABLE INITIALLY DEFERRED
+);
+
+CREATE TABLE agent_profile_revisions (
+    id TEXT PRIMARY KEY,
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    instructions TEXT NOT NULL,
+    adapter TEXT NOT NULL,
+    command TEXT NOT NULL,
+    args_json TEXT NOT NULL,
+    model TEXT NOT NULL,
+    max_input_tokens INTEGER NOT NULL CHECK (max_input_tokens >= 4096),
+    reserved_output_tokens INTEGER NOT NULL CHECK (
+        reserved_output_tokens >= 512 AND reserved_output_tokens < max_input_tokens
+    ),
+    recent_message_limit INTEGER NOT NULL CHECK (recent_message_limit BETWEEN 0 AND 200),
+    retrieval_limit INTEGER NOT NULL CHECK (retrieval_limit BETWEEN 0 AND 100),
+    workspace_policy TEXT NOT NULL CHECK (workspace_policy IN ('NONE', 'READ_ONLY', 'WRITE_TASK')),
+    approval_policy TEXT NOT NULL CHECK (approval_policy IN ('READ_ONLY', 'WORKSPACE_WRITE')),
+    timeout_seconds INTEGER NOT NULL CHECK (timeout_seconds BETWEEN 30 AND 86400),
+    created_at TEXT NOT NULL,
+    UNIQUE(profile_id, revision)
+);
+
+CREATE INDEX agent_profile_revisions_history_idx
+ON agent_profile_revisions(profile_id, revision DESC);
+
+INSERT INTO agent_profiles(id, name, role, current_revision_id, created_at, updated_at) VALUES
+('profile-planner', '规划 Agent', 'PLANNER', 'profile-planner-r1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-implementer', '实现 Agent', 'IMPLEMENTER', 'profile-implementer-r1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-revision', '修订 Agent', 'REVISION', 'profile-revision-r1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-reviewer', '审查 Agent', 'REVIEWER', 'profile-reviewer-r1', strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+INSERT INTO agent_profile_revisions(
+    id, profile_id, revision, instructions, adapter, command, args_json, model,
+    max_input_tokens, reserved_output_tokens, recent_message_limit, retrieval_limit,
+    workspace_policy, approval_policy, timeout_seconds, created_at
+) VALUES
+('profile-planner-r1', 'profile-planner', 1, '分析 Topic，提出必要澄清，生成可审核的 Plan、Task 草案、验收标准、测试项和估算。未经人工批准不得执行正式 Task。', 'generic', '', '[]', '', 64000, 12000, 30, 10, 'NONE', 'READ_ONLY', 3600, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-implementer-r1', 'profile-implementer', 1, '只实现当前 Task，在受管 Workspace 内工作，满足验收标准并报告实际执行的测试证据。', 'generic', '', '[]', '', 64000, 12000, 20, 8, 'WRITE_TASK', 'WORKSPACE_WRITE', 3600, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-revision-r1', 'profile-revision', 1, '针对最近一次驳回意见修订当前 Task，保留正确改动，重新运行受影响测试并报告证据。', 'generic', '', '[]', '', 64000, 12000, 20, 8, 'WRITE_TASK', 'WORKSPACE_WRITE', 3600, strftime('%Y-%m-%dT%H:%M:%fZ', 'now')),
+('profile-reviewer-r1', 'profile-reviewer', 1, '只读审查当前 Task 的验收标准、Diff 和测试证据，明确区分已验证事实与推断。', 'generic', '', '[]', '', 48000, 10000, 15, 8, 'READ_ONLY', 'READ_ONLY', 1800, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+
+CREATE TABLE project_agent_defaults (
+    purpose TEXT PRIMARY KEY CHECK (purpose IN ('PLANNING', 'IMPLEMENTATION', 'REVISION', 'REVIEW')),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT
+);
+
+INSERT INTO project_agent_defaults(purpose, profile_id) VALUES
+('PLANNING', 'profile-planner'),
+('IMPLEMENTATION', 'profile-implementer'),
+('REVISION', 'profile-revision'),
+('REVIEW', 'profile-reviewer');`, true
+	case 12:
+		return `CREATE TABLE runs (
+    id TEXT PRIMARY KEY,
+    purpose TEXT NOT NULL CHECK (purpose IN ('PLANNING', 'IMPLEMENTATION', 'REVISION', 'REVIEW')),
+    topic_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN (
+        'CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING',
+        'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'
+    )),
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    retry_of_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    claim_token_hash TEXT NOT NULL,
+    lease_generation INTEGER NOT NULL CHECK (lease_generation >= 1),
+    lease_expires_at TEXT NOT NULL,
+    runner_pid INTEGER,
+    runner_started_at TEXT,
+    run_nonce TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    failure_kind TEXT NOT NULL DEFAULT '',
+    failure_code TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    failure_retryable INTEGER CHECK (failure_retryable IS NULL OR failure_retryable IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (purpose = 'PLANNING' AND topic_id IS NOT NULL AND task_id IS NULL) OR
+        (purpose != 'PLANNING' AND topic_id IS NULL AND task_id IS NOT NULL)
+    )
+);
+
+CREATE UNIQUE INDEX runs_one_active_task_idx
+ON runs(task_id) WHERE task_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+
+CREATE UNIQUE INDEX runs_one_active_topic_idx
+ON runs(topic_id) WHERE topic_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+
+CREATE INDEX runs_status_queue_idx ON runs(status, queued_at);
+CREATE INDEX runs_task_history_idx ON runs(task_id, created_at DESC);`, true
+	case 13:
+		return `CREATE TABLE task_estimates (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    points INTEGER NOT NULL CHECK (points IN (1, 2, 3, 5, 8, 13)),
+    remaining_points INTEGER NOT NULL CHECK (remaining_points BETWEEN 0 AND points),
+    confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    rationale TEXT NOT NULL,
+    source TEXT NOT NULL CHECK (source IN ('AI', 'HUMAN')),
+    source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    CHECK (source != 'AI' OR source_run_id IS NOT NULL),
+    UNIQUE(task_id, revision)
+);
+
+CREATE INDEX task_estimates_history_idx ON task_estimates(task_id, revision DESC);
+
+CREATE TABLE task_test_cases (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    title TEXT NOT NULL,
+    description TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+    created_by TEXT NOT NULL CHECK (created_by IN ('HUMAN', 'AGENT')),
+    source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (created_by != 'AGENT' OR source_run_id IS NOT NULL)
+);
+
+CREATE INDEX task_test_cases_order_idx ON task_test_cases(task_id, sort_order, created_at);
+
+CREATE TABLE task_test_results (
+    id TEXT PRIMARY KEY,
+    test_case_id TEXT NOT NULL REFERENCES task_test_cases(id) ON DELETE CASCADE,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    outcome TEXT NOT NULL CHECK (outcome IN ('PASSED', 'FAILED', 'BLOCKED')),
+    evidence_kind TEXT NOT NULL CHECK (evidence_kind IN ('COMMAND', 'HUMAN', 'AGENT_REPORT')),
+    summary TEXT NOT NULL,
+    command TEXT NOT NULL DEFAULT '',
+    artifact_ref TEXT NOT NULL DEFAULT '',
+    source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    CHECK (evidence_kind != 'COMMAND' OR length(trim(command)) > 0),
+    CHECK (evidence_kind != 'AGENT_REPORT' OR source_run_id IS NOT NULL)
+);
+
+CREATE INDEX task_test_results_latest_idx
+ON task_test_results(test_case_id, created_at DESC, id DESC);`, true
+	case 14:
+		return `CREATE TABLE run_artifacts (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    kind TEXT NOT NULL CHECK (kind IN ('PROMPT', 'CONTEXT_MANIFEST', 'STDOUT', 'STDERR', 'RESULT')),
+    relative_path TEXT NOT NULL UNIQUE,
+    sha256 TEXT NOT NULL,
+    size INTEGER NOT NULL CHECK (size >= 0),
+    truncated INTEGER NOT NULL CHECK (truncated IN (0, 1)),
+    created_at TEXT NOT NULL,
+    UNIQUE(run_id, kind)
+);
+
+CREATE INDEX run_artifacts_run_idx ON run_artifacts(run_id, kind);`, true
+	case 15:
+		return `INSERT INTO task_events(id, task_id, sequence, event_type, payload_json, occurred_at)
+SELECT lower(hex(randomblob(16))), id, version + 1, 'TASK_STATUS_CHANGED',
+       '{"schema_version":1,"command":"MIGRATE_AUTO_READY","from":"BACKLOG","to":"READY"}',
+       strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+FROM tasks WHERE status = 'BACKLOG';
+
+UPDATE tasks
+SET status = 'READY', version = version + 1, updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+WHERE status = 'BACKLOG';`, true
+	case 16:
+		return `ALTER TABLE tasks ADD COLUMN title_source TEXT NOT NULL DEFAULT 'HUMAN'
+    CHECK (title_source IN ('PROVISIONAL', 'AI', 'HUMAN'));
+ALTER TABLE tasks ADD COLUMN title_locked INTEGER NOT NULL DEFAULT 1
+    CHECK (title_locked IN (0, 1));
+ALTER TABLE tasks ADD COLUMN assessment_input_version INTEGER NOT NULL DEFAULT 1
+    CHECK (assessment_input_version >= 1);
+
+ALTER TABLE task_events RENAME TO task_events_v15;
+CREATE TABLE task_events (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'TASK_CREATED', 'TASK_STATUS_CHANGED', 'TASK_TITLE_CHANGED'
+    )),
+    payload_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(task_id, sequence)
+);
+INSERT INTO task_events SELECT * FROM task_events_v15;
+DROP TABLE task_events_v15;
+CREATE INDEX task_events_timeline_idx ON task_events(task_id, sequence);
+
+ALTER TABLE agent_profiles RENAME TO agent_profiles_v15;
+CREATE TABLE agent_profiles (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    role TEXT NOT NULL UNIQUE CHECK (role IN (
+        'PLANNER', 'TRIAGER', 'IMPLEMENTER', 'REVISION', 'REVIEWER'
+    )),
+    current_revision_id TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(current_revision_id) REFERENCES agent_profile_revisions(id) DEFERRABLE INITIALLY DEFERRED
+);
+INSERT INTO agent_profiles SELECT * FROM agent_profiles_v15;
+DROP TABLE agent_profiles_v15;
+
+ALTER TABLE project_agent_defaults RENAME TO project_agent_defaults_v15;
+CREATE TABLE project_agent_defaults (
+    purpose TEXT PRIMARY KEY CHECK (purpose IN (
+        'PLANNING', 'TRIAGE', 'IMPLEMENTATION', 'REVISION', 'REVIEW'
+    )),
+    profile_id TEXT NOT NULL REFERENCES agent_profiles(id) ON DELETE RESTRICT
+);
+INSERT INTO project_agent_defaults SELECT * FROM project_agent_defaults_v15;
+DROP TABLE project_agent_defaults_v15;
+
+INSERT INTO agent_profiles(id, name, role, current_revision_id, created_at, updated_at)
+VALUES ('profile-triager', '任务评估 Agent', 'TRIAGER', 'profile-triager-r1',
+        strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'));
+INSERT INTO agent_profile_revisions(
+    id, profile_id, revision, instructions, adapter, command, args_json, model,
+    max_input_tokens, reserved_output_tokens, recent_message_limit, retrieval_limit,
+    workspace_policy, approval_policy, timeout_seconds, created_at
+) VALUES (
+    'profile-triager-r1', 'profile-triager', 1,
+    '只评估当前正式 Task：生成简洁动宾标题，按固定六维标准给出 0 到 4 的原始评分、置信度、依据、假设和拆分建议。不得修改代码、优先级、模型或权限。',
+    'generic', '', '[]', '', 32000, 6000, 20, 8, 'NONE', 'READ_ONLY', 900,
+    strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+);
+INSERT INTO project_agent_defaults(purpose, profile_id) VALUES ('TRIAGE', 'profile-triager');
+
+ALTER TABLE runs RENAME TO runs_v15;
+CREATE TABLE runs (
+    id TEXT PRIMARY KEY,
+    purpose TEXT NOT NULL CHECK (purpose IN (
+        'PLANNING', 'TRIAGE', 'IMPLEMENTATION', 'REVISION', 'REVIEW'
+    )),
+    topic_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN (
+        'CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING',
+        'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'
+    )),
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    retry_of_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    claim_token_hash TEXT NOT NULL,
+    lease_generation INTEGER NOT NULL CHECK (lease_generation >= 1),
+    lease_expires_at TEXT NOT NULL,
+    runner_pid INTEGER,
+    runner_started_at TEXT,
+    run_nonce TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    failure_kind TEXT NOT NULL DEFAULT '',
+    failure_code TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    failure_retryable INTEGER CHECK (failure_retryable IS NULL OR failure_retryable IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    subject_version INTEGER NOT NULL DEFAULT 0 CHECK (subject_version >= 0),
+    CHECK (
+        (purpose = 'PLANNING' AND topic_id IS NOT NULL AND task_id IS NULL) OR
+        (purpose != 'PLANNING' AND topic_id IS NULL AND task_id IS NOT NULL)
+    )
+);
+INSERT INTO runs(
+    id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
+    claim_token_hash, lease_generation, lease_expires_at, runner_pid, runner_started_at,
+    run_nonce, queued_at, claimed_at, started_at, finished_at, exit_code,
+    failure_kind, failure_code, failure_message, failure_retryable, created_at, updated_at,
+    subject_version
+)
+SELECT id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
+       claim_token_hash, lease_generation, lease_expires_at, runner_pid, runner_started_at,
+       run_nonce, queued_at, claimed_at, started_at, finished_at, exit_code,
+       failure_kind, failure_code, failure_message, failure_retryable, created_at, updated_at,
+       CASE WHEN task_id IS NULL THEN 0 ELSE 1 END
+FROM runs_v15;
+DROP TABLE runs_v15;
+CREATE UNIQUE INDEX runs_one_active_task_idx
+ON runs(task_id) WHERE task_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+CREATE UNIQUE INDEX runs_one_active_topic_idx
+ON runs(topic_id) WHERE topic_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+CREATE INDEX runs_status_queue_idx ON runs(status, queued_at);
+CREATE INDEX runs_task_history_idx ON runs(task_id, created_at DESC);
+
+CREATE TABLE task_assessments (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    task_assessment_version INTEGER NOT NULL CHECK (task_assessment_version >= 1),
+    revision INTEGER NOT NULL CHECK (revision >= 1),
+    suggested_title TEXT NOT NULL,
+    applied_title TEXT NOT NULL,
+    technical_complexity INTEGER NOT NULL CHECK (technical_complexity BETWEEN 0 AND 4),
+    requirement_uncertainty INTEGER NOT NULL CHECK (requirement_uncertainty BETWEEN 0 AND 4),
+    change_scope INTEGER NOT NULL CHECK (change_scope BETWEEN 0 AND 4),
+    validation_burden INTEGER NOT NULL CHECK (validation_burden BETWEEN 0 AND 4),
+    human_dependency INTEGER NOT NULL CHECK (human_dependency BETWEEN 0 AND 4),
+    risk_and_reversibility INTEGER NOT NULL CHECK (risk_and_reversibility BETWEEN 0 AND 4),
+    weighted_score REAL NOT NULL CHECK (weighted_score BETWEEN 0 AND 4),
+    complexity TEXT NOT NULL CHECK (complexity IN ('C1', 'C2', 'C3', 'C4', 'C5')),
+    autonomy TEXT NOT NULL CHECK (autonomy IN ('A0', 'A1', 'A2', 'A3')),
+    confidence REAL NOT NULL CHECK (confidence BETWEEN 0 AND 1),
+    rationale TEXT NOT NULL,
+    assumptions_json TEXT NOT NULL,
+    split_recommended INTEGER NOT NULL CHECK (split_recommended IN (0, 1)),
+    split_rationale TEXT NOT NULL,
+    source_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, revision),
+    UNIQUE(source_run_id)
+);
+CREATE INDEX task_assessments_current_idx
+ON task_assessments(task_id, revision DESC);`, true
+	case 17:
+		return `ALTER TABLE runs RENAME TO runs_v16;
+CREATE TABLE runs (
+    id TEXT PRIMARY KEY,
+    purpose TEXT NOT NULL CHECK (purpose IN (
+        'PLANNING', 'TRIAGE', 'IMPLEMENTATION', 'REVISION', 'REVIEW'
+    )),
+    topic_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN (
+        'CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING', 'NEEDS_INPUT',
+        'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'
+    )),
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    retry_of_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_of_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    claim_token_hash TEXT NOT NULL,
+    lease_generation INTEGER NOT NULL CHECK (lease_generation >= 1),
+    lease_expires_at TEXT NOT NULL,
+    runner_pid INTEGER,
+    runner_started_at TEXT,
+    run_nonce TEXT NOT NULL,
+    queued_at TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    exit_code INTEGER,
+    failure_kind TEXT NOT NULL DEFAULT '',
+    failure_code TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    failure_retryable INTEGER CHECK (failure_retryable IS NULL OR failure_retryable IN (0, 1)),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    subject_version INTEGER NOT NULL DEFAULT 0 CHECK (subject_version >= 0),
+    CHECK (
+        (purpose = 'PLANNING' AND topic_id IS NOT NULL AND task_id IS NULL) OR
+        (purpose != 'PLANNING' AND topic_id IS NULL AND task_id IS NOT NULL)
+    )
+);
+INSERT INTO runs(
+    id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
+    continuation_of_run_id, claim_token_hash, lease_generation, lease_expires_at,
+    runner_pid, runner_started_at, run_nonce, queued_at, claimed_at, started_at,
+    finished_at, exit_code, failure_kind, failure_code, failure_message,
+    failure_retryable, created_at, updated_at, subject_version
+)
+SELECT id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
+       NULL, claim_token_hash, lease_generation, lease_expires_at, runner_pid,
+       runner_started_at, run_nonce, queued_at, claimed_at, started_at, finished_at,
+       exit_code, failure_kind, failure_code, failure_message, failure_retryable,
+       created_at, updated_at, subject_version
+FROM runs_v16;
+DROP TABLE runs_v16;
+CREATE UNIQUE INDEX runs_one_active_task_idx
+ON runs(task_id) WHERE task_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+CREATE UNIQUE INDEX runs_one_active_topic_idx
+ON runs(topic_id) WHERE topic_id IS NOT NULL AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING');
+CREATE INDEX runs_status_queue_idx ON runs(status, queued_at);
+CREATE INDEX runs_task_history_idx ON runs(task_id, created_at DESC);
+
+CREATE TABLE clarifications (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_purpose TEXT NOT NULL CHECK (continuation_purpose IN ('IMPLEMENTATION', 'REVISION')),
+    category TEXT NOT NULL CHECK (category IN ('REQUIREMENT', 'DECISION', 'ENVIRONMENT', 'VALIDATION')),
+    question TEXT NOT NULL CHECK (length(trim(question)) BETWEEN 1 AND 4000),
+    options_json TEXT NOT NULL,
+    recommended_option_id TEXT NOT NULL DEFAULT '',
+    allow_custom_answer INTEGER NOT NULL CHECK (allow_custom_answer IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('OPEN', 'ANSWERED')),
+    selected_option_id TEXT NOT NULL DEFAULT '',
+    custom_answer TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    answered_at TEXT,
+    CHECK (
+        (status = 'OPEN' AND selected_option_id = '' AND custom_answer = '' AND answered_at IS NULL) OR
+        (status = 'ANSWERED' AND ((selected_option_id != '' AND custom_answer = '') OR
+                                  (selected_option_id = '' AND custom_answer != '')) AND answered_at IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX clarifications_one_open_task_idx
+ON clarifications(task_id) WHERE status = 'OPEN';
+CREATE INDEX clarifications_open_queue_idx ON clarifications(status, created_at);`, true
+	case 18:
+		return `CREATE TABLE plans (
+    id TEXT PRIMARY KEY,
+    plan_key TEXT NOT NULL UNIQUE,
+    topic_id TEXT NOT NULL UNIQUE REFERENCES topics(id) ON DELETE RESTRICT,
+    status TEXT NOT NULL CHECK (status IN ('IN_REVIEW', 'CHANGES_REQUESTED', 'APPROVED')),
+    current_revision_id TEXT NOT NULL,
+    approved_revision_id TEXT,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    FOREIGN KEY(current_revision_id) REFERENCES plan_revisions(id) DEFERRABLE INITIALLY DEFERRED,
+    FOREIGN KEY(approved_revision_id) REFERENCES plan_revisions(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE plan_revisions (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
+    revision_number INTEGER NOT NULL CHECK (revision_number >= 1),
+    summary TEXT NOT NULL CHECK (length(trim(summary)) BETWEEN 1 AND 20000),
+    rationale TEXT NOT NULL,
+    risks TEXT NOT NULL,
+    source_run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    previous_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    UNIQUE(plan_id, revision_number)
+);
+
+CREATE INDEX plan_revisions_history_idx ON plan_revisions(plan_id, revision_number DESC);
+
+CREATE TABLE plan_task_drafts (
+    id TEXT PRIMARY KEY,
+    plan_revision_id TEXT NOT NULL REFERENCES plan_revisions(id) ON DELETE RESTRICT,
+    draft_key TEXT NOT NULL,
+    title TEXT NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 200),
+    description TEXT NOT NULL,
+    acceptance_criteria TEXT NOT NULL,
+    priority INTEGER NOT NULL CHECK (priority BETWEEN 0 AND 3),
+    proposed_order INTEGER NOT NULL CHECK (proposed_order >= 0),
+    UNIQUE(plan_revision_id, draft_key),
+    UNIQUE(plan_revision_id, proposed_order)
+);
+
+CREATE TABLE plan_task_draft_test_cases (
+    id TEXT PRIMARY KEY,
+    task_draft_id TEXT NOT NULL REFERENCES plan_task_drafts(id) ON DELETE RESTRICT,
+    title TEXT NOT NULL CHECK (length(trim(title)) > 0),
+    description TEXT NOT NULL,
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    sort_order INTEGER NOT NULL CHECK (sort_order >= 0),
+    UNIQUE(task_draft_id, sort_order)
+);
+
+CREATE TABLE plan_reviews (
+    id TEXT PRIMARY KEY,
+    plan_id TEXT NOT NULL REFERENCES plans(id) ON DELETE RESTRICT,
+    plan_revision_id TEXT NOT NULL REFERENCES plan_revisions(id) ON DELETE RESTRICT,
+    decision TEXT NOT NULL CHECK (decision IN ('APPROVED', 'CHANGES_REQUESTED')),
+    comment TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+
+CREATE INDEX plan_reviews_history_idx ON plan_reviews(plan_id, created_at DESC);
+
+ALTER TABLE tasks ADD COLUMN source_plan_revision_id TEXT REFERENCES plan_revisions(id) ON DELETE RESTRICT;
+ALTER TABLE tasks ADD COLUMN source_plan_task_draft_id TEXT REFERENCES plan_task_drafts(id) ON DELETE RESTRICT;
+CREATE UNIQUE INDEX tasks_source_plan_draft_unique_idx
+ON tasks(source_plan_task_draft_id) WHERE source_plan_task_draft_id IS NOT NULL;`, true
+	case 19:
+		return `CREATE TABLE project_skills (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    source_path TEXT NOT NULL UNIQUE,
+    content_sha256 TEXT NOT NULL CHECK (length(content_sha256) = 64),
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE project_mcp_servers (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    config_name TEXT NOT NULL UNIQUE,
+    enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE agent_profile_revision_skills (
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    skill_id TEXT NOT NULL REFERENCES project_skills(id) ON DELETE RESTRICT,
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    PRIMARY KEY(profile_revision_id, skill_id)
+);
+
+CREATE TABLE agent_profile_revision_mcp_servers (
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    mcp_server_id TEXT NOT NULL REFERENCES project_mcp_servers(id) ON DELETE RESTRICT,
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    enabled_tools_json TEXT NOT NULL,
+    PRIMARY KEY(profile_revision_id, mcp_server_id)
+);
+
+CREATE TABLE run_tool_policy_snapshots (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    snapshot_json TEXT NOT NULL,
+    sha256 TEXT NOT NULL CHECK (length(sha256) = 64),
+    created_at TEXT NOT NULL
+);`, true
+	case 20:
+		return `CREATE TABLE run_usage (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    input_tokens INTEGER CHECK (input_tokens IS NULL OR input_tokens >= 0),
+    cached_input_tokens INTEGER CHECK (cached_input_tokens IS NULL OR cached_input_tokens >= 0),
+    cache_write_input_tokens INTEGER CHECK (cache_write_input_tokens IS NULL OR cache_write_input_tokens >= 0),
+    output_tokens INTEGER CHECK (output_tokens IS NULL OR output_tokens >= 0),
+    reasoning_output_tokens INTEGER CHECK (reasoning_output_tokens IS NULL OR reasoning_output_tokens >= 0),
+    model_requests INTEGER CHECK (model_requests IS NULL OR model_requests >= 1),
+    peak_input_tokens INTEGER CHECK (peak_input_tokens IS NULL OR peak_input_tokens >= 0),
+    source TEXT NOT NULL CHECK (source IN ('CODEX_JSONL')),
+    captured_at TEXT NOT NULL,
+    CHECK (
+        input_tokens IS NOT NULL OR cached_input_tokens IS NOT NULL OR
+        cache_write_input_tokens IS NOT NULL OR output_tokens IS NOT NULL OR
+        reasoning_output_tokens IS NOT NULL OR model_requests IS NOT NULL OR
+        peak_input_tokens IS NOT NULL
+    ),
+    CHECK (input_tokens IS NULL OR cached_input_tokens IS NULL OR cached_input_tokens <= input_tokens),
+    CHECK (input_tokens IS NULL OR peak_input_tokens IS NULL OR peak_input_tokens <= input_tokens)
+);
+
+CREATE INDEX run_usage_captured_idx ON run_usage(captured_at DESC);`, true
 	default:
 		return "", false
 	}

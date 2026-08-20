@@ -44,7 +44,7 @@ export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask }: Creat
       if (kind === 'topic') {
         await onCreateTopic({ title: '', description: normalized })
       } else {
-        await onCreateTask({ title: '', description: normalized, acceptance_criteria: '', priority: 0 })
+		await onCreateTask({ title: '', description: normalized, acceptance_criteria: '', priority: 2 })
       }
       onClose()
     } catch (submitError: unknown) {

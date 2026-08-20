@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -80,6 +81,38 @@ func TestGitRoutesValidateAndReportMissingTask(t *testing.T) {
 	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/missing/workspace", "", http.StatusNotFound)
 }
 
+func TestGitRoutesExposeChangesAndManualReview(t *testing.T) {
+	server, database := newGitTestServer(t)
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(context.Background(), task.CreateInput{Title: "人工验收"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/workspace", "", http.StatusOK)
+	var worktree workspace.Workspace
+	if err := json.Unmarshal(body, &worktree); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree.Path, "README.md"), []byte("# changed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	changes := requestJSON(t, server.Client(), http.MethodGet, server.URL+"/api/tasks/"+created.ID+"/changes", "", http.StatusOK)
+	if !strings.Contains(string(changes), `"path":"README.md"`) {
+		t.Fatalf("changes = %s", changes)
+	}
+	current, err := store.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/submit-review",
+		fmt.Sprintf(`{"version":%d}`, current.Version), http.StatusOK)
+	reviewed := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/reviews",
+		fmt.Sprintf(`{"version":%d,"decision":"ACCEPTED"}`, current.Version+1), http.StatusOK)
+	if !strings.Contains(string(reviewed), `"status":"ACCEPTED"`) || !strings.Contains(string(reviewed), `"commit_sha":"`) {
+		t.Fatalf("review = %s", reviewed)
+	}
+}
+
 func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	t.Helper()
 	temporaryRoot, err := filepath.Abs(filepath.Join("..", "..", ".tmp"))
@@ -112,7 +145,11 @@ func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	}
 	t.Cleanup(func() { _ = database.Close() })
 	mux := http.NewServeMux()
-	RegisterGitWorkflowRoutes(mux, gitworkflow.New(currentProject, database))
+	manager := gitworkflow.New(currentProject, database)
+	discussionStore := storage.NewDiscussionStore(database)
+	relationStore := storage.NewRelationStore(database)
+	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore, storage.NewAssessmentStore(database))
+	RegisterGitWorkflowRoutes(mux, manager)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server, database

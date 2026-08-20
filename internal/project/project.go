@@ -147,8 +147,9 @@ func initializeConfigFiles(ctx context.Context, root string, paths Paths) error 
 		local := LocalConfig{
 			Version: 1,
 			Agent: AgentConfig{
-				Args:       []string{},
-				MaxWorkers: 2,
+				Args:           []string{},
+				WorkersEnabled: false,
+				MaxWorkers:     2,
 			},
 			Proxy:  ProxyConfig{Mode: "inherit"},
 			Server: ServerConfig{Port: 0},
@@ -177,13 +178,55 @@ func readConfigs(paths Paths) (ProjectConfig, LocalConfig, error) {
 	if config.Version != 1 || local.Version != 1 {
 		return ProjectConfig{}, LocalConfig{}, errors.New("不支持的 ATS 配置版本")
 	}
-	if local.Agent.MaxWorkers < 1 {
-		return ProjectConfig{}, LocalConfig{}, errors.New("agent.max_workers 必须大于 0")
+	if err := validateMaxWorkers(local.Agent.MaxWorkers); err != nil {
+		return ProjectConfig{}, LocalConfig{}, err
 	}
 	if local.Server.Port < 0 || local.Server.Port > 65535 {
 		return ProjectConfig{}, LocalConfig{}, errors.New("server.port 必须为 0 到 65535；0 表示使用随机端口")
 	}
 	return config, local, nil
+}
+
+// WorkerSettings 返回当前进程生效的项目 Worker 配置。
+func (project *Project) WorkerSettings() WorkerSettings {
+	project.configMu.RLock()
+	defer project.configMu.RUnlock()
+	return WorkerSettings{
+		Enabled:    project.Local.Agent.WorkersEnabled,
+		MaxWorkers: project.Local.Agent.MaxWorkers,
+	}
+}
+
+// AgentAdapter 返回旧配置中的 Adapter 展示值。
+func (project *Project) AgentAdapter() string {
+	project.configMu.RLock()
+	defer project.configMu.RUnlock()
+	return project.Local.Agent.Adapter
+}
+
+// UpdateWorkerSettings 原子保存并启用新的项目 Worker 配置。
+func (project *Project) UpdateWorkerSettings(enabled bool, maxWorkers int) (WorkerSettings, error) {
+	if err := validateMaxWorkers(maxWorkers); err != nil {
+		return WorkerSettings{}, err
+	}
+
+	project.configMu.Lock()
+	defer project.configMu.Unlock()
+	updated := project.Local
+	updated.Agent.WorkersEnabled = enabled
+	updated.Agent.MaxWorkers = maxWorkers
+	if err := writeTOML(project.Paths.LocalConfig, 0o600, updated); err != nil {
+		return WorkerSettings{}, fmt.Errorf("保存 Worker 配置: %w", err)
+	}
+	project.Local = updated
+	return WorkerSettings{Enabled: enabled, MaxWorkers: maxWorkers}, nil
+}
+
+func validateMaxWorkers(maxWorkers int) error {
+	if maxWorkers < 1 || maxWorkers > 32 {
+		return errors.New("agent.max_workers 必须为 1 到 32")
+	}
+	return nil
 }
 
 func existingOrNewInstanceID(ctx context.Context, path string) (string, error) {

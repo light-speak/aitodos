@@ -12,8 +12,10 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/light-speak/aitodos/internal/capabilitycatalog"
 	"github.com/light-speak/aitodos/internal/gitworkflow"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/scheduler"
 	"github.com/light-speak/aitodos/internal/storage"
 	"github.com/light-speak/aitodos/internal/transport/httpapi"
 	"github.com/light-speak/aitodos/internal/webui"
@@ -38,6 +40,8 @@ func Serve(
 		return fmt.Errorf("open project database: %w", err)
 	}
 	defer database.Close()
+	projectScheduler := scheduler.New(currentProject, database)
+	go projectScheduler.Run(ctx)
 
 	address := net.JoinHostPort("127.0.0.1", strconv.Itoa(port))
 	listener, err := net.Listen("tcp4", address)
@@ -101,10 +105,23 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	mux := http.NewServeMux()
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
+	gitManager := gitworkflow.New(currentProject, database)
 	httpapi.RegisterTopicRoutes(mux, storage.NewTopicStore(database), discussionStore, relationStore)
-	httpapi.RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore)
+	httpapi.RegisterPlanRoutes(mux, storage.NewPlanStore(database))
+	taskStore := storage.NewTaskStore(database)
+	assessmentStore := storage.NewAssessmentStore(database)
+	httpapi.RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, assessmentStore)
+	httpapi.RegisterAssessmentRoutes(mux, taskStore, assessmentStore)
 	httpapi.RegisterArtifactRoutes(mux, storage.NewArtifactStore(database, currentProject.Paths.Artifacts))
-	httpapi.RegisterGitWorkflowRoutes(mux, gitworkflow.New(currentProject, database))
+	httpapi.RegisterGitWorkflowRoutes(mux, gitManager)
+	httpapi.RegisterProjectRoutes(mux, currentProject)
+	httpapi.RegisterAgentProfileRoutes(mux, storage.NewAgentProfileStore(database))
+	httpapi.RegisterCapabilityRoutes(mux, capabilitycatalog.New(
+		currentProject.Root, "codex", storage.NewCapabilityStore(database),
+	))
+	httpapi.RegisterQualityRoutes(mux, storage.NewQualityStore(database))
+	httpapi.RegisterClarificationRoutes(mux, storage.NewClarificationStore(database))
+	httpapi.RegisterRunRoutes(mux, storage.NewRunStore(database))
 	mux.HandleFunc("GET /api/health", func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(response).Encode(Health{
@@ -112,15 +129,6 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 			ProjectInstanceID: currentProject.InstanceID,
 			Nonce:             metadata.Nonce,
 			PID:               metadata.PID,
-		})
-	})
-	mux.HandleFunc("GET /api/project", func(response http.ResponseWriter, _ *http.Request) {
-		response.Header().Set("Content-Type", "application/json")
-		_ = json.NewEncoder(response).Encode(map[string]any{
-			"name":        currentProject.Config.Name,
-			"root":        currentProject.Root,
-			"agent":       currentProject.Local.Agent.Adapter,
-			"max_workers": currentProject.Local.Agent.MaxWorkers,
 		})
 	})
 	uiHandler, err := webui.NewHandler()

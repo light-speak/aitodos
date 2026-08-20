@@ -20,26 +20,28 @@ const (
 type Command string
 
 const (
-	CommandQueue        Command = "QUEUE"
-	CommandClaimRun     Command = "CLAIM_RUN"
-	CommandRunSucceeded Command = "RUN_SUCCEEDED"
-	CommandRunFailed    Command = "RUN_FAILED"
-	CommandCancelRun    Command = "CANCEL_RUN"
-	CommandAccept       Command = "ACCEPT"
-	CommandReject       Command = "REJECT"
-	CommandRetry        Command = "RETRY"
+	CommandSubmitReview         Command = "SUBMIT_REVIEW"
+	CommandClaimRun             Command = "CLAIM_RUN"
+	CommandRunSucceeded         Command = "RUN_SUCCEEDED"
+	CommandRunFailed            Command = "RUN_FAILED"
+	CommandNeedsInput           Command = "NEEDS_INPUT"
+	CommandCancelRun            Command = "CANCEL_RUN"
+	CommandAccept               Command = "ACCEPT"
+	CommandReject               Command = "REJECT"
+	CommandRetry                Command = "RETRY"
+	CommandResumeImplementation Command = "RESUME_IMPLEMENTATION"
+	CommandResumeRevision       Command = "RESUME_REVISION"
 )
 
 var transitions = map[Status]map[Command]Status{
-	StatusBacklog: {
-		CommandQueue: StatusReady,
-	},
 	StatusReady: {
-		CommandClaimRun: StatusRunning,
+		CommandClaimRun:     StatusRunning,
+		CommandSubmitReview: StatusReview,
 	},
 	StatusRunning: {
 		CommandRunSucceeded: StatusReview,
 		CommandRunFailed:    StatusBlocked,
+		CommandNeedsInput:   StatusBlocked,
 		CommandCancelRun:    StatusCancelled,
 	},
 	StatusReview: {
@@ -47,10 +49,12 @@ var transitions = map[Status]map[Command]Status{
 		CommandReject: StatusChangesRequested,
 	},
 	StatusChangesRequested: {
-		CommandQueue: StatusReady,
+		CommandClaimRun: StatusRunning,
 	},
 	StatusBlocked: {
-		CommandRetry: StatusReady,
+		CommandRetry:                StatusReady,
+		CommandResumeImplementation: StatusReady,
+		CommandResumeRevision:       StatusChangesRequested,
 	},
 }
 
@@ -90,13 +94,16 @@ func AllStatuses() []Status {
 // AllCommands 返回状态机定义的全部领域命令。
 func AllCommands() []Command {
 	return []Command{
-		CommandQueue,
+		CommandSubmitReview,
 		CommandClaimRun,
 		CommandRunSucceeded,
 		CommandRunFailed,
+		CommandNeedsInput,
 		CommandCancelRun,
 		CommandAccept,
 		CommandReject,
 		CommandRetry,
+		CommandResumeImplementation,
+		CommandResumeRevision,
 	}
 }

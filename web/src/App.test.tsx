@@ -1,4 +1,4 @@
-import { render, screen, within } from '@testing-library/react'
+import { act, render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 
@@ -8,10 +8,23 @@ const backlogTask = {
   id: 'task-1',
   key: 'ATS-001',
   title: '实现项目看板',
+	title_source: 'HUMAN',
+	title_locked: true,
   description: '展示当前项目中的任务',
   acceptance_criteria: '可以查看详情并排队',
   status: 'BACKLOG',
   priority: 10,
+	assessment_input_version: 1,
+	assessment: {
+		id: 'assessment-1', task_id: 'task-1', task_assessment_version: 1, revision: 1,
+		suggested_title: '实现项目看板', applied_title: '实现项目看板',
+		scores: { technical_complexity: 4, requirement_uncertainty: 2, change_scope: 3, validation_burden: 3, human_dependency: 4, risk_and_reversibility: 2 },
+		weighted_score: 3.1, complexity: 'C4', autonomy: 'A0', confidence: 0.8,
+		rationale: '需要跨模块修改并进行多轮人工验证', assumptions: ['接口保持兼容'],
+		split_recommended: true, split_rationale: '建议拆分前后端任务', source_run_id: 'run-triage-1',
+		created_at: '2026-08-18T00:00:00Z',
+	},
+	assessment_stale: false,
   version: 1,
   created_at: '2026-08-18T00:00:00Z',
   updated_at: '2026-08-18T00:00:00Z',
@@ -23,6 +36,8 @@ const relatedTask = {
   key: 'ATS-099',
   title: '补充接口测试',
   priority: 5,
+	assessment: undefined,
+	assessment_stale: false,
 }
 
 const openTopic = {
@@ -46,6 +61,32 @@ const topicMessage = {
   created_at: '2026-08-18T01:00:00Z',
 }
 
+const implementerProfile = {
+	id: 'profile-implementer', name: '实现 Agent', role: 'IMPLEMENTER',
+	created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-20T00:00:00Z',
+	current_revision: {
+		id: 'revision-1', profile_id: 'profile-implementer', revision: 1,
+		instructions: '实现当前 Task', adapter: 'generic', command: '', args: [], model: '',
+		max_input_tokens: 64000, reserved_output_tokens: 12000, recent_message_limit: 20,
+		retrieval_limit: 8, workspace_policy: 'WRITE_TASK', approval_policy: 'WORKSPACE_WRITE',
+		tool_policy: { skills: [], mcp_servers: [] },
+		timeout_seconds: 3600, created_at: '2026-08-20T00:00:00Z',
+	},
+}
+
+const pendingClarification = {
+	id: 'clarification-1', task_id: 'task-1', source_run_id: 'run-1', continuation_purpose: 'IMPLEMENTATION',
+	category: 'DECISION', question: '数据库迁移是否兼容旧版本？',
+	options: [
+		{ id: 'compatible', label: '兼容升级', description: '保留旧数据' },
+		{ id: 'fresh', label: '仅新项目', description: '不迁移旧数据' },
+	],
+	recommended_option_id: 'compatible', allow_custom_answer: true, status: 'OPEN', version: 1,
+	created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-20T00:00:00Z',
+}
+
+let openClarifications: unknown[] = []
+
 const fetchMock = vi.fn<typeof fetch>((input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
   const method = init?.method ?? 'GET'
@@ -55,12 +96,59 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
       name: 'AiTodos',
       root: '/projects/aitodos',
       agent: 'codex',
+		workers_enabled: false,
       max_workers: 2,
     }))
   }
+	if (url === '/api/project/workers' && method === 'POST') {
+		return Promise.resolve(Response.json({
+			name: 'AiTodos', root: '/projects/aitodos', agent: 'codex',
+			workers_enabled: true, max_workers: 2,
+		}))
+	}
   if (url === '/api/tasks' && method === 'GET') {
     return Promise.resolve(Response.json([backlogTask, relatedTask]))
   }
+	if (url === '/api/clarifications' && method === 'GET') {
+		return Promise.resolve(Response.json(openClarifications))
+	}
+	if (url === '/api/tasks/task-1/clarifications' && method === 'GET') {
+		return Promise.resolve(Response.json(openClarifications))
+	}
+	if (url === '/api/clarifications/clarification-1/answer' && method === 'POST') {
+		openClarifications = []
+		return Promise.resolve(Response.json({
+			clarification: { ...pendingClarification, status: 'ANSWERED', selected_option_id: 'compatible', version: 2 },
+			task: { ...backlogTask, status: 'READY', version: 2 },
+		}))
+	}
+	if (url === '/api/progress' && method === 'GET') {
+		return Promise.resolve(Response.json({
+			total_tasks: 2, accepted_tasks: 1, strict_percent: 50,
+			estimated_tasks: 1, estimate_coverage: 50, total_points: 5,
+			remaining_points: 2, forecast_percent: 60,
+			required_tests: 1, verified_passed_tests: 1, agent_reported_passed_tests: 0,
+		}))
+	}
+	if (url === '/api/runs/usage' && method === 'GET') {
+		return Promise.resolve(Response.json({
+			total_runs: 0, runs_with_usage: 0, input_tokens: null, cached_input_tokens: null,
+			uncached_input_tokens: null, cache_write_input_tokens: null, output_tokens: null,
+			reasoning_output_tokens: null, model_requests: null, peak_input_tokens: null, by_purpose: [],
+		}))
+	}
+	if (url === '/api/agent-profiles' && method === 'GET') {
+		return Promise.resolve(Response.json([implementerProfile]))
+	}
+	if (url === '/api/project/capabilities' && method === 'GET') {
+		return Promise.resolve(Response.json({ skills: [], mcp_servers: [] }))
+	}
+	if (url === '/api/agent-profiles/profile-implementer/revisions' && method === 'POST') {
+		return Promise.resolve(Response.json({
+			...implementerProfile,
+			current_revision: { ...implementerProfile.current_revision, revision: 2, command: 'codex' },
+		}, { status: 201 }))
+	}
   if (url === '/api/topics' && method === 'GET') {
     return Promise.resolve(Response.json([openTopic]))
   }
@@ -68,6 +156,7 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
     return Promise.resolve(Response.json({
       current_branch: 'main',
       head_sha: '1234567890abcdef',
+		has_head: true,
       dirty: false,
       branches: [{ name: 'main', head_sha: '1234567890abcdef' }],
     }))
@@ -91,13 +180,22 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
   }
   if (url === '/api/tasks' && method === 'POST') {
     return Promise.resolve(Response.json(
-      { ...backlogTask, id: 'task-2', key: 'ATS-002', title: '新增任务', priority: 0 },
+      { ...backlogTask, id: 'task-2', key: 'ATS-002', title: '新增任务', status: 'READY', priority: 2 },
       { status: 201 },
     ))
   }
-  if (url === '/api/tasks/task-1/queue' && method === 'POST') {
-    return Promise.resolve(Response.json({ ...backlogTask, status: 'READY', version: 2 }))
-  }
+	if (url === '/api/tasks/task-1' && method === 'GET') {
+		return Promise.resolve(Response.json({ ...backlogTask, version: 2, current_workspace_id: 'workspace-1' }))
+	}
+	if (url === '/api/tasks/task-1/title' && method === 'PUT') {
+		return Promise.resolve(Response.json({
+			...backlogTask,
+			title: '实现可筛选项目看板',
+			assessment: undefined,
+			assessment_stale: undefined,
+			version: 2,
+		}))
+	}
   if (url === '/api/topics' && method === 'POST') {
     return Promise.resolve(Response.json(
       { ...openTopic, id: 'topic-2', key: 'TOP-002', title: '规划搜索能力' },
@@ -142,6 +240,7 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
       target_branch: 'main',
       base_commit_sha: '1234567890abcdef',
       head_sha: '1234567890abcdef',
+		has_head: true,
       state: 'READY',
       dirty: false,
       created_at: '2026-08-19T00:00:00Z',
@@ -149,6 +248,21 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
       last_verified_at: '2026-08-19T00:00:00Z',
     }))
   }
+	if (url === '/api/tasks/task-1/reviews' && method === 'GET') {
+		return Promise.resolve(Response.json([]))
+	}
+	if (url === '/api/tasks/task-1/quality' && method === 'GET') {
+		return Promise.resolve(Response.json({ estimate_history: [], test_cases: [] }))
+	}
+	if (url === '/api/tasks/task-1/assessment' && method === 'GET') {
+		return Promise.resolve(Response.json({ current: backlogTask.assessment, history: [backlogTask.assessment], stale: false }))
+	}
+	if (url === '/api/tasks/task-1/changes' && method === 'GET') {
+		return Promise.resolve(Response.json({
+			base_commit_sha: '1234567890abcdef', head_sha: '1234567890abcdef', dirty: false,
+			file_count: 0, additions: 0, deletions: 0, files: [],
+		}))
+	}
   if (url === '/api/tasks/task-1/messages' && method === 'POST') {
     return Promise.resolve(Response.json({
       ...topicMessage,
@@ -176,6 +290,7 @@ describe('App', () => {
   beforeEach(() => {
     vi.stubGlobal('fetch', fetchMock)
     fetchMock.mockClear()
+		openClarifications = []
   })
 
   afterEach(() => {
@@ -203,6 +318,12 @@ describe('App', () => {
     expect(screen.getByRole('region', { name: '待验收' })).toBeInTheDocument()
     expect(screen.getByRole('region', { name: '已完成' })).toBeInTheDocument()
     expect(screen.queryByRole('region', { name: '已就绪' })).not.toBeInTheDocument()
+		expect(screen.getAllByText('C4').length).toBeGreaterThan(1)
+		expect(screen.getByText('A0')).toBeInTheDocument()
+		await user.selectOptions(screen.getByLabelText('复杂度筛选'), 'C4')
+		expect(screen.getByRole('button', { name: /ATS-001.*实现项目看板/ })).toBeInTheDocument()
+		expect(screen.queryByRole('button', { name: /ATS-099.*补充接口测试/ })).not.toBeInTheDocument()
+		await user.selectOptions(screen.getByLabelText('复杂度筛选'), 'ALL')
 
     await user.click(screen.getByRole('button', { name: /ATS-001.*实现项目看板/ }))
 
@@ -211,7 +332,34 @@ describe('App', () => {
     expect(within(dialog).getByText('待完善')).toBeInTheDocument()
     expect(within(dialog).getByText('展示当前项目中的任务')).toBeInTheDocument()
     expect(within(dialog).getByText('可以查看详情并排队')).toBeInTheDocument()
+		expect(within(dialog).getByText('需要跨模块修改并进行多轮人工验证')).toBeInTheDocument()
+		await user.click(within(dialog).getByRole('button', { name: '编辑并锁定标题' }))
+		const titleDialog = screen.getByRole('dialog', { name: '编辑 Task 标题' })
+		await user.clear(within(titleDialog).getByLabelText('Task 标题'))
+		await user.type(within(titleDialog).getByLabelText('Task 标题'), '实现可筛选项目看板')
+		await user.click(within(titleDialog).getByRole('button', { name: '保存并锁定' }))
+		expect(await within(dialog).findByRole('heading', { name: '实现可筛选项目看板' })).toBeInTheDocument()
+		await user.click(within(dialog).getByRole('button', { name: '关闭' }))
+		expect(screen.getAllByText('C4').length).toBeGreaterThan(1)
   })
+
+	it('从全局待回答入口选择答案并让 Task 继续排队', async () => {
+		openClarifications = [pendingClarification]
+		const user = userEvent.setup()
+		render(<App />)
+
+		const pendingButton = await screen.findByRole('button', { name: /待回答 1/ })
+		await user.click(pendingButton)
+		const dialog = screen.getByRole('dialog', { name: '等待你的回答' })
+		await user.click(within(dialog).getByRole('radio', { name: /兼容升级/ }))
+		await user.click(within(dialog).getByRole('button', { name: '回答并继续' }))
+
+		expect(fetchMock).toHaveBeenCalledWith('/api/clarifications/clarification-1/answer', expect.objectContaining({
+			method: 'POST',
+			body: '{"selected_option_id":"compatible","custom_answer":"","expected_version":1}',
+		}))
+		expect(await within(dialog).findByText('当前没有待回答问题。')).toBeInTheDocument()
+	})
 
   it('从仓库分支创建绑定固定 Commit 的本地 Release Tag', async () => {
     const user = userEvent.setup()
@@ -236,22 +384,16 @@ describe('App', () => {
     expect(within(dialog).getAllByText(/12345678/).length).toBeGreaterThan(0)
   })
 
-  it('Task 可显式创建长期 Workspace 并显示 Git 身份', async () => {
+  it('Task Workspace 由 Worker 领取时自动准备，不暴露手动创建入口', async () => {
     const user = userEvent.setup()
     render(<App />)
 
     await user.click(await screen.findByRole('tab', { name: /Tasks/ }))
     await user.click(screen.getByRole('button', { name: /ATS-001.*实现项目看板/ }))
     const dialog = await screen.findByRole('dialog', { name: '实现项目看板' })
-    await user.click(await within(dialog).findByRole('button', { name: '创建 Task Workspace' }))
-
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/tasks/task-1/workspace',
-      expect.objectContaining({ method: 'POST' }),
-    )
-    expect(await within(dialog).findByText('aitodos/aitodos/ATS-001-task1')).toBeInTheDocument()
-    expect(within(dialog).getByText('工作区干净')).toBeInTheDocument()
-    expect(within(dialog).queryByText('v1')).not.toBeInTheDocument()
+	expect(await within(dialog).findByText('Worker 领取 Task 后，系统会自动准备独立 Workspace。')).toBeInTheDocument()
+	expect(within(dialog).queryByRole('button', { name: '创建 Task Workspace' })).not.toBeInTheDocument()
+	expect(within(dialog).queryByRole('button', { name: '设为可执行' })).not.toBeInTheDocument()
   })
 
   it('按 N 新建事项但不覆盖浏览器的 Ctrl+N', async () => {
@@ -285,7 +427,7 @@ describe('App', () => {
     )
   })
 
-  it('从统一入口直接创建 Task 并通过领域命令排队', async () => {
+  it('从统一入口创建的 Task 自动等待 Worker 执行', async () => {
     const user = userEvent.setup()
     render(<App />)
 
@@ -301,21 +443,73 @@ describe('App', () => {
       '/api/tasks',
       expect.objectContaining({
         method: 'POST',
-        body: '{"title":"","description":"新增任务","acceptance_criteria":"","priority":0}',
+        body: '{"title":"","description":"新增任务","acceptance_criteria":"","priority":2}',
       }),
     )
-
-    await user.click(screen.getByRole('button', { name: /ATS-001.*实现项目看板/ }))
-    await user.click(screen.getByRole('button', { name: '加入执行队列' }))
-
     const todoColumn = screen.getByRole('region', { name: '待办' })
-    expect(await within(todoColumn).findByText('实现项目看板')).toBeInTheDocument()
-    expect(await within(todoColumn).findByText('可执行')).toBeInTheDocument()
-    expect(fetchMock).toHaveBeenCalledWith(
-      '/api/tasks/task-1/queue',
-      expect.objectContaining({ method: 'POST', body: '{"version":1}' }),
-    )
+	expect(await within(todoColumn).findByText('新增任务')).toBeInTheDocument()
+	expect(await within(todoColumn).findByText('等待执行')).toBeInTheDocument()
   })
+
+	it('在项目顶部通过全局开关启动 Workers', async () => {
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByText('讨论 Agent 上下文')
+
+		await user.click(screen.getByRole('button', { name: '启动 Workers' }))
+
+		expect(fetchMock).toHaveBeenCalledWith('/api/project/workers', expect.objectContaining({
+			method: 'POST', body: '{"enabled":true,"max_workers":2}',
+		}))
+		expect(await screen.findByRole('button', { name: '暂停 Workers' })).toBeInTheDocument()
+	})
+
+	it('Workers 启动后自动刷新任务状态', async () => {
+		vi.useFakeTimers({ shouldAdvanceTime: true })
+		const user = userEvent.setup({ advanceTimers: vi.advanceTimersByTime })
+		render(<App />)
+		await screen.findByText('讨论 Agent 上下文')
+		const initialReads = fetchMock.mock.calls.filter(([input]) => input === '/api/tasks').length
+
+		await user.click(screen.getByRole('button', { name: '启动 Workers' }))
+		await screen.findByRole('button', { name: '暂停 Workers' })
+		await act(() => vi.advanceTimersByTimeAsync(2_100))
+
+		expect(fetchMock.mock.calls.filter(([input]) => input === '/api/tasks')).toHaveLength(initialReads + 1)
+		vi.useRealTimers()
+	})
+
+	it('可以在项目顶部配置 Worker 并发数', async () => {
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByText('讨论 Agent 上下文')
+
+		await user.click(screen.getByRole('button', { name: '配置 Workers' }))
+		const dialog = screen.getByRole('dialog', { name: 'Worker 设置' })
+		const input = within(dialog).getByLabelText('最大并发数')
+		await user.clear(input)
+		await user.type(input, '4')
+		await user.click(within(dialog).getByRole('button', { name: '保存设置' }))
+
+		expect(fetchMock).toHaveBeenCalledWith('/api/project/workers', expect.objectContaining({
+			method: 'POST', body: '{"enabled":false,"max_workers":4}',
+		}))
+		expect(screen.queryByRole('dialog', { name: 'Worker 设置' })).not.toBeInTheDocument()
+	})
+
+	it('可以查看整体进度与 Agent 配置', async () => {
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByText('讨论 Agent 上下文')
+
+		await user.click(screen.getByRole('tab', { name: '整体进度' }))
+		expect(await screen.findByRole('region', { name: '项目整体进度' })).toBeInTheDocument()
+		expect(screen.getByText('60%')).toBeInTheDocument()
+
+		await user.click(screen.getByRole('tab', { name: 'Agents' }))
+		expect(await screen.findByText('实现 Agent')).toBeInTheDocument()
+		expect(screen.getByText('未配置')).toBeInTheDocument()
+	})
 
   it('统一入口默认创建 Topic 且不要求标题', async () => {
     const user = userEvent.setup()

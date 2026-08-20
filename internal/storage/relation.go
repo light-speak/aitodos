@@ -13,9 +13,12 @@ import (
 var ErrSelfTaskLink = errors.New("task cannot link to itself")
 
 const relatedTaskColumns = `
-tasks.id, tasks.task_key, tasks.title, tasks.description, tasks.acceptance_criteria,
+tasks.id, tasks.task_key, tasks.title, tasks.title_source, tasks.title_locked,
+tasks.description, tasks.acceptance_criteria,
 tasks.status, tasks.priority, tasks.target_branch, tasks.base_commit_sha,
-tasks.current_workspace_id, tasks.latest_run_id, tasks.version,
+tasks.current_workspace_id, tasks.latest_run_id,
+COALESCE(tasks.source_plan_revision_id, ''), COALESCE(tasks.source_plan_task_draft_id, ''),
+tasks.assessment_input_version, tasks.version,
 tasks.created_at, tasks.updated_at`
 
 const relatedTopicColumns = `
@@ -220,10 +223,12 @@ func scanTaskAssociations(rows *sql.Rows) ([]relation.TaskAssociation, error) {
 func scanTaskAssociation(scanner rowScanner, item *relation.TaskAssociation, sourceMessageID *sql.NullString, createdAt *string) error {
 	var taskCreatedAt, taskUpdatedAt string
 	if err := scanner.Scan(
-		&item.Task.ID, &item.Task.Key, &item.Task.Title, &item.Task.Description,
+		&item.Task.ID, &item.Task.Key, &item.Task.Title, &item.Task.TitleSource,
+		&item.Task.TitleLocked, &item.Task.Description,
 		&item.Task.AcceptanceCriteria, &item.Task.Status, &item.Task.Priority,
 		&item.Task.TargetBranch, &item.Task.BaseCommitSHA, &item.Task.CurrentWorkspaceID,
-		&item.Task.LatestRunID, &item.Task.Version, &taskCreatedAt, &taskUpdatedAt,
+		&item.Task.LatestRunID, &item.Task.SourcePlanRevisionID, &item.Task.SourcePlanTaskDraftID,
+		&item.Task.AssessmentInputVersion, &item.Task.Version, &taskCreatedAt, &taskUpdatedAt,
 		sourceMessageID, createdAt,
 	); err != nil {
 		return fmt.Errorf("scan task link: %w", err)

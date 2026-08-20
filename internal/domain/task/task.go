@@ -14,31 +14,68 @@ const (
 	provisionalTitleLength = 60
 )
 
+// TitleSource 标识 Task 标题由临时规则、AI 或人工产生。
+type TitleSource string
+
+const (
+	TitleSourceProvisional TitleSource = "PROVISIONAL"
+	TitleSourceAI          TitleSource = "AI"
+	TitleSourceHuman       TitleSource = "HUMAN"
+)
+
 // Task 表示一个由人创建、等待 Agent 执行并验收的目标。
 type Task struct {
-	ID                 string    `json:"id"`
-	Key                string    `json:"key"`
-	Title              string    `json:"title"`
-	Description        string    `json:"description"`
-	AcceptanceCriteria string    `json:"acceptance_criteria"`
-	Status             Status    `json:"status"`
-	Priority           int       `json:"priority"`
-	TargetBranch       string    `json:"target_branch,omitempty"`
-	BaseCommitSHA      string    `json:"base_commit_sha,omitempty"`
-	CurrentWorkspaceID string    `json:"current_workspace_id,omitempty"`
-	LatestRunID        string    `json:"latest_run_id,omitempty"`
-	Version            int64     `json:"version"`
-	CreatedAt          time.Time `json:"created_at"`
-	UpdatedAt          time.Time `json:"updated_at"`
+	ID                     string      `json:"id"`
+	Key                    string      `json:"key"`
+	Title                  string      `json:"title"`
+	TitleSource            TitleSource `json:"title_source"`
+	TitleLocked            bool        `json:"title_locked"`
+	Description            string      `json:"description"`
+	AcceptanceCriteria     string      `json:"acceptance_criteria"`
+	Status                 Status      `json:"status"`
+	Priority               int         `json:"priority"`
+	TargetBranch           string      `json:"target_branch,omitempty"`
+	BaseCommitSHA          string      `json:"base_commit_sha,omitempty"`
+	CurrentWorkspaceID     string      `json:"current_workspace_id,omitempty"`
+	LatestRunID            string      `json:"latest_run_id,omitempty"`
+	SourcePlanRevisionID   string      `json:"source_plan_revision_id,omitempty"`
+	SourcePlanTaskDraftID  string      `json:"source_plan_task_draft_id,omitempty"`
+	AssessmentInputVersion int64       `json:"assessment_input_version"`
+	Version                int64       `json:"version"`
+	CreatedAt              time.Time   `json:"created_at"`
+	UpdatedAt              time.Time   `json:"updated_at"`
 }
 
 // CreateInput 是创建 Task 时允许由用户提供的字段。
 type CreateInput struct {
-	Title              string `json:"title"`
-	Description        string `json:"description"`
-	AcceptanceCriteria string `json:"acceptance_criteria"`
-	Priority           int    `json:"priority"`
-	TargetBranch       string `json:"target_branch,omitempty"`
+	Title                 string      `json:"title"`
+	Description           string      `json:"description"`
+	AcceptanceCriteria    string      `json:"acceptance_criteria"`
+	Priority              int         `json:"priority"`
+	TargetBranch          string      `json:"target_branch,omitempty"`
+	TitleSource           TitleSource `json:"-"`
+	SourcePlanRevisionID  string      `json:"-"`
+	SourcePlanTaskDraftID string      `json:"-"`
+}
+
+// UpdateTitleInput 是人工锁定标题的领域输入。
+type UpdateTitleInput struct {
+	Title string `json:"title"`
+}
+
+// Normalized 清理人工标题。
+func (input UpdateTitleInput) Normalized() UpdateTitleInput {
+	input.Title = strings.TrimSpace(input.Title)
+	return input
+}
+
+// Validate 校验人工标题。
+func (input UpdateTitleInput) Validate() error {
+	input = input.Normalized()
+	if utf8.RuneCountInString(input.Title) < 1 || utf8.RuneCountInString(input.Title) > maxTitleLength {
+		return errors.New("title 长度必须为 1 到 200")
+	}
+	return nil
 }
 
 // Validate 校验创建 Task 所需的不变量。
@@ -50,6 +87,12 @@ func (input CreateInput) Validate() error {
 	if utf8.RuneCountInString(normalized.Title) > maxTitleLength {
 		return errors.New("title must not exceed 200 characters")
 	}
+	if normalized.Priority < 0 || normalized.Priority > 3 {
+		return errors.New("priority must be between P0 and P3")
+	}
+	if normalized.TitleSource != TitleSourceProvisional && normalized.TitleSource != TitleSourceAI && normalized.TitleSource != TitleSourceHuman {
+		return errors.New("title source must be PROVISIONAL, AI, or HUMAN")
+	}
 	return nil
 }
 
@@ -59,6 +102,14 @@ func (input CreateInput) Normalized() CreateInput {
 	input.Description = strings.TrimSpace(input.Description)
 	input.AcceptanceCriteria = strings.TrimSpace(input.AcceptanceCriteria)
 	input.TargetBranch = strings.TrimSpace(input.TargetBranch)
+	input.SourcePlanRevisionID = strings.TrimSpace(input.SourcePlanRevisionID)
+	input.SourcePlanTaskDraftID = strings.TrimSpace(input.SourcePlanTaskDraftID)
+	if input.TitleSource == "" && input.Title == "" {
+		input.TitleSource = TitleSourceProvisional
+	}
+	if input.TitleSource == "" {
+		input.TitleSource = TitleSourceHuman
+	}
 	if input.Title == "" {
 		input.Title = provisionalTitle(input.Description)
 	}
@@ -88,6 +139,8 @@ const (
 	EventCreated EventType = "TASK_CREATED"
 	// EventStatusChanged 表示 Task 状态已通过领域命令迁移。
 	EventStatusChanged EventType = "TASK_STATUS_CHANGED"
+	// EventTitleChanged 表示标题被 AI 应用或由人工锁定。
+	EventTitleChanged EventType = "TASK_TITLE_CHANGED"
 )
 
 // Event 是 Task 聚合内按序追加的审计记录。

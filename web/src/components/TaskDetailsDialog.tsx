@@ -1,13 +1,15 @@
-import { useState } from 'react'
 import { Clock3Icon, ListChecksIcon, TextIcon, XIcon } from 'lucide-react'
 
-import { errorMessage } from '../api/client'
-import type { DiscussionMessage, Task, TaskAssociation, TaskStatus, Topic, TopicAssociation, Workspace } from '../types'
+import type { Clarification, ClarificationAnswerInput, CreateTaskEstimateInput, CreateTaskTestCaseInput, CreateTaskTestResultInput, DiscussionMessage, Task, TaskAssessmentState, TaskAssociation, TaskQuality, TaskStatus, Topic, TopicAssociation, Workspace } from '../types'
+import { TaskClarificationsPanel } from './ClarificationsPanel'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
 import { RelatedTasks } from './RelatedTasks'
 import { RelatedTopics } from './RelatedTopics'
 import { TaskWorkspacePanel } from './TaskWorkspacePanel'
+import { TaskChangesPanel } from './TaskChangesPanel'
+import { TaskQualityPanel } from './TaskQualityPanel'
+import { TaskAssessmentPanel } from './TaskAssessmentPanel'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Separator } from './ui/separator'
@@ -20,7 +22,6 @@ interface TaskDetailsDialogProps {
   associations: TaskAssociation[]
   topics: Topic[]
   topicAssociations: TopicAssociation[]
-  pending: boolean
   discussionLoading: boolean
   relationLoading: boolean
   submitting: boolean
@@ -32,10 +33,20 @@ interface TaskDetailsDialogProps {
   pendingRelationTopicIDs: Set<string>
   workspace: Workspace | null
   workspaceLoading: boolean
-  workspaceCreating: boolean
-  workspaceError: unknown
+	workspaceError: unknown
+	quality: TaskQuality | null
+	qualityLoading: boolean
+	qualityError: unknown
+	qualityBusy: boolean
+	assessment: TaskAssessmentState | null
+	assessmentLoading: boolean
+	assessmentError: unknown
+	assessmentBusy: boolean
+	repositoryHasHead: boolean
+	clarifications: Clarification[]
+	clarificationError: unknown
+	answeringClarificationID: string | null
   onClose: () => void
-  onQueue: (task: Task) => Promise<void>
   onReloadDiscussion: () => void
   onSendMessage: (content: string, linkedTaskIDs: string[]) => Promise<void>
   onAddRelation: (taskID: string) => Promise<void>
@@ -44,11 +55,20 @@ interface TaskDetailsDialogProps {
   onAddTopicRelation: (topicID: string) => Promise<void>
   onRemoveTopicRelation: (topicID: string) => Promise<void>
   onOpenTopic: (topicID: string) => void
-  onCreateWorkspace: () => Promise<void>
+	onTaskUpdated: (task: Task) => void
+	onWorkspaceChanged: () => void
+	onReloadQuality: () => void
+	onCreateEstimate: (input: CreateTaskEstimateInput) => Promise<void>
+	onCreateTestCase: (input: CreateTaskTestCaseInput) => Promise<void>
+	onRecordTestResult: (testCaseID: string, input: CreateTaskTestResultInput) => Promise<void>
+	onReloadAssessment: () => void
+	onUpdateTitle: (title: string) => Promise<void>
+	onReloadClarifications: () => void
+	onAnswerClarification: (item: Clarification, input: Omit<ClarificationAnswerInput, 'expected_version'>) => Promise<void>
 }
 
 const statusLabels: Record<TaskStatus, string> = {
-  BACKLOG: '待完善', READY: '可执行', RUNNING: '执行中', REVIEW: '待验收',
+	BACKLOG: '待完善', READY: '等待执行', RUNNING: '执行中', REVIEW: '待验收',
   ACCEPTED: '已验收', CHANGES_REQUESTED: '需修改', BLOCKED: '已阻塞', CANCELLED: '已取消',
 }
 
@@ -64,19 +84,7 @@ const statusTone: Record<TaskStatus, string> = {
 }
 
 export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
-  const { task, tasks, messages, associations, pending, onClose, onQueue, onOpenTask } = props
-  const [commandError, setCommandError] = useState('')
-  const canQueue = task.status === 'BACKLOG' || task.status === 'CHANGES_REQUESTED'
-
-  async function handleQueue() {
-    setCommandError('')
-    try {
-      await onQueue(task)
-      onClose()
-    } catch (queueError: unknown) {
-      setCommandError(errorMessage(queueError))
-    }
-  }
+	const { task, tasks, messages, associations, onClose, onOpenTask } = props
 
   return (
     <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
@@ -95,13 +103,7 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="outline" className={statusTone[task.status]}>{statusLabels[task.status]}</Badge>
             <Badge variant="secondary" className="font-mono">P{task.priority}</Badge>
-            {canQueue ? (
-              <Button className="ml-auto" type="button" disabled={pending} onClick={() => { void handleQueue() }}>
-                {pending ? '正在加入队列…' : '加入执行队列'}
-              </Button>
-            ) : null}
           </div>
-          {commandError ? <p className="text-sm text-destructive" role="alert">{commandError}</p> : null}
         </SheetHeader>
 
         <div className="min-h-0 flex-1 overflow-y-auto px-5 sm:px-6">
@@ -109,14 +111,36 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
           <Separator />
           <DetailSection icon={<ListChecksIcon />} title="Acceptance Criteria" value={task.acceptance_criteria} />
           <Separator />
+			<TaskClarificationsPanel
+				items={props.clarifications}
+				error={props.clarificationError}
+				answeringID={props.answeringClarificationID}
+				onReload={props.onReloadClarifications}
+				onAnswer={props.onAnswerClarification}
+			/>
+			{props.clarifications.length > 0 || props.clarificationError ? <Separator /> : null}
+			<TaskAssessmentPanel task={task} state={props.assessment} loading={props.assessmentLoading} error={props.assessmentError} busy={props.assessmentBusy} onReload={props.onReloadAssessment} onUpdateTitle={props.onUpdateTitle} />
+			<Separator />
+			<TaskQualityPanel
+				quality={props.quality}
+				loading={props.qualityLoading}
+				error={props.qualityError}
+				busy={props.qualityBusy}
+				onReload={props.onReloadQuality}
+				onCreateEstimate={props.onCreateEstimate}
+				onCreateTestCase={props.onCreateTestCase}
+				onRecordResult={props.onRecordTestResult}
+			/>
+			<Separator />
           <TaskWorkspacePanel
             workspace={props.workspace}
             loading={props.workspaceLoading}
-            creating={props.workspaceCreating}
             error={props.workspaceError}
-            onCreate={props.onCreateWorkspace}
+			repositoryHasHead={props.repositoryHasHead}
           />
           <Separator />
+			<TaskChangesPanel task={task} hasWorkspace={props.workspace !== null} onTaskUpdated={props.onTaskUpdated} onWorkspaceChanged={props.onWorkspaceChanged} />
+			<Separator />
           <dl className="grid gap-4 py-5 text-sm">
             <DetailItem icon={<Clock3Icon />} label="创建时间" value={formatDate(task.created_at)} />
           </dl>

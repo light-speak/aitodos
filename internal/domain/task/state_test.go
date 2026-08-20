@@ -12,15 +12,18 @@ func TestTransitionAllowsDocumentedCommands(t *testing.T) {
 		command Command
 		want    Status
 	}{
-		{name: "queue backlog", current: StatusBacklog, command: CommandQueue, want: StatusReady},
 		{name: "claim ready", current: StatusReady, command: CommandClaimRun, want: StatusRunning},
+		{name: "submit manual review", current: StatusReady, command: CommandSubmitReview, want: StatusReview},
 		{name: "succeed run", current: StatusRunning, command: CommandRunSucceeded, want: StatusReview},
 		{name: "fail run", current: StatusRunning, command: CommandRunFailed, want: StatusBlocked},
+		{name: "run needs input", current: StatusRunning, command: CommandNeedsInput, want: StatusBlocked},
 		{name: "cancel run", current: StatusRunning, command: CommandCancelRun, want: StatusCancelled},
 		{name: "accept task", current: StatusReview, command: CommandAccept, want: StatusAccepted},
 		{name: "reject task", current: StatusReview, command: CommandReject, want: StatusChangesRequested},
-		{name: "queue changes", current: StatusChangesRequested, command: CommandQueue, want: StatusReady},
+		{name: "claim revision", current: StatusChangesRequested, command: CommandClaimRun, want: StatusRunning},
 		{name: "retry blocked", current: StatusBlocked, command: CommandRetry, want: StatusReady},
+		{name: "answer implementation clarification", current: StatusBlocked, command: CommandResumeImplementation, want: StatusReady},
+		{name: "answer revision clarification", current: StatusBlocked, command: CommandResumeRevision, want: StatusChangesRequested},
 	}
 
 	for _, test := range tests {
@@ -38,15 +41,18 @@ func TestTransitionAllowsDocumentedCommands(t *testing.T) {
 
 func TestTransitionRejectsEveryUndocumentedCombination(t *testing.T) {
 	allowed := map[[2]string]bool{
-		{string(StatusBacklog), string(CommandQueue)}:          true,
-		{string(StatusReady), string(CommandClaimRun)}:         true,
-		{string(StatusRunning), string(CommandRunSucceeded)}:   true,
-		{string(StatusRunning), string(CommandRunFailed)}:      true,
-		{string(StatusRunning), string(CommandCancelRun)}:      true,
-		{string(StatusReview), string(CommandAccept)}:          true,
-		{string(StatusReview), string(CommandReject)}:          true,
-		{string(StatusChangesRequested), string(CommandQueue)}: true,
-		{string(StatusBlocked), string(CommandRetry)}:          true,
+		{string(StatusReady), string(CommandClaimRun)}:               true,
+		{string(StatusReady), string(CommandSubmitReview)}:           true,
+		{string(StatusRunning), string(CommandRunSucceeded)}:         true,
+		{string(StatusRunning), string(CommandRunFailed)}:            true,
+		{string(StatusRunning), string(CommandCancelRun)}:            true,
+		{string(StatusReview), string(CommandAccept)}:                true,
+		{string(StatusReview), string(CommandReject)}:                true,
+		{string(StatusChangesRequested), string(CommandClaimRun)}:    true,
+		{string(StatusBlocked), string(CommandRetry)}:                true,
+		{string(StatusRunning), string(CommandNeedsInput)}:           true,
+		{string(StatusBlocked), string(CommandResumeImplementation)}: true,
+		{string(StatusBlocked), string(CommandResumeRevision)}:       true,
 	}
 
 	for _, status := range AllStatuses() {

@@ -15,6 +15,7 @@ const initialState: GitWorkflowState = { repository: null, releases: [], loading
 export function useGitWorkflow() {
   const [state, setState] = useState(initialState)
   const [submitting, setSubmitting] = useState(false)
+	const [reloadToken, setReloadToken] = useState(0)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -25,7 +26,12 @@ export function useGitWorkflow() {
       },
     )
     return () => controller.abort()
-  }, [])
+  }, [reloadToken])
+
+	const reload = useCallback(() => {
+		setState((current) => ({ ...current, loading: true, error: null }))
+		setReloadToken((current) => current + 1)
+	}, [])
 
   const create = useCallback(async (input: CreateReleaseInput) => {
     setSubmitting(true)
@@ -49,7 +55,7 @@ export function useGitWorkflow() {
     }
   }, [])
 
-  return useMemo(() => ({ ...state, submitting, createRelease: create }), [create, state, submitting])
+  return useMemo(() => ({ ...state, submitting, createRelease: create, reload }), [create, reload, state, submitting])
 }
 
 async function loadGitWorkflow(signal: AbortSignal) {

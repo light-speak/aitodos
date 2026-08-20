@@ -19,12 +19,12 @@ func TestTaskStoreCreatesListsAndTransitionsTaskAtomically(t *testing.T) {
 		Title:              "实现任务看板",
 		Description:        "显示项目任务",
 		AcceptanceCriteria: "可以创建并排队任务",
-		Priority:           10,
+		Priority:           0,
 	})
 	if err != nil {
 		t.Fatalf("Create() error = %v", err)
 	}
-	if created.Status != task.StatusBacklog || created.Version != 1 {
+	if created.Status != task.StatusReady || created.Version != 1 || created.Priority != 0 {
 		t.Fatalf("created task = %#v", created)
 	}
 	if created.ID == "" || created.Key == "" {
@@ -39,12 +39,12 @@ func TestTaskStoreCreatesListsAndTransitionsTaskAtomically(t *testing.T) {
 		t.Fatalf("List() = %#v", listed)
 	}
 
-	queued, err := store.ApplyCommand(ctx, created.ID, created.Version, task.CommandQueue)
+	running, err := store.ApplyCommand(ctx, created.ID, created.Version, task.CommandClaimRun)
 	if err != nil {
 		t.Fatalf("ApplyCommand() error = %v", err)
 	}
-	if queued.Status != task.StatusReady || queued.Version != 2 {
-		t.Fatalf("queued task = %#v", queued)
+	if running.Status != task.StatusRunning || running.Version != 2 {
+		t.Fatalf("running task = %#v", running)
 	}
 
 	events, err := store.ListEvents(ctx, created.ID)
@@ -81,7 +81,7 @@ func TestTaskStoreRejectsInvalidTransitionWithoutPartialWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Status != task.StatusBacklog || loaded.Version != 1 {
+	if loaded.Status != task.StatusReady || loaded.Version != 1 {
 		t.Fatalf("task changed after rejection: %#v", loaded)
 	}
 	events, err := store.ListEvents(ctx, created.ID)
@@ -100,11 +100,11 @@ func TestTaskStoreRejectsStaleVersionWithoutPartialWrite(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.ApplyCommand(ctx, created.ID, created.Version, task.CommandQueue); err != nil {
+	if _, err := store.ApplyCommand(ctx, created.ID, created.Version, task.CommandClaimRun); err != nil {
 		t.Fatal(err)
 	}
 
-	_, err = store.ApplyCommand(ctx, created.ID, created.Version, task.CommandQueue)
+	_, err = store.ApplyCommand(ctx, created.ID, created.Version, task.CommandClaimRun)
 	if !errors.Is(err, ErrTaskVersionConflict) {
 		t.Fatalf("ApplyCommand() error = %v, want ErrTaskVersionConflict", err)
 	}
@@ -122,6 +122,33 @@ func TestTaskStoreReturnsNotFound(t *testing.T) {
 	_, err := store.Get(context.Background(), "missing")
 	if !errors.Is(err, ErrTaskNotFound) {
 		t.Fatalf("Get() error = %v, want ErrTaskNotFound", err)
+	}
+}
+
+func TestTaskStoreRecordsReviewWithStatusTransitionAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := NewTaskStore(openTaskTestDatabase(t))
+	created, err := store.Create(ctx, task.CreateInput{Title: "检查 Diff"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	inReview, err := store.ApplyCommand(ctx, created.ID, created.Version, task.CommandSubmitReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, review, err := store.ApplyReview(ctx, inReview.ID, inReview.Version, task.ReviewInput{
+		Decision: task.ReviewAccepted,
+		Comment:  "符合验收标准",
+	}, "abc123")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if accepted.Status != task.StatusAccepted || review.CommitSHA != "abc123" {
+		t.Fatalf("accepted = %#v, review = %#v", accepted, review)
+	}
+	reviews, err := store.ListReviews(ctx, created.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].Comment != "符合验收标准" {
+		t.Fatalf("ListReviews() = %#v, %v", reviews, err)
 	}
 }
 

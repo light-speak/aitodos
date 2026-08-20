@@ -18,12 +18,15 @@ var (
 	ErrTaskNotFound = errors.New("task not found")
 	// ErrTaskVersionConflict 表示写入基于过期的 Task 版本。
 	ErrTaskVersionConflict = errors.New("task version conflict")
+	// ErrRequiredTestsNotPassed 表示必测项尚无可验证的通过证据。
+	ErrRequiredTestsNotPassed = errors.New("required tests not passed")
 )
 
 const taskColumns = `
-id, task_key, title, description, acceptance_criteria, status, priority,
+id, task_key, title, title_source, title_locked, description, acceptance_criteria, status, priority,
 target_branch, base_commit_sha, current_workspace_id, latest_run_id,
-version, created_at, updated_at`
+COALESCE(source_plan_revision_id, ''), COALESCE(source_plan_task_draft_id, ''),
+assessment_input_version, version, created_at, updated_at`
 
 // TaskStore 使用 SQLite 持久化 Task 当前状态和审计事件。
 type TaskStore struct {
@@ -69,9 +72,48 @@ func (store *TaskStore) Get(ctx context.Context, id string) (task.Task, error) {
 	return getTask(ctx, store.database, id)
 }
 
+// UpdateTitle 人工更新并锁定标题，后续 Triage 只能保留该标题。
+func (store *TaskStore) UpdateTitle(
+	ctx context.Context,
+	id string,
+	expectedVersion int64,
+	input task.UpdateTitleInput,
+) (task.Task, error) {
+	input = input.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, err
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("begin task title update: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	updated, event, err := prepareTitleUpdate(current, input.Title, task.TitleSourceHuman, true)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := updateTaskTitle(ctx, transaction, current, updated); err != nil {
+		return task.Task{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, fmt.Errorf("commit task title update: %w", err)
+	}
+	return updated, nil
+}
+
 // List 按优先级和创建时间返回当前项目的全部 Task。
 func (store *TaskStore) List(ctx context.Context) ([]task.Task, error) {
-	rows, err := store.database.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks ORDER BY priority DESC, created_at ASC")
+	rows, err := store.database.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks ORDER BY priority ASC, created_at ASC")
 	if err != nil {
 		return nil, fmt.Errorf("list tasks: %w", err)
 	}
@@ -157,6 +199,134 @@ ORDER BY sequence`, taskID)
 	return events, nil
 }
 
+// ApplyReview 原子保存人工验收、更新 Task 状态并追加审计事件。
+func (store *TaskStore) ApplyReview(
+	ctx context.Context,
+	id string,
+	expectedVersion int64,
+	input task.ReviewInput,
+	commitSHA string,
+) (task.Task, task.Review, error) {
+	input = input.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, task.Review{}, fmt.Errorf("begin task review: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, task.Review{}, ErrTaskVersionConflict
+	}
+	if input.Decision == task.ReviewAccepted {
+		if err := ensureRequiredTestsPassed(ctx, transaction, id); err != nil {
+			return task.Task{}, task.Review{}, err
+		}
+	}
+	updated, event, err := prepareReviewTransition(current, input)
+	if err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	review, err := newReview(id, input, commitSHA, event.OccurredAt)
+	if err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if err := updateTaskStatus(ctx, transaction, current, updated); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if err := insertTaskReview(ctx, transaction, review); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, task.Review{}, fmt.Errorf("commit task review: %w", err)
+	}
+	return updated, review, nil
+}
+
+// ListReviews 按时间倒序返回 Task 的人工验收历史。
+func (store *TaskStore) ListReviews(ctx context.Context, taskID string) ([]task.Review, error) {
+	if err := requireTask(ctx, store.database, taskID); err != nil {
+		return nil, err
+	}
+	rows, err := store.database.QueryContext(ctx, `
+SELECT id, task_id, decision, comment, commit_sha, created_at
+FROM task_reviews WHERE task_id = ? ORDER BY created_at DESC, id DESC`, taskID)
+	if err != nil {
+		return nil, fmt.Errorf("list task reviews: %w", err)
+	}
+	defer rows.Close()
+	result := make([]task.Review, 0)
+	for rows.Next() {
+		review, scanErr := scanTaskReview(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, review)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate task reviews: %w", err)
+	}
+	return result, nil
+}
+
+func prepareReviewTransition(current task.Task, input task.ReviewInput) (task.Task, task.Event, error) {
+	return prepareTransition(current, mustReviewStatus(input), input.Command())
+}
+
+func mustReviewStatus(input task.ReviewInput) task.Status {
+	if input.Decision == task.ReviewAccepted {
+		return task.StatusAccepted
+	}
+	return task.StatusChangesRequested
+}
+
+func newReview(taskID string, input task.ReviewInput, commitSHA string, createdAt time.Time) (task.Review, error) {
+	id, err := newID()
+	if err != nil {
+		return task.Review{}, err
+	}
+	return task.Review{
+		ID: id, TaskID: taskID, Decision: input.Decision,
+		Comment: input.Comment, CommitSHA: commitSHA, CreatedAt: createdAt,
+	}, nil
+}
+
+func insertTaskReview(ctx context.Context, transaction *sql.Tx, review task.Review) error {
+	_, err := transaction.ExecContext(ctx, `
+INSERT INTO task_reviews(id, task_id, decision, comment, commit_sha, created_at)
+VALUES (?, ?, ?, ?, ?, ?)`,
+		review.ID, review.TaskID, review.Decision, review.Comment, review.CommitSHA, formatTime(review.CreatedAt),
+	)
+	if err != nil {
+		return fmt.Errorf("insert task review: %w", err)
+	}
+	return nil
+}
+
+func scanTaskReview(scanner rowScanner) (task.Review, error) {
+	var review task.Review
+	var createdAt string
+	if err := scanner.Scan(
+		&review.ID, &review.TaskID, &review.Decision, &review.Comment, &review.CommitSHA, &createdAt,
+	); err != nil {
+		return task.Review{}, fmt.Errorf("scan task review: %w", err)
+	}
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return task.Review{}, fmt.Errorf("parse task review time: %w", err)
+	}
+	review.CreatedAt = parsed
+	return review, nil
+}
+
 func newTaskAndEvent(input task.CreateInput) (task.Task, task.Event, error) {
 	id, err := newID()
 	if err != nil {
@@ -169,16 +339,50 @@ func newTaskAndEvent(input task.CreateInput) (task.Task, task.Event, error) {
 	now := time.Now().UTC()
 	created := task.Task{
 		ID: id, Key: taskKey(id), Title: input.Title,
+		TitleSource: input.TitleSource, TitleLocked: input.TitleSource == task.TitleSourceHuman,
 		Description: input.Description, AcceptanceCriteria: input.AcceptanceCriteria,
-		Status: task.StatusBacklog, Priority: input.Priority, TargetBranch: input.TargetBranch,
-		Version: 1, CreatedAt: now, UpdatedAt: now,
+		Status: task.StatusReady, Priority: input.Priority, TargetBranch: input.TargetBranch,
+		SourcePlanRevisionID: input.SourcePlanRevisionID, SourcePlanTaskDraftID: input.SourcePlanTaskDraftID,
+		AssessmentInputVersion: 1, Version: 1, CreatedAt: now, UpdatedAt: now,
 	}
-	payload, err := json.Marshal(map[string]any{"schema_version": 1, "title": created.Title})
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1, "title": created.Title, "title_source": created.TitleSource,
+	})
 	if err != nil {
 		return task.Task{}, task.Event{}, fmt.Errorf("encode task created event: %w", err)
 	}
 	event := task.Event{ID: eventID, TaskID: id, Sequence: 1, Type: task.EventCreated, Payload: payload, OccurredAt: now}
 	return created, event, nil
+}
+
+func prepareTitleUpdate(
+	current task.Task,
+	title string,
+	source task.TitleSource,
+	locked bool,
+) (task.Task, task.Event, error) {
+	eventID, err := newID()
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	now := time.Now().UTC()
+	updated := current
+	updated.Title = title
+	updated.TitleSource = source
+	updated.TitleLocked = locked
+	updated.Version++
+	updated.UpdatedAt = now
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1, "from": current.Title, "to": title,
+		"source": source, "locked": locked,
+	})
+	if err != nil {
+		return task.Task{}, task.Event{}, fmt.Errorf("encode task title event: %w", err)
+	}
+	return updated, task.Event{
+		ID: eventID, TaskID: current.ID, Sequence: updated.Version,
+		Type: task.EventTitleChanged, Payload: payload, OccurredAt: now,
+	}, nil
 }
 
 func prepareTransition(current task.Task, next task.Status, command task.Command) (task.Task, task.Event, error) {
@@ -210,19 +414,35 @@ func prepareTransition(current task.Task, next task.Status, command task.Command
 func insertTask(ctx context.Context, transaction *sql.Tx, item task.Task) error {
 	_, err := transaction.ExecContext(ctx, `
 INSERT INTO tasks (
-    id, task_key, title, description, acceptance_criteria, status, priority,
+    id, task_key, title, title_source, title_locked, description, acceptance_criteria, status, priority,
     target_branch, base_commit_sha, current_workspace_id, latest_run_id,
+    source_plan_revision_id, source_plan_task_draft_id, assessment_input_version,
     version, created_at, updated_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		item.ID, item.Key, item.Title, item.Description, item.AcceptanceCriteria,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		item.ID, item.Key, item.Title, item.TitleSource, item.TitleLocked,
+		item.Description, item.AcceptanceCriteria,
 		item.Status, item.Priority, item.TargetBranch, item.BaseCommitSHA,
-		item.CurrentWorkspaceID, item.LatestRunID, item.Version,
+		item.CurrentWorkspaceID, item.LatestRunID, nullableString(item.SourcePlanRevisionID),
+		nullableString(item.SourcePlanTaskDraftID), item.AssessmentInputVersion, item.Version,
 		formatTime(item.CreatedAt), formatTime(item.UpdatedAt),
 	)
 	if err != nil {
 		return fmt.Errorf("insert task: %w", err)
 	}
 	return nil
+}
+
+func updateTaskTitle(ctx context.Context, transaction *sql.Tx, current, updated task.Task) error {
+	result, err := transaction.ExecContext(ctx, `
+UPDATE tasks SET title = ?, title_source = ?, title_locked = ?, version = ?, updated_at = ?
+WHERE id = ? AND version = ?`,
+		updated.Title, updated.TitleSource, updated.TitleLocked, updated.Version,
+		formatTime(updated.UpdatedAt), current.ID, current.Version,
+	)
+	if err != nil {
+		return fmt.Errorf("update task title: %w", err)
+	}
+	return requireSingleChange(result)
 }
 
 func updateTaskStatus(ctx context.Context, transaction *sql.Tx, current, updated task.Task) error {
@@ -278,9 +498,12 @@ func scanTask(scanner rowScanner) (task.Task, error) {
 	var item task.Task
 	var createdAt, updatedAt string
 	err := scanner.Scan(
-		&item.ID, &item.Key, &item.Title, &item.Description, &item.AcceptanceCriteria,
+		&item.ID, &item.Key, &item.Title, &item.TitleSource, &item.TitleLocked,
+		&item.Description, &item.AcceptanceCriteria,
 		&item.Status, &item.Priority, &item.TargetBranch, &item.BaseCommitSHA,
-		&item.CurrentWorkspaceID, &item.LatestRunID, &item.Version, &createdAt, &updatedAt,
+		&item.CurrentWorkspaceID, &item.LatestRunID, &item.SourcePlanRevisionID,
+		&item.SourcePlanTaskDraftID, &item.AssessmentInputVersion,
+		&item.Version, &createdAt, &updatedAt,
 	)
 	if err != nil {
 		return task.Task{}, err

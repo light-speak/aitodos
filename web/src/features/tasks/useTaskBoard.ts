@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { createTask, createTopic, getProject, getTasks, getTopics, queueTask } from '../../api/client'
+import { createTask, createTopic, getProject, getTasks, getTopics, updateWorkerSettings } from '../../api/client'
 import type { CreateTaskInput, CreateTopicInput, ProjectInfo, Task, Topic } from '../../types'
 
 interface BoardState {
@@ -12,11 +12,12 @@ interface BoardState {
 }
 
 const initialState: BoardState = { project: null, topics: [], tasks: [], loading: true, error: null }
+const workerRefreshIntervalMs = 2_000
 
 export function useTaskBoard() {
   const [state, setState] = useState<BoardState>(initialState)
   const [reloadToken, setReloadToken] = useState(0)
-  const [pendingTaskIDs, setPendingTaskIDs] = useState<Set<string>>(() => new Set())
+	const [updatingWorkers, setUpdatingWorkers] = useState(false)
 
   useEffect(() => {
     const controller = new AbortController()
@@ -31,6 +32,28 @@ export function useTaskBoard() {
     return () => controller.abort()
   }, [reloadToken])
 
+  useEffect(() => {
+    if (!state.project?.workers_enabled) return
+    const controller = new AbortController()
+    let loading = false
+    const timer = window.setInterval(() => {
+      if (loading) return
+      loading = true
+      void getTasks(controller.signal).then(
+        (tasks) => setState((current) => ({ ...current, tasks })),
+        (error: unknown) => {
+          if (!controller.signal.aborted) {
+            setState((current) => ({ ...current, error }))
+          }
+        },
+      ).finally(() => { loading = false })
+    }, workerRefreshIntervalMs)
+    return () => {
+      controller.abort()
+      window.clearInterval(timer)
+    }
+  }, [state.project?.workers_enabled])
+
   const create = useCallback(async (input: CreateTaskInput) => {
     const created = await createTask(input)
     setState((current) => ({ ...current, tasks: [...current.tasks, created] }))
@@ -41,31 +64,36 @@ export function useTaskBoard() {
     setState((current) => ({ ...current, topics: [created, ...current.topics] }))
   }, [])
 
-  const queue = useCallback(async (currentTask: Task) => {
-    setPendingTaskIDs((current) => withTaskID(current, currentTask.id, true))
-    try {
-      const updated = await queueTask(currentTask)
-      setState((current) => ({ ...current, tasks: replaceTask(current.tasks, updated) }))
-    } finally {
-      setPendingTaskIDs((current) => withTaskID(current, currentTask.id, false))
-    }
-  }, [])
+	const updateWorkers = useCallback(async (enabled: boolean, maxWorkers: number) => {
+		setUpdatingWorkers(true)
+		try {
+			const project = await updateWorkerSettings(enabled, maxWorkers)
+			setState((current) => ({ ...current, project }))
+		} finally {
+			setUpdatingWorkers(false)
+		}
+	}, [])
 
   const reload = useCallback(() => {
     setState((current) => ({ ...current, loading: true, error: null }))
     setReloadToken((current) => current + 1)
   }, [])
 
+	const updateTask = useCallback((updated: Task) => {
+		setState((current) => ({ ...current, tasks: replaceTask(current.tasks, updated) }))
+	}, [])
+
   return useMemo(
     () => ({
       ...state,
-      pendingTaskIDs,
+		updatingWorkers,
       createTask: create,
       createTopic: createNewTopic,
-      queueTask: queue,
+		updateWorkers,
+			updateTask,
       reload,
     }),
-    [create, createNewTopic, pendingTaskIDs, queue, reload, state],
+		[create, createNewTopic, reload, state, updateTask, updateWorkers, updatingWorkers],
   )
 }
 
@@ -75,15 +103,14 @@ async function loadBoard(signal: AbortSignal) {
 }
 
 function replaceTask(tasks: Task[], updated: Task): Task[] {
-  return tasks.map((item) => (item.id === updated.id ? updated : item))
-}
-
-function withTaskID(current: Set<string>, taskID: string, present: boolean): Set<string> {
-  const updated = new Set(current)
-  if (present) {
-    updated.add(taskID)
-  } else {
-    updated.delete(taskID)
-  }
-  return updated
+	return tasks.map((item) => {
+		if (item.id !== updated.id) return item
+		return {
+			...updated,
+			...(updated.assessment === undefined && item.assessment !== undefined ? { assessment: item.assessment } : {}),
+			...(updated.assessment_stale === undefined && item.assessment_stale !== undefined
+				? { assessment_stale: item.assessment_stale }
+				: {}),
+		}
+	})
 }

@@ -110,6 +110,100 @@ func TestManagerReportsRepositoryBranchesAndHead(t *testing.T) {
 	}
 }
 
+func TestManagerReportsRepositoryWithoutInitialCommit(t *testing.T) {
+	repository, database := initializeUnbornRepository(t)
+	ctx := context.Background()
+	manager := New(repository, database)
+	info, err := manager.RepositoryInfo(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.HasHead || info.HeadSHA != "" || info.CurrentBranch != "main" || len(info.Branches) != 0 {
+		t.Fatalf("repository info = %#v", info)
+	}
+	created, err := storage.NewTaskStore(database).Create(ctx, task.CreateInput{Title: "等待首个 Commit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.CreateTaskWorkspace(ctx, created.ID); !errors.Is(err, ErrRepositoryUnborn) {
+		t.Fatalf("CreateTaskWorkspace() error = %v, want ErrRepositoryUnborn", err)
+	}
+}
+
+func TestManagerSummarizesAndLoadsTaskChanges(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	createdTask, err := storage.NewTaskStore(database).Create(ctx, task.CreateInput{Title: "展示修改"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(repository, database)
+	createdWorkspace, err := manager.CreateTaskWorkspace(ctx, createdTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(createdWorkspace.Path, "README.md"), []byte("# changed\nsecond\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(createdWorkspace.Path, "new.txt"), []byte("new file\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	changes, err := manager.TaskChanges(ctx, createdTask.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changes.FileCount != 2 || changes.Additions != 3 || changes.Deletions != 1 {
+		t.Fatalf("changes = %#v", changes)
+	}
+	patch, err := manager.TaskFileDiff(ctx, createdTask.ID, "README.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(patch.Patch, "+# changed") || !strings.Contains(patch.Patch, "-# test") {
+		t.Fatalf("patch = %q", patch.Patch)
+	}
+}
+
+func TestManagerCompletesManualReviewFlow(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(ctx, task.CreateInput{Title: "走完人工验收"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(repository, database)
+	createdWorkspace, err := manager.CreateTaskWorkspace(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	worktree := &createdWorkspace
+	if err := os.WriteFile(filepath.Join(worktree.Path, "README.md"), []byte("# reviewed\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created, err = store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err = manager.SubmitTaskReview(ctx, created.ID, created.Version)
+	if err != nil || created.Status != task.StatusReview {
+		t.Fatalf("SubmitTaskReview() = %#v, %v", created, err)
+	}
+	updated, review, err := manager.ReviewTask(ctx, created.ID, created.Version, task.ReviewInput{Decision: task.ReviewAccepted})
+	if err != nil || updated.Status != task.StatusAccepted || review.CommitSHA == worktree.BaseCommitSHA {
+		t.Fatalf("ReviewTask() = %#v, %#v, %v", updated, review, err)
+	}
+	committed, err := manager.TaskWorkspace(ctx, created.ID)
+	if err != nil || committed == nil || committed.Dirty || review.CommitSHA != committed.HeadSHA {
+		t.Fatalf("TaskWorkspace() after review = %#v, %v", committed, err)
+	}
+	released, err := manager.CreateRelease(ctx, release.CreateInput{Version: "1.2.0", SourceBranch: committed.BranchName})
+	if err != nil || len(released.TaskIDs) != 1 || released.TaskIDs[0] != created.ID {
+		t.Fatalf("CreateRelease() = %#v, %v", released, err)
+	}
+}
+
 func TestManagerRejectsConflictingExistingTagAndRecordsFailure(t *testing.T) {
 	repository, database := initializeRepository(t)
 	runGit(t, repository.Root, "tag", "v2.0.0")
@@ -181,6 +275,33 @@ func initializeRepository(t *testing.T) (*project.Project, *sql.DB) {
 	}
 	runGit(t, repoRoot, "add", "README.md")
 	runGit(t, repoRoot, "commit", "--quiet", "-m", "initial")
+	repository, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), repository.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return repository, database
+}
+
+func initializeUnbornRepository(t *testing.T) (*project.Project, *sql.DB) {
+	t.Helper()
+	temporaryRoot, err := filepath.Abs(filepath.Join("..", "..", ".tmp"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(temporaryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	repoRoot, err := os.MkdirTemp(temporaryRoot, "gitworkflow-unborn-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(repoRoot) })
+	runGit(t, repoRoot, "init", "--quiet", "--initial-branch=main")
 	repository, _, err := project.Initialize(context.Background(), repoRoot)
 	if err != nil {
 		t.Fatal(err)
