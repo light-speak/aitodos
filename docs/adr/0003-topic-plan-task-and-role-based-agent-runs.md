@@ -86,6 +86,7 @@ Control Plane 根据 Run purpose 选择默认 Agent Profile、权限和 Context 
 
 ```text
 Planner     分析需求、提出 Clarification、生成 Plan Revision
+Triager     为正式 Task 生成标题和复杂度评估，不获得 Git Workspace
 Implementer 修改 Task Workspace 并验证结果
 Reviewer    只读检查 Diff、测试和验收标准
 Generalist  用户显式选择的通用职责
@@ -95,7 +96,7 @@ Planner 可以为 Task 草案推荐 Agent Profile 和执行顺序，但 Schedule
 
 ### 7. Agent Profile 可在 UI 配置且必须版本化
 
-Project 为 PLANNING、IMPLEMENTATION、REVISION 和 REVIEW 分别配置默认 Agent Profile。一个 Adapter 可以对应多个不同职责的 Profile。
+Project 为 PLANNING、TRIAGE、IMPLEMENTATION、REVISION 和 REVIEW 分别配置默认 Agent Profile。一个 Adapter 可以对应多个不同职责的 Profile。Triage 的专用边界见 ADR-0010。
 
 最终 Agent 输入按固定层次组合：
 
@@ -131,17 +132,17 @@ SUPERSEDES
 
 ## 状态影响
 
-Task 保留执行和验收状态机，并增加 `NEEDS_CLARIFICATION`：
+Task 保留执行和验收状态机。ADR-0011 最终选择复用 `BLOCKED` 表达等待人工输入，并用 Run 的 `NEEDS_INPUT` 区分普通失败：
 
 ```text
-BACKLOG → READY → RUNNING
-                    ├── Agent 提问 → NEEDS_CLARIFICATION → READY（新 Run）
-                    ├── 失败 ─────→ BLOCKED
-                    ├── 取消 ─────→ CANCELLED
-                    └── 成功 ─────→ REVIEW → ACCEPTED / CHANGES_REQUESTED
+READY → RUNNING
+          ├── Agent 提问 → BLOCKED → READY / CHANGES_REQUESTED（Continuation Run）
+          ├── 失败 ─────→ BLOCKED
+          ├── 取消 ─────→ CANCELLED
+          └── 成功 ─────→ REVIEW → ACCEPTED / CHANGES_REQUESTED
 ```
 
-`READY` 表示已经存在等待 Claim 的 Run，不同时表示“需求大致明确”。需求分析和 Plan 批准由 Topic/Plan 状态表达，避免一个状态承担两种含义。
+`READY` 表示正式 Task 已进入等待执行集合；Scheduler Claim 时创建并绑定不可变 Run Snapshot。`BACKLOG` 只作为旧数据库迁移兼容状态保留，不再是新建 Task 的正常状态。`READY` 不同时表示“需求大致明确”。需求分析和 Plan 批准由 Topic/Plan 状态表达，避免一个状态承担两种含义。自动调度和 P0–P3 规则见 ADR-0008。
 
 ## 后果
 
@@ -160,7 +161,7 @@ BACKLOG → READY → RUNNING
 - UI 不再只有 Kanban，需要 Topic、Plan Review、Search 和关系视图。
 - 现有 Task 中心 API、Schema 和实施顺序需要调整。
 
-当前仓库的 Schema v8、Topic/Task 创建与查询、双主体持久讨论、评论引用 Task、Topic–Task 与对称 Task–Task 关系，以及对应 Detail UI 已实现基础纵向切片；Schema v7/v8 另增加 Task Workspace 与本地 Release，详见 ADR-0007。评论归属与关系引用保持分离，评论引用会在同一事务中建立可追溯主体关系。Plan、Clarification、Decision、Label、Task `NEEDS_CLARIFICATION` 和多主体 Run 尚未实现。后续必须继续使用版本化 migration 和回归测试迁移，不得直接修改已有 migration 或静默保留冲突语义。
+当前仓库的 Schema v18 已实现 Topic/Task 创建与查询、双主体持久讨论、评论引用 Task、Topic–Task 与对称 Task–Task 关系、不可变 Plan Revision、人工审核、批准后原子创建 Task/关系/测试项、Task Workspace、本地 Release、Task Run、Task Triage、Task Clarification/Continuation Run 与对应 UI。评论归属与关系引用保持分离，评论引用会在同一事务中建立可追溯主体关系。Topic Clarification、Decision、Label 和 Topic Planning Run 尚未实现；当前 Plan Revision 由人类编辑，Planner Run 后续只能提交同一审核流程的草案。Task Agent 等待回答时复用既有 `BLOCKED` Task 状态，具体终态与续跑语义由 ADR-0011 取代本 ADR 早期提出的 Task `NEEDS_CLARIFICATION` 状态。后续必须继续使用版本化 migration 和回归测试迁移，不得直接修改已有 migration 或静默保留冲突语义。
 
 ## 被否决的方案
 

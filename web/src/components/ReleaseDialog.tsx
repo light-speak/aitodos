@@ -57,6 +57,7 @@ export function ReleaseDialog({ repository, releases, submitting, onClose, onCre
         </DialogHeader>
 
         <form className="grid gap-4" onSubmit={(event) => { void handleSubmit(event) }}>
+			{!repository.has_head ? <p className="rounded-lg border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">仓库尚无 Commit。先创建首个 Commit，才能创建 Release Tag。</p> : null}
           <div className="rounded-xl border bg-muted/30 p-4">
             <div className="grid gap-4 sm:grid-cols-[minmax(0,1fr)_minmax(0,1.4fr)]">
               <div className="grid gap-2">
@@ -115,6 +116,7 @@ export function ReleaseDialog({ repository, releases, submitting, onClose, onCre
                       <div className="flex items-center gap-2">
                         <span className="font-mono text-sm font-medium">{item.tag_name}</span>
                         <Badge variant={item.status === 'TAGGED' ? 'secondary' : 'outline'}>{releaseStatusLabel(item)}</Badge>
+						{item.task_ids.length > 0 ? <Badge variant="outline">自动关联 {item.task_ids.length} 个 Task</Badge> : null}
                       </div>
                       <p className="truncate font-mono text-xs text-muted-foreground">
                         {item.source_branch} @ {shortGitSHA(item.commit_sha)}
@@ -129,7 +131,7 @@ export function ReleaseDialog({ repository, releases, submitting, onClose, onCre
 
           <DialogFooter>
             <Button variant="outline" type="button" onClick={onClose}>关闭</Button>
-            <Button type="submit" disabled={submitting || repository.branches.length === 0}>
+            <Button type="submit" disabled={submitting || !repository.has_head || repository.branches.length === 0}>
               <TagIcon />{submitting ? '正在创建…' : '创建本地 Tag'}
             </Button>
           </DialogFooter>

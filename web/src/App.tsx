@@ -1,14 +1,19 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertCircleIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
+import { AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from './api/client'
 import { AppHeader } from './components/AppHeader'
+import { AgentProfilesPage } from './components/AgentProfilesPage'
 import { CreateItemDialog } from './components/CreateItemDialog'
 import { KanbanBoard } from './components/KanbanBoard'
 import { ReleaseDialog } from './components/ReleaseDialog'
+import { ProgressPage } from './components/ProgressPage'
+import { ProjectCapabilitiesPanel } from './components/ProjectCapabilitiesPanel'
 import { TaskDetailsDialog } from './components/TaskDetailsDialog'
 import { TopicDetailsDialog } from './components/TopicDetailsDialog'
 import { TopicList } from './components/TopicList'
+import { WorkerSettingsDialog } from './components/WorkerSettingsDialog'
+import { ClarificationInboxDialog } from './components/ClarificationsPanel'
 import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import { useTaskBoard } from './features/tasks/useTaskBoard'
@@ -17,12 +22,23 @@ import { useTaskAssociations } from './features/discussion/useTaskAssociations'
 import { useTopicAssociations } from './features/discussion/useTopicAssociations'
 import { useGitWorkflow } from './features/git/useGitWorkflow'
 import { useTaskWorkspace } from './features/git/useTaskWorkspace'
+import { useAgentProfiles } from './features/agents/useAgentProfiles'
+import { useProjectCapabilities } from './features/agents/useProjectCapabilities'
+import { useProjectProgress } from './features/progress/useProjectProgress'
+import { useTaskQuality } from './features/quality/useTaskQuality'
+import { useTaskAssessment } from './features/assessment/useTaskAssessment'
+import { useClarifications } from './features/clarifications/useClarifications'
+import { useTopicPlan } from './features/plans/useTopicPlan'
+
+type AppView = 'topics' | 'tasks' | 'progress' | 'agents'
 
 export default function App() {
   const board = useTaskBoard()
-  const [view, setView] = useState<'topics' | 'tasks'>('topics')
+	const [view, setView] = useState<AppView>('topics')
   const [creating, setCreating] = useState(false)
   const [showReleases, setShowReleases] = useState(false)
+	const [showWorkerSettings, setShowWorkerSettings] = useState(false)
+	const [showClarifications, setShowClarifications] = useState(false)
   const [selectedTaskID, setSelectedTaskID] = useState<string | null>(null)
   const [selectedTopicID, setSelectedTopicID] = useState<string | null>(null)
   const selectedTask = useMemo(
@@ -40,6 +56,13 @@ export default function App() {
   const topicAssociations = useTopicAssociations(selectedTaskID, board.topics)
   const git = useGitWorkflow()
   const workspace = useTaskWorkspace(selectedTaskID)
+	const quality = useTaskQuality(selectedTaskID)
+	const assessment = useTaskAssessment(selectedTaskID)
+	const clarifications = useClarifications(selectedTaskID, board.project?.workers_enabled ?? false)
+	const progress = useProjectProgress(view === 'progress')
+	const agents = useAgentProfiles(view === 'agents')
+	const capabilities = useProjectCapabilities(view === 'agents')
+	const topicPlan = useTopicPlan(selectedTopicID)
 
   function openTask(taskID: string) {
     setSelectedTopicID(null)
@@ -89,6 +112,14 @@ export default function App() {
         repository={git.repository}
         latestRelease={git.releases[0] ?? null}
         onOpenReleases={() => setShowReleases(true)}
+		onToggleWorkers={() => {
+			if (!board.project) return
+			void board.updateWorkers(!board.project.workers_enabled, board.project.max_workers)
+		}}
+		onConfigureWorkers={() => setShowWorkerSettings(true)}
+		workersPending={board.updatingWorkers}
+		clarificationCount={clarifications.open.length}
+		onOpenClarifications={() => setShowClarifications(true)}
         onCreate={() => setCreating(true)}
       />
       <main className="min-w-0 py-6">
@@ -96,7 +127,7 @@ export default function App() {
           <div>
             <p className="mb-1 text-xs font-medium tracking-wide text-muted-foreground uppercase">Agent workflow</p>
             <h2 className="font-heading text-2xl font-semibold tracking-tight">
-              {view === 'topics' ? '议题' : '任务看板'}
+			{viewTitle(view)}
             </h2>
           </div>
           <ViewTabs view={view} topicCount={board.topics.length} taskCount={board.tasks.length} onChange={setView} />
@@ -113,11 +144,18 @@ export default function App() {
             </div>
           </div>
         ) : null}
-        {view === 'topics' ? (
+		{git.error ? (
+			<div className="px-4 pb-4 sm:px-6 lg:px-8"><div className="flex items-center gap-3 rounded-xl border border-destructive/20 bg-destructive/5 px-4 py-3 text-sm text-destructive" role="alert"><AlertCircleIcon className="size-4 shrink-0" /><span className="min-w-0 flex-1">Git：{errorMessage(git.error)}</span><Button variant="ghost" size="sm" type="button" onClick={git.reload}><RefreshCwIcon />重新读取</Button></div></div>
+		) : null}
+		{view === 'topics' ? (
           <TopicList topics={board.topics} loading={board.loading} onOpenTopic={setSelectedTopicID} />
-        ) : (
+		) : view === 'tasks' ? (
           <KanbanBoard tasks={board.tasks} loading={board.loading} onOpenTask={setSelectedTaskID} />
-        )}
+		) : view === 'progress' ? (
+			<ProgressPage {...progress} onReload={progress.reload} />
+		) : (
+			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} /></>
+		)}
       </main>
       {creating ? (
         <CreateItemDialog
@@ -141,7 +179,6 @@ export default function App() {
           messages={discussion.messages}
           associations={associations.associations}
           topicAssociations={topicAssociations.associations}
-          pending={board.pendingTaskIDs.has(selectedTask.id)}
           discussionLoading={discussion.loading}
           relationLoading={associations.loading}
           submitting={discussion.submitting}
@@ -153,10 +190,20 @@ export default function App() {
           pendingRelationTopicIDs={topicAssociations.pendingTopicIDs}
           workspace={workspace.workspace}
           workspaceLoading={workspace.loading}
-          workspaceCreating={workspace.creating}
           workspaceError={workspace.error}
+		quality={quality.quality}
+		qualityLoading={quality.loading}
+		qualityError={quality.error}
+		qualityBusy={quality.busy}
+		assessment={assessment.assessment}
+		assessmentLoading={assessment.loading}
+		assessmentError={assessment.error}
+		assessmentBusy={assessment.busy}
+		clarifications={clarifications.history}
+		clarificationError={clarifications.error}
+		answeringClarificationID={clarifications.answeringID}
+			repositoryHasHead={git.repository?.has_head !== false}
           onClose={() => setSelectedTaskID(null)}
-          onQueue={board.queueTask}
           onReloadDiscussion={discussion.reload}
           onSendMessage={sendMessage}
           onAddRelation={associations.add}
@@ -165,10 +212,25 @@ export default function App() {
           onAddTopicRelation={topicAssociations.add}
           onRemoveTopicRelation={topicAssociations.remove}
           onOpenTopic={openTopic}
-          onCreateWorkspace={async () => {
-            await workspace.create()
-            board.reload()
-          }}
+			onTaskUpdated={board.updateTask}
+		onReloadQuality={quality.reload}
+		onCreateEstimate={quality.createEstimate}
+		onCreateTestCase={quality.createTestCase}
+		onRecordTestResult={quality.recordResult}
+		onReloadAssessment={assessment.reload}
+		onReloadClarifications={clarifications.reload}
+		onAnswerClarification={async (item, input) => {
+			const updated = await clarifications.answer(item, input)
+			board.updateTask(updated)
+		}}
+		onUpdateTitle={async (title) => {
+			const updated = await assessment.updateTitle(selectedTask, title)
+			board.updateTask(updated)
+		}}
+			onWorkspaceChanged={() => {
+			workspace.reload()
+			git.reload()
+		}}
         />
       ) : null}
       {selectedTopic ? (
@@ -190,6 +252,24 @@ export default function App() {
           onAddRelation={associations.add}
           onRemoveRelation={associations.remove}
           onOpenTask={openTask}
+			plan={topicPlan.plan}
+			planLoading={topicPlan.loading}
+			planSubmitting={topicPlan.submitting}
+			planError={topicPlan.error}
+			onReloadPlan={() => topicPlan.reload()}
+			onSubmitPlan={async (input) => {
+				await topicPlan.submit(selectedTopic, input)
+				board.reload()
+			}}
+			onRejectPlan={async (comment) => {
+				await topicPlan.reject(selectedTopic, comment)
+				board.reload()
+			}}
+			onApprovePlan={async (comment) => {
+				await topicPlan.approve(selectedTopic, comment)
+				board.reload()
+				associations.reload()
+			}}
         />
       ) : null}
       {showReleases && git.repository ? (
@@ -201,6 +281,26 @@ export default function App() {
           onCreate={git.createRelease}
         />
       ) : null}
+		{showWorkerSettings && board.project ? (
+			<WorkerSettingsDialog
+				project={board.project}
+				onClose={() => setShowWorkerSettings(false)}
+				onSave={board.updateWorkers}
+			/>
+		) : null}
+		{showClarifications ? (
+			<ClarificationInboxDialog
+				items={clarifications.open}
+				tasks={board.tasks}
+				answeringID={clarifications.answeringID}
+				onClose={() => setShowClarifications(false)}
+				onOpenTask={(taskID) => { setShowClarifications(false); openTask(taskID) }}
+				onAnswer={async (item, input) => {
+					const updated = await clarifications.answer(item, input)
+					board.updateTask(updated)
+				}}
+			/>
+		) : null}
     </div>
   )
 }
@@ -216,10 +316,10 @@ function ViewTabs({
   taskCount,
   onChange,
 }: {
-  view: 'topics' | 'tasks'
+	view: AppView
   topicCount: number
   taskCount: number
-  onChange: (view: 'topics' | 'tasks') => void
+	onChange: (view: AppView) => void
 }) {
   return (
     <div className="flex w-fit rounded-lg border bg-muted/40 p-1" role="tablist" aria-label="工作类型">
@@ -243,6 +343,16 @@ function ViewTabs({
       >
         <ListTodoIcon />任务 Tasks <Badge variant="outline">{taskCount}</Badge>
       </Button>
+		<Button variant={view === 'progress' ? 'secondary' : 'ghost'} size="sm" type="button" role="tab" aria-selected={view === 'progress'} onClick={() => onChange('progress')}>
+			<GaugeIcon />整体进度
+		</Button>
+		<Button variant={view === 'agents' ? 'secondary' : 'ghost'} size="sm" type="button" role="tab" aria-selected={view === 'agents'} onClick={() => onChange('agents')}>
+			<BotIcon />Agents
+		</Button>
     </div>
   )
+}
+
+function viewTitle(view: AppView): string {
+	return ({ topics: '议题', tasks: '任务看板', progress: '整体进度', agents: 'Agent 配置' })[view]
 }

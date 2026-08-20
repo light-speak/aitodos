@@ -96,6 +96,58 @@ func TestLoadReadsFixedLocalServerPort(t *testing.T) {
 	}
 }
 
+func TestWorkerSettingsPersistInLocalConfig(t *testing.T) {
+	repoRoot := initGitRepository(t)
+	initialized, _, err := Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings := initialized.WorkerSettings(); settings.Enabled || settings.MaxWorkers != 2 {
+		t.Fatalf("default worker settings = %#v", settings)
+	}
+
+	updated, err := initialized.UpdateWorkerSettings(true, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !updated.Enabled || updated.MaxWorkers != 3 {
+		t.Fatalf("updated worker settings = %#v", updated)
+	}
+
+	loaded, err := Load(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if settings := loaded.WorkerSettings(); !settings.Enabled || settings.MaxWorkers != 3 {
+		t.Fatalf("reloaded worker settings = %#v", settings)
+	}
+}
+
+func TestWorkerSettingsRejectInvalidConcurrencyWithoutChangingConfig(t *testing.T) {
+	repoRoot := initGitRepository(t)
+	initialized, _, err := Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(initialized.Paths.LocalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, maxWorkers := range []int{0, 33} {
+		if _, err := initialized.UpdateWorkerSettings(true, maxWorkers); err == nil {
+			t.Fatalf("UpdateWorkerSettings(true, %d) error = nil", maxWorkers)
+		}
+	}
+	after, err := os.ReadFile(initialized.Paths.LocalConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(after) != string(before) {
+		t.Fatal("invalid update changed local.toml")
+	}
+}
+
 func TestLoadRejectsInvalidLocalServerPort(t *testing.T) {
 	repoRoot := initGitRepository(t)
 	initialized, _, err := Initialize(context.Background(), repoRoot)
@@ -160,7 +212,7 @@ func assertDatabaseInitialized(t *testing.T, databasePath string, instanceID str
 	if err := database.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 8 {
-		t.Fatalf("schema version = %d, want 8", version)
+	if version != 20 {
+		t.Fatalf("schema version = %d, want 20", version)
 	}
 }

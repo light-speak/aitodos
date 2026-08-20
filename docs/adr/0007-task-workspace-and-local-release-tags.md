@@ -2,6 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-08-19
+- 更新：2026-08-20
 
 ## 背景
 
@@ -24,7 +25,11 @@ Task 的数据库 `version` 是乐观锁修订号，不是软件版本。若 UI 
 7. 已存在的同名 Tag 只有在它是 annotated tag 且指向相同 Commit 时才视为幂等成功，否则返回冲突。
 8. Release 只包含来源分支 Commit 中已经提交的内容。Task Workspace 中未提交或尚未合入来源分支的修改不会进入 Release。
 9. 系统不自动 push，不自动 merge，不因创建 Release 自动 commit。
-10. Agent 默认不得 commit。未来若实现提交，由用户触发“验收并提交”领域命令，Control Plane 在校验 Workspace 和 Review 后创建系统可审计 Commit；该交互需在实现 AcceptTask 前细化，但不得改成 Agent 静默提交。
+10. Agent 默认不得 commit。用户显式执行 `AcceptTask` 时，Control Plane 在 Task 处于 `REVIEW`、Workspace 身份有效且确有修改时自动创建 Commit，再把验收时 HEAD 写入不可变 Review。Commit 是人类验收命令的一部分，不是 Agent 静默提交；失败后 Task 保持 `REVIEW`，可安全重试。
+11. READY Task 可通过显式 `SubmitTaskReview` 直接进入 REVIEW，用于人工或外部工具完成实现、尚未接入 Agent Run 的流程；该命令不创建或伪造 Run。
+12. 文件清单相对 Workspace Base Commit 计算，完整单文件 Diff 仅在人类点击时读取，最大返回 512 KiB；不写入主数据库、不默认展开。
+13. 正式 Task 自动进入 `READY`；Scheduler 在第一次写入型 Run Claim 后、启动 Runner 前自动且幂等地准备 Workspace。普通 UI 不提供“创建 Workspace”按钮；路径、Branch 和 SHA 只作为技术详情展示。仓库无首个 Commit 或 Workspace 身份不可信时不得启动 Agent，并返回可操作错误。
+14. 创建 Release 时，根据最新通过 Review 的 Commit 是否为 Release Commit 的 Git 祖先，自动关联能够证明已包含的 Task；无法证明的 Task 不自动关联。
 
 ## 备选方案
 
@@ -53,4 +58,4 @@ Task 的数据库 `version` 是乐观锁修订号，不是软件版本。若 UI 
 - 用户能从 Task 详情看到真实 Git 工作身份，从 Release 面板看到版本、来源分支和固定 Commit。
 - 创建 Release 前必须确保目标内容已经提交到所选来源分支，并配置本地 Git 用户信息以创建 annotated tag。
 - Release 与可选 Task 关联只用于审计，当前不证明 Task 修改已经合入 Commit。
-- Workspace/Release 数据使用 Schema v7/v8 持久化；Git 操作失败不会丢失恢复所需事实。
+- Workspace/Release 数据使用 Schema v7/v8 持久化，人工 Review 使用 Schema v9；Git 操作失败不会丢失恢复所需事实。

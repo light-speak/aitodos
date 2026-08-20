@@ -193,14 +193,15 @@ Secret、环境变量值、Claim Token、代理凭据和脱敏前日志不得进
 Run 在能力可用时记录：
 
 ```text
-input_tokens, cached_input_tokens
+input_tokens, cached_input_tokens, cache_write_input_tokens
 output_tokens, reasoning_tokens, total_tokens
+model_requests, peak_input_tokens
 context_estimated_tokens
 context_included_items, context_omitted_items
 session_resumed
 ```
 
-未知值保存 `NULL`。UI 显示 Context Manifest、预算、省略原因、Session 是否恢复和实际 Usage，便于判断 Summary、Resume、Prompt Cache 和按需读取是否真正降低消耗。
+未知值保存 `NULL`。`cached_input_tokens` 是 `input_tokens` 的子集，二者都计入实际输入；Run 累计输入不能冒充单次上下文大小。UI 显示 Context Manifest、软预算、采用/省略原因、Session 是否恢复和实际 Usage，便于判断 Summary、Resume、Prompt Cache 和按需读取是否真正降低消耗。质量优先的软预算修订见 [ADR-0014](0014-actual-usage-and-quality-first-soft-context-budget.md)。
 
 ## 后果
 

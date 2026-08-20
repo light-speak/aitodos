@@ -7,9 +7,12 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
+	"strings"
 
 	"github.com/light-speak/aitodos/internal/daemon"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/runner"
 )
 
 // Run 执行 ATS CLI 并返回进程退出码。
@@ -30,6 +33,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		err = runStop(ctx, args[1:], stdout, stderr)
 	case "open":
 		err = runOpen(ctx, args[1:], stdout, stderr)
+	case "runner":
+		err = runRunner(ctx, args[1:], stderr)
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -43,6 +48,55 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return 1
 	}
 	return 0
+}
+
+func runRunner(ctx context.Context, args []string, stderr io.Writer) error {
+	flags := flag.NewFlagSet("runner", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	projectRoot := flags.String("project", "", "项目根目录")
+	runID := flags.String("run", "", "Run ID")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || *projectRoot == "" || *runID == "" {
+		return errors.New("runner 需要 --project 和 --run")
+	}
+	claimToken, err := readRunnerClaimToken()
+	generationText := os.Getenv("ATS_LEASE_GENERATION")
+	if err != nil || generationText == "" {
+		return errors.New("runner 缺少 Claim 环境")
+	}
+	generation, err := strconv.ParseInt(generationText, 10, 64)
+	if err != nil || generation < 1 {
+		return errors.New("runner Lease Generation 无效")
+	}
+	currentProject, err := project.Load(ctx, *projectRoot)
+	if err != nil {
+		return err
+	}
+	return runner.Execute(ctx, currentProject, *runID, claimToken, generation)
+}
+
+func readRunnerClaimToken() (string, error) {
+	fdText := os.Getenv("ATS_CLAIM_FD")
+	fd, err := strconv.Atoi(fdText)
+	if err != nil || fd < 3 {
+		return "", errors.New("runner Claim FD 无效")
+	}
+	file := os.NewFile(uintptr(fd), "ats-claim")
+	if file == nil {
+		return "", errors.New("runner Claim FD 不存在")
+	}
+	defer file.Close()
+	content, err := io.ReadAll(io.LimitReader(file, 1025))
+	if err != nil || len(content) > 1024 {
+		return "", errors.New("读取 Runner Claim 失败")
+	}
+	token := strings.TrimSpace(string(content))
+	if token == "" {
+		return "", errors.New("Runner Claim 为空")
+	}
+	return token, nil
 }
 
 func runInit(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {

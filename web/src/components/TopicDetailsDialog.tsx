@@ -1,8 +1,10 @@
+import type { ComponentProps } from 'react'
 import { TextIcon, XIcon } from 'lucide-react'
 
 import type { DiscussionMessage, Task, TaskAssociation, Topic, TopicStatus } from '../types'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
+import { PlanPanel } from './PlanPanel'
 import { RelatedTasks } from './RelatedTasks'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -26,6 +28,14 @@ interface TopicDetailsDialogProps {
   onAddRelation: (taskID: string) => Promise<void>
   onRemoveRelation: (taskID: string) => Promise<void>
   onOpenTask: (taskID: string) => void
+	plan: ComponentProps<typeof PlanPanel>['plan']
+	planLoading: boolean
+	planSubmitting: boolean
+	planError: unknown
+	onReloadPlan: () => void
+	onSubmitPlan: ComponentProps<typeof PlanPanel>['onSubmit']
+	onRejectPlan: ComponentProps<typeof PlanPanel>['onReject']
+	onApprovePlan: ComponentProps<typeof PlanPanel>['onApprove']
 }
 
 const statusLabels: Record<TopicStatus, { phase: string; detail?: string }> = {
@@ -66,6 +76,18 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
             <MarkdownContent content={topic.description} emptyText="未填写描述" />
           </section>
           <Separator />
+			<PlanPanel
+				topic={topic}
+				plan={props.plan}
+				loading={props.planLoading}
+				submitting={props.planSubmitting}
+				error={props.planError}
+				onReload={props.onReloadPlan}
+				onSubmit={props.onSubmitPlan}
+				onReject={props.onRejectPlan}
+				onApprove={props.onApprovePlan}
+			/>
+			<Separator />
           <RelatedTasks
             tasks={tasks}
             associations={associations}

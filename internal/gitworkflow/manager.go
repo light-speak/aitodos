@@ -14,6 +14,7 @@ import (
 	"unicode"
 
 	"github.com/light-speak/aitodos/internal/domain/release"
+	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/workspace"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/storage"
@@ -22,6 +23,9 @@ import (
 var (
 	ErrTagConflict       = errors.New("git tag already points to another commit or is not annotated")
 	ErrWorkspaceIdentity = errors.New("workspace git identity mismatch")
+	ErrWorkspaceDirty    = errors.New("workspace has uncommitted changes")
+	ErrWorkspaceClean    = errors.New("workspace has no changes to commit")
+	ErrRepositoryUnborn  = errors.New("repository has no initial commit")
 )
 
 // Branch 保存本地 Branch 名称和当前 Commit。
@@ -30,10 +34,98 @@ type Branch struct {
 	HeadSHA string `json:"head_sha"`
 }
 
+// SubmitTaskReview 将可执行 Task 送入人工验收，不伪造 Agent Run。
+func (manager *Manager) SubmitTaskReview(ctx context.Context, taskID string, version int64) (task.Task, error) {
+	return manager.tasks.ApplyCommand(ctx, taskID, version, task.CommandSubmitReview)
+}
+
+// CommitTaskWorkspace 显式提交当前 Task worktree 中的全部修改。
+func (manager *Manager) CommitTaskWorkspace(ctx context.Context, taskID, message string) (workspace.Workspace, error) {
+	message = strings.TrimSpace(message)
+	if message == "" || len(message) > 500 {
+		return workspace.Workspace{}, errors.New("commit message must contain 1 to 500 characters")
+	}
+	currentTask, err := manager.tasks.Get(ctx, taskID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if currentTask.Status != task.StatusReview {
+		return workspace.Workspace{}, &task.TransitionError{Current: currentTask.Status, Command: task.CommandSubmitReview}
+	}
+	item, err := manager.TaskWorkspace(ctx, taskID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	if item == nil || !item.Dirty {
+		return workspace.Workspace{}, ErrWorkspaceClean
+	}
+	lock, err := acquireRepositoryLock(ctx, filepath.Join(manager.project.Paths.Runtime, "git.lock"))
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
+	defer lock.Close()
+	if _, err := manager.gitOutput(ctx, item.Path, "add", "--all"); err != nil {
+		return workspace.Workspace{}, err
+	}
+	if _, err := manager.gitOutput(ctx, item.Path, "commit", "-m", message); err != nil {
+		return workspace.Workspace{}, err
+	}
+	return manager.refreshWorkspace(ctx, *item)
+}
+
+// ReviewTask 保存人工验收，并把验收时的 workspace HEAD 固化到 Review。
+func (manager *Manager) ReviewTask(
+	ctx context.Context,
+	taskID string,
+	version int64,
+	input task.ReviewInput,
+) (task.Task, task.Review, error) {
+	input = input.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	current, err := manager.tasks.Get(ctx, taskID)
+	if err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if current.Version != version {
+		return task.Task{}, task.Review{}, storage.ErrTaskVersionConflict
+	}
+	if _, err := task.Transition(current.Status, input.Command()); err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	commitSHA := ""
+	item, err := manager.TaskWorkspace(ctx, taskID)
+	if err != nil {
+		return task.Task{}, task.Review{}, err
+	}
+	if item != nil {
+		if input.Decision == task.ReviewAccepted && item.Dirty {
+			committed, commitErr := manager.CommitTaskWorkspace(ctx, taskID, defaultTaskCommitMessage(current))
+			if commitErr != nil {
+				return task.Task{}, task.Review{}, commitErr
+			}
+			item = &committed
+		}
+		commitSHA = item.HeadSHA
+	}
+	return manager.tasks.ApplyReview(ctx, taskID, version, input, commitSHA)
+}
+
+func defaultTaskCommitMessage(item task.Task) string {
+	return fmt.Sprintf("feat: complete %s / 完成 %s", item.Key, item.Key)
+}
+
+// ListTaskReviews 返回 Task 的人工验收历史。
+func (manager *Manager) ListTaskReviews(ctx context.Context, taskID string) ([]task.Review, error) {
+	return manager.tasks.ListReviews(ctx, taskID)
+}
+
 // RepositoryInfo 是 UI 创建 Release 前需要的当前 Git 事实。
 type RepositoryInfo struct {
 	CurrentBranch string   `json:"current_branch"`
 	HeadSHA       string   `json:"head_sha"`
+	HasHead       bool     `json:"has_head"`
 	Dirty         bool     `json:"dirty"`
 	ExactTag      string   `json:"exact_tag,omitempty"`
 	Branches      []Branch `json:"branches"`
@@ -57,14 +149,19 @@ func New(currentProject *project.Project, database *sql.DB) *Manager {
 
 // CreateTaskWorkspace 为 Task 创建或恢复一个长期 linked worktree。
 func (manager *Manager) CreateTaskWorkspace(ctx context.Context, taskID string) (workspace.Workspace, error) {
+	item, err := manager.tasks.Get(ctx, taskID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
 	lock, err := acquireRepositoryLock(ctx, filepath.Join(manager.project.Paths.Runtime, "git.lock"))
 	if err != nil {
 		return workspace.Workspace{}, err
 	}
 	defer lock.Close()
-	item, err := manager.tasks.Get(ctx, taskID)
-	if err != nil {
-		return workspace.Workspace{}, err
+	if _, hasHead, headErr := manager.optionalHead(ctx); headErr != nil {
+		return workspace.Workspace{}, headErr
+	} else if !hasHead {
+		return workspace.Workspace{}, ErrRepositoryUnborn
 	}
 	targetBranch := item.TargetBranch
 	if targetBranch == "" {
@@ -122,9 +219,9 @@ func (manager *Manager) RepositoryInfo(ctx context.Context) (RepositoryInfo, err
 	if err != nil {
 		currentBranch = ""
 	}
-	headSHA, err := manager.gitOutput(ctx, manager.project.Root, "rev-parse", "HEAD")
+	headSHA, hasHead, err := manager.optionalHead(ctx)
 	if err != nil {
-		return RepositoryInfo{}, fmt.Errorf("read repository HEAD: %w", err)
+		return RepositoryInfo{}, err
 	}
 	status, err := manager.gitOutput(ctx, manager.project.Root, "status", "--porcelain", "--untracked-files=normal")
 	if err != nil {
@@ -136,9 +233,23 @@ func (manager *Manager) RepositoryInfo(ctx context.Context) (RepositoryInfo, err
 	}
 	exactTag, _ := manager.gitOutput(ctx, manager.project.Root, "describe", "--tags", "--exact-match", "HEAD")
 	return RepositoryInfo{
-		CurrentBranch: currentBranch, HeadSHA: headSHA, Dirty: status != "",
+		CurrentBranch: currentBranch, HeadSHA: headSHA, HasHead: hasHead, Dirty: status != "",
 		ExactTag: exactTag, Branches: branches,
 	}, nil
+}
+
+func (manager *Manager) optionalHead(ctx context.Context) (string, bool, error) {
+	command := exec.CommandContext(ctx, "git", "-C", manager.project.Root, "rev-parse", "--verify", "--quiet", "HEAD")
+	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	output, err := command.CombinedOutput()
+	if err == nil {
+		return strings.TrimSpace(string(output)), true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+		return "", false, nil
+	}
+	return "", false, fmt.Errorf("read repository HEAD: %w: %s", err, strings.TrimSpace(string(output)))
 }
 
 // CreateRelease 创建可恢复的 Release 记录和本地 annotated tag。
@@ -156,6 +267,15 @@ func (manager *Manager) CreateRelease(ctx context.Context, input release.CreateI
 	if err != nil {
 		return release.Release{}, err
 	}
+	inferredTaskIDs, err := manager.inferReleaseTaskIDs(ctx, commitSHA)
+	if err != nil {
+		return release.Release{}, err
+	}
+	input.TaskIDs = append(input.TaskIDs, inferredTaskIDs...)
+	input = input.Normalized()
+	if err := input.Validate(); err != nil {
+		return release.Release{}, err
+	}
 	reserved, err := manager.releases.Reserve(ctx, input, commitSHA)
 	if err != nil {
 		return release.Release{}, err
@@ -168,6 +288,52 @@ func (manager *Manager) CreateRelease(ctx context.Context, input release.CreateI
 		return reserved, nil
 	}
 	return manager.releases.MarkTagged(ctx, reserved.ID)
+}
+
+func (manager *Manager) inferReleaseTaskIDs(ctx context.Context, commitSHA string) ([]string, error) {
+	tasks, err := manager.tasks.List(ctx)
+	if err != nil {
+		return nil, err
+	}
+	result := make([]string, 0)
+	for _, item := range tasks {
+		if item.Status != task.StatusAccepted {
+			continue
+		}
+		reviews, reviewErr := manager.tasks.ListReviews(ctx, item.ID)
+		if reviewErr != nil {
+			return nil, reviewErr
+		}
+		for _, review := range reviews {
+			if review.Decision != task.ReviewAccepted || review.CommitSHA == "" {
+				continue
+			}
+			reachable, ancestorErr := manager.isAncestor(ctx, review.CommitSHA, commitSHA)
+			if ancestorErr != nil {
+				return nil, ancestorErr
+			}
+			if reachable {
+				result = append(result, item.ID)
+			}
+			break
+		}
+	}
+	sort.Strings(result)
+	return result, nil
+}
+
+func (manager *Manager) isAncestor(ctx context.Context, ancestor, descendant string) (bool, error) {
+	command := exec.CommandContext(ctx, "git", "-C", manager.project.Root, "merge-base", "--is-ancestor", ancestor, descendant)
+	command.Env = append(os.Environ(), "GIT_TERMINAL_PROMPT=0")
+	err := command.Run()
+	if err == nil {
+		return true, nil
+	}
+	var exitError *exec.ExitError
+	if errors.As(err, &exitError) && exitError.ExitCode() == 1 {
+		return false, nil
+	}
+	return false, fmt.Errorf("verify release commit ancestry: %w", err)
 }
 
 // ListReleases 返回当前项目发布历史。

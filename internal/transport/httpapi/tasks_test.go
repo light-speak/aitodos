@@ -16,17 +16,19 @@ import (
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
-func TestTaskRoutesCreateListGetAndQueue(t *testing.T) {
+func TestTaskRoutesCreateListAndGetReadyTask(t *testing.T) {
 	server := newTaskTestServer(t)
 
 	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{
 		"title":"实现任务看板",
 		"description":"项目级看板",
-		"acceptance_criteria":"可以排队任务",
-		"priority":10
+		"acceptance_criteria":"可以自动等待执行"
 	}`, http.StatusCreated)
-	if created.Status != task.StatusBacklog {
+	if created.Status != task.StatusReady || created.Priority != 2 {
 		t.Fatalf("created status = %q", created.Status)
+	}
+	if created.TitleSource != task.TitleSourceHuman || !created.TitleLocked {
+		t.Fatalf("created title metadata = %#v", created)
 	}
 
 	response, err := server.Client().Get(server.URL + "/api/tasks")
@@ -50,13 +52,6 @@ func TestTaskRoutesCreateListGetAndQueue(t *testing.T) {
 		t.Fatalf("loaded task = %#v", loaded)
 	}
 
-	queued := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/queue", `{"version":1}`, http.StatusOK)
-	if queued.Status != task.StatusReady || queued.Version != 2 {
-		t.Fatalf("queued task = %#v", queued)
-	}
-
-	requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/queue", `{"version":2}`, http.StatusConflict)
-	requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/queue", `{"version":1}`, http.StatusConflict)
 }
 
 func TestTaskRoutesValidateInputAndNotFound(t *testing.T) {
@@ -66,9 +61,17 @@ func TestTaskRoutesValidateInputAndNotFound(t *testing.T) {
 	if created.Title != "直接修复登录按钮" {
 		t.Fatalf("derived title = %q", created.Title)
 	}
+	if created.TitleSource != task.TitleSourceProvisional || created.TitleLocked {
+		t.Fatalf("provisional title metadata = %#v", created)
+	}
+	updated := requestTask(t, server.Client(), http.MethodPut, server.URL+"/api/tasks/"+created.ID+"/title", `{
+		"title":"修复登录按钮状态","expected_version":1
+	}`, http.StatusOK)
+	if updated.TitleSource != task.TitleSourceHuman || !updated.TitleLocked || updated.Version != 2 {
+		t.Fatalf("updated title = %#v", updated)
+	}
 	requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"任务","unknown":true}`, http.StatusBadRequest)
 	requestTask(t, server.Client(), http.MethodGet, server.URL+"/api/tasks/missing", "", http.StatusNotFound)
-	requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/missing/queue", `{"version":1}`, http.StatusNotFound)
 }
 
 func TestTaskRoutesDiscussAndRelateTasks(t *testing.T) {
@@ -120,7 +123,8 @@ func newTaskTestServer(t *testing.T) *httptest.Server {
 	mux := http.NewServeMux()
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
-	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore)
+	taskStore := storage.NewTaskStore(database)
+	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database))
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server

@@ -1,5 +1,7 @@
 package project
 
+import "sync"
+
 // Paths 集中描述当前项目的受管路径。
 type Paths struct {
 	ATSRoot       string
@@ -36,11 +38,12 @@ type ServerConfig struct {
 
 // AgentConfig 描述当前项目启动 Agent CLI 的方式。
 type AgentConfig struct {
-	Adapter    string   `toml:"adapter"`
-	Command    string   `toml:"command"`
-	Args       []string `toml:"args"`
-	Model      string   `toml:"model"`
-	MaxWorkers int      `toml:"max_workers"`
+	Adapter        string   `toml:"adapter"`
+	Command        string   `toml:"command"`
+	Args           []string `toml:"args"`
+	Model          string   `toml:"model"`
+	WorkersEnabled bool     `toml:"workers_enabled"`
+	MaxWorkers     int      `toml:"max_workers"`
 }
 
 // ProxyConfig 描述当前项目的网络代理继承策略。
@@ -50,10 +53,17 @@ type ProxyConfig struct {
 
 // Project 是一个已经初始化的本地项目。
 type Project struct {
+	configMu     sync.RWMutex
 	Root         string
 	GitCommonDir string
 	InstanceID   string
 	Paths        Paths
 	Config       ProjectConfig
 	Local        LocalConfig
+}
+
+// WorkerSettings 是当前项目可动态修改的 Worker 配置。
+type WorkerSettings struct {
+	Enabled    bool `json:"enabled"`
+	MaxWorkers int  `json:"max_workers"`
 }

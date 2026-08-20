@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/light-speak/aitodos/internal/domain/assessment"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/relation"
 	"github.com/light-speak/aitodos/internal/domain/task"
@@ -16,13 +17,29 @@ import (
 const maxRequestBodyBytes = 1 << 20
 
 type taskHandler struct {
-	store      *storage.TaskStore
-	discussion *storage.DiscussionStore
-	relations  *storage.RelationStore
+	store       *storage.TaskStore
+	discussion  *storage.DiscussionStore
+	relations   *storage.RelationStore
+	assessments *storage.AssessmentStore
 }
 
-type commandRequest struct {
-	Version int64 `json:"version"`
+type createTaskRequest struct {
+	Title              string `json:"title"`
+	Description        string `json:"description"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	Priority           *int   `json:"priority"`
+	TargetBranch       string `json:"target_branch,omitempty"`
+}
+
+type updateTaskTitleRequest struct {
+	Title           string `json:"title"`
+	ExpectedVersion int64  `json:"expected_version"`
+}
+
+type taskListItem struct {
+	task.Task
+	Assessment      *assessment.Assessment `json:"assessment,omitempty"`
+	AssessmentStale bool                   `json:"assessment_stale"`
 }
 
 type errorEnvelope struct {
@@ -40,12 +57,16 @@ func RegisterTaskRoutes(
 	store *storage.TaskStore,
 	discussionStore *storage.DiscussionStore,
 	relationStore *storage.RelationStore,
+	assessmentStore *storage.AssessmentStore,
 ) {
-	handler := &taskHandler{store: store, discussion: discussionStore, relations: relationStore}
+	handler := &taskHandler{
+		store: store, discussion: discussionStore, relations: relationStore,
+		assessments: assessmentStore,
+	}
 	mux.HandleFunc("POST /api/tasks", handler.create)
 	mux.HandleFunc("GET /api/tasks", handler.list)
 	mux.HandleFunc("GET /api/tasks/{taskID}", handler.get)
-	mux.HandleFunc("POST /api/tasks/{taskID}/queue", handler.queue)
+	mux.HandleFunc("PUT /api/tasks/{taskID}/title", handler.updateTitle)
 	mux.HandleFunc("GET /api/tasks/{taskID}/messages", handler.listMessages)
 	mux.HandleFunc("POST /api/tasks/{taskID}/messages", handler.createMessage)
 	mux.HandleFunc("GET /api/tasks/{taskID}/relations", handler.listRelations)
@@ -54,6 +75,20 @@ func RegisterTaskRoutes(
 	mux.HandleFunc("GET /api/tasks/{taskID}/topics", handler.listTopics)
 	mux.HandleFunc("POST /api/tasks/{taskID}/topics", handler.createTopicRelation)
 	mux.HandleFunc("DELETE /api/tasks/{taskID}/topics/{topicID}", handler.deleteTopicRelation)
+}
+
+func (handler *taskHandler) updateTitle(response http.ResponseWriter, request *http.Request) {
+	var body updateTaskTitleRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的 Task 标题")
+		return
+	}
+	updated, err := handler.store.UpdateTitle(request.Context(), request.PathValue("taskID"), body.ExpectedVersion, task.UpdateTitleInput{Title: body.Title})
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
 }
 
 func (handler *taskHandler) listTopics(response http.ResponseWriter, request *http.Request) {
@@ -162,10 +197,18 @@ func (handler *taskHandler) deleteRelation(response http.ResponseWriter, request
 }
 
 func (handler *taskHandler) create(response http.ResponseWriter, request *http.Request) {
-	var input task.CreateInput
-	if err := decodeJSON(response, request, &input); err != nil {
+	var body createTaskRequest
+	if err := decodeJSON(response, request, &body); err != nil {
 		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的 Task")
 		return
+	}
+	priority := 2
+	if body.Priority != nil {
+		priority = *body.Priority
+	}
+	input := task.CreateInput{
+		Title: body.Title, Description: body.Description, AcceptanceCriteria: body.AcceptanceCriteria,
+		Priority: priority, TargetBranch: body.TargetBranch,
 	}
 	if err := input.Validate(); err != nil {
 		writeError(response, http.StatusBadRequest, "INVALID_TASK", err.Error())
@@ -185,7 +228,21 @@ func (handler *taskHandler) list(response http.ResponseWriter, request *http.Req
 		writeError(response, http.StatusInternalServerError, "TASK_LIST_FAILED", "读取 Task 列表失败")
 		return
 	}
-	writeJSON(response, http.StatusOK, tasks)
+	assessments, err := handler.assessments.ListCurrent(request.Context())
+	if err != nil {
+		writeError(response, http.StatusInternalServerError, "TASK_LIST_FAILED", "读取 Task 评估失败")
+		return
+	}
+	result := make([]taskListItem, 0, len(tasks))
+	for _, item := range tasks {
+		view := taskListItem{Task: item}
+		if current, exists := assessments[item.ID]; exists {
+			view.Assessment = &current
+			view.AssessmentStale = current.TaskAssessmentVersion != item.AssessmentInputVersion
+		}
+		result = append(result, view)
+	}
+	writeJSON(response, http.StatusOK, result)
 }
 
 func (handler *taskHandler) get(response http.ResponseWriter, request *http.Request) {
@@ -195,25 +252,6 @@ func (handler *taskHandler) get(response http.ResponseWriter, request *http.Requ
 		return
 	}
 	writeJSON(response, http.StatusOK, loaded)
-}
-
-func (handler *taskHandler) queue(response http.ResponseWriter, request *http.Request) {
-	var input commandRequest
-	if err := decodeJSON(response, request, &input); err != nil || input.Version < 1 {
-		writeError(response, http.StatusBadRequest, "INVALID_COMMAND", "version 必须是正整数")
-		return
-	}
-	updated, err := handler.store.ApplyCommand(
-		request.Context(),
-		request.PathValue("taskID"),
-		input.Version,
-		task.CommandQueue,
-	)
-	if err != nil {
-		writeTaskError(response, err)
-		return
-	}
-	writeJSON(response, http.StatusOK, updated)
 }
 
 func writeTaskError(response http.ResponseWriter, err error) {

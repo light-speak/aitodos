@@ -1,4 +1,4 @@
-import { GitBranchIcon, ListTodoIcon, MessageSquareIcon, PlusIcon, SquareKanbanIcon, TagIcon } from 'lucide-react'
+import { BotIcon, CircleHelpIcon, GitBranchIcon, ListTodoIcon, MessageSquareIcon, PlusIcon, Settings2Icon, SquareKanbanIcon, TagIcon } from 'lucide-react'
 
 import { shortGitSHA } from '../lib/utils'
 import type { ProjectInfo, Release, RepositoryInfo } from '../types'
@@ -13,14 +13,21 @@ interface AppHeaderProps {
   repository: RepositoryInfo | null
   latestRelease: Release | null
   onOpenReleases: () => void
+	onToggleWorkers: () => void
+	onConfigureWorkers: () => void
+	workersPending: boolean
+	clarificationCount: number
+	onOpenClarifications: () => void
   onCreate: () => void
 }
 
 export function AppHeader(props: AppHeaderProps) {
-  const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onCreate } = props
+	const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onToggleWorkers, onConfigureWorkers, workersPending, clarificationCount, onOpenClarifications, onCreate } = props
   const branchSummary = repository === null
     ? '正在读取…'
-    : `${repository.current_branch || 'detached'} @ ${shortGitSHA(repository.head_sha)}`
+		: repository.has_head
+			? `${repository.current_branch || 'detached'} @ ${shortGitSHA(repository.head_sha)}`
+			: `${repository.current_branch || '未命名分支'} · 尚无 Commit`
   return (
     <header className="border-b bg-card">
       <div className="flex min-h-20 items-center gap-4 px-4 sm:px-6 lg:px-8">
@@ -43,6 +50,24 @@ export function AppHeader(props: AppHeaderProps) {
           <Separator orientation="vertical" className="h-8" />
           <Metric icon={<TagIcon />} label="Release" value={latestRelease?.tag_name ?? '尚未发布'} />
         </div>
+		<Button
+			variant={project?.workers_enabled ? 'default' : 'outline'}
+			size="lg"
+			type="button"
+			aria-label={project?.workers_enabled ? '暂停 Workers' : '启动 Workers'}
+			disabled={project === null || workersPending}
+			onClick={onToggleWorkers}
+		>
+			<BotIcon />
+			{workersPending ? '保存中…' : project?.workers_enabled ? `${project.max_workers} Workers` : 'Workers 已暂停'}
+		</Button>
+		<Button variant="ghost" size="icon-lg" type="button" aria-label="配置 Workers" disabled={project === null} onClick={onConfigureWorkers}>
+			<Settings2Icon />
+		</Button>
+		<Button aria-label={clarificationCount > 0 ? `待回答 ${clarificationCount}` : '待回答'} variant={clarificationCount > 0 ? 'default' : 'outline'} size="lg" type="button" onClick={onOpenClarifications}>
+			<CircleHelpIcon />待回答
+			{clarificationCount > 0 ? <Badge variant="secondary">{clarificationCount}</Badge> : null}
+		</Button>
         <Button variant="outline" size="lg" type="button" aria-label="Releases" onClick={onOpenReleases}>
           <TagIcon />Releases
         </Button>

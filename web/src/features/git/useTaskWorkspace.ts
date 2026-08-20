@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { createTaskWorkspace, getTaskWorkspace } from '../../api/client'
+import { getTaskWorkspace } from '../../api/client'
 import type { Workspace } from '../../types'
 
 interface WorkspaceState {
@@ -14,7 +14,7 @@ const emptyState: WorkspaceState = { taskID: null, workspace: null, loading: fal
 
 export function useTaskWorkspace(taskID: string | null) {
 	const [state, setState] = useState<WorkspaceState>(emptyState)
-  const [creating, setCreating] = useState(false)
+	const [reloadToken, setReloadToken] = useState(0)
 
   useEffect(() => {
 		if (taskID === null) return
@@ -31,25 +31,12 @@ export function useTaskWorkspace(taskID: string | null) {
       },
     )
     return () => controller.abort()
-  }, [taskID])
+  }, [taskID, reloadToken])
 
-  const create = useCallback(async () => {
-    if (taskID === null) return
-    setCreating(true)
-    try {
-			const created = await createTaskWorkspace(taskID)
-			setState({ taskID, workspace: created, loading: false, error: null })
-    } catch (createError: unknown) {
-			setState({ taskID, workspace: null, loading: false, error: createError })
-      throw createError
-    } finally {
-      setCreating(false)
-    }
-  }, [taskID])
+	const reload = useCallback(() => setReloadToken((current) => current + 1), [])
 
 	return useMemo(() => ({
 		...(state.taskID === taskID ? state : { taskID, workspace: null, loading: taskID !== null, error: null }),
-		creating,
-		create,
-	}), [create, creating, state, taskID])
+		reload,
+	}), [reload, state, taskID])
 }

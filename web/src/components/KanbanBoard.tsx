@@ -1,7 +1,8 @@
+import { useState } from 'react'
 import type { KeyboardEvent } from 'react'
 import { ArrowUpRightIcon } from 'lucide-react'
 
-import type { Task, TaskStatus } from '../types'
+import type { ComplexityLevel, Task, TaskStatus } from '../types'
 import { Badge } from './ui/badge'
 import { Card, CardDescription, CardFooter, CardHeader, CardTitle } from './ui/card'
 import { Skeleton } from './ui/skeleton'
@@ -21,7 +22,7 @@ const columns: ReadonlyArray<{ id: string; statuses: readonly TaskStatus[]; labe
 
 const statusLabels: Record<TaskStatus, string> = {
   BACKLOG: '待完善',
-  READY: '可执行',
+	READY: '等待执行',
   RUNNING: '执行中',
   REVIEW: '待验收',
   ACCEPTED: '已完成',
@@ -31,11 +32,30 @@ const statusLabels: Record<TaskStatus, string> = {
 }
 
 export function KanbanBoard({ tasks, loading, onOpenTask }: KanbanBoardProps) {
+	const [complexityFilter, setComplexityFilter] = useState<'ALL' | 'UNKNOWN' | ComplexityLevel>('ALL')
+	const visibleTasks = tasks.filter((task) => matchesComplexity(task, complexityFilter))
+
   return (
-    <div className="kanban-scrollbar overflow-x-auto px-4 pb-8 sm:px-6 lg:px-8">
+		<div className="px-4 pb-8 sm:px-6 lg:px-8">
+			<div className="mb-3 flex justify-end">
+				<label className="flex items-center gap-2 text-xs text-muted-foreground">
+					复杂度
+					<select
+						aria-label="复杂度筛选"
+						className="h-8 rounded-md border bg-background px-2 text-xs text-foreground shadow-xs outline-none focus-visible:ring-2 focus-visible:ring-ring"
+						value={complexityFilter}
+						onChange={(event) => setComplexityFilter(event.currentTarget.value as typeof complexityFilter)}
+					>
+						<option value="ALL">全部</option>
+						<option value="UNKNOWN">未评估</option>
+						{(['C1', 'C2', 'C3', 'C4', 'C5'] as const).map((level) => <option value={level} key={level}>{level}</option>)}
+					</select>
+				</label>
+			</div>
+			<div className="kanban-scrollbar overflow-x-auto">
       <div className="flex min-w-max items-start gap-3" aria-label="Task Kanban">
         {columns.map((column) => {
-          const columnTasks = tasks.filter((task) => column.statuses.includes(task.status))
+          const columnTasks = visibleTasks.filter((task) => column.statuses.includes(task.status))
           return (
             <section
               className="w-[300px] rounded-xl border bg-muted/30 p-2.5"
@@ -64,8 +84,15 @@ export function KanbanBoard({ tasks, loading, onOpenTask }: KanbanBoardProps) {
           )
         })}
       </div>
+			</div>
     </div>
   )
+}
+
+function matchesComplexity(task: Task, filter: 'ALL' | 'UNKNOWN' | ComplexityLevel): boolean {
+	if (filter === 'ALL') return true
+	const complexity = task.assessment_stale ? undefined : task.assessment?.complexity
+	return filter === 'UNKNOWN' ? complexity === undefined : complexity === filter
 }
 
 function TaskCard({ task, onOpenTask }: { task: Task; onOpenTask: (taskID: string) => void }) {
@@ -93,8 +120,9 @@ function TaskCard({ task, onOpenTask }: { task: Task; onOpenTask: (taskID: strin
         <div className="flex items-center justify-between gap-2">
           <span className="font-mono text-[11px] font-medium text-muted-foreground">{task.key}</span>
           <span className="flex items-center gap-1">
+			{task.assessment && !task.assessment_stale ? <><Badge variant="secondary" className="h-5 px-1.5 font-mono text-[10px]">{task.assessment.complexity}</Badge><Badge variant="outline" className="h-5 px-1.5 font-mono text-[10px]">{task.assessment.autonomy}</Badge></> : null}
             <Badge variant="outline" className="h-5 px-1.5 text-[10px]">{statusLabels[task.status]}</Badge>
-            <Badge variant={task.priority > 0 ? 'default' : 'outline'} className="h-5 px-1.5 font-mono text-[10px]">
+			<Badge variant={task.priority === 0 ? 'default' : 'outline'} className="h-5 px-1.5 font-mono text-[10px]">
               P{task.priority}
             </Badge>
           </span>

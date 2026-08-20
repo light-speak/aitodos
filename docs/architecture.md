@@ -1,6 +1,6 @@
 # AiTodos 架构设计基线
 
-- 状态：Draft，ADR-0001 至 ADR-0007 已接受；Topic/Task 讨论、Task Workspace 与本地 Release Tag 已实现，Plan/Context/Run 主体扩展尚未同步
+- 状态：Draft，ADR-0001 至 ADR-0013 已接受；Topic/Task 讨论、Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Agent Profile Revision、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage 和持久 Clarification/Continuation Run 已实现；MCP 调用审计与资源回收、Planning Run、Search/MCP Read Server、SSE、取消与完整 Crash Recovery 正在推进
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
@@ -19,6 +19,7 @@ Topic Discussion
 + Agent Runtime
 + Git Workspace
 + Local Release / Annotated Tag
++ Explainable Progress / Test Evidence
 ```
 
 系统必须始终能够回答：
@@ -127,7 +128,7 @@ Run 业务主体没有其他活跃 Run
 Run 状态为 QUEUED
 ```
 
-PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。当前项目内按优先级和排队时间排序。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
+PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；TRIAGE Run 作用于 Task 但不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。Worker 开关只控制当前项目的新 Claim；正式 Task 自动进入内部 READY，缺少有效评估时先执行 Triage，Revision 优先于 Implementation，随后按 P0–P3 和排队时间排序。Triage 失败或 Profile 未配置不得永久阻塞 Implementation。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
 
 ### Workspace Manager
 
@@ -208,9 +209,25 @@ Label 是 Project 内可自定义的人类分类，只用于展示、搜索、�
 
 代表 Project 仓库中的一个 SemVer 发布事实。Release 固定保存规范版本、`v<semver>` Tag、来源本地分支和解析后的不可变 Commit SHA；来源分支只用于审计，分支后续移动不会改变 Release。创建 Release 会在本地创建 annotated tag，但不会 push、merge 或自动提交 Workspace 修改。
 
+### Estimate Revision / Test Case / Test Result
+
+Estimate Revision 保存 AI 或人工对 Task 工作量、剩余量、置信度和依据的不可变估算。MVP 尚未实现输入 Revision 和 stale 自动检测。Test Case 描述需要验证的行为；Test Result 保存某次 Run 或人工验证的状态与证据来源。AI 文本声明与 Runner 实际命令结果必须分开标识。
+
+### Task Assessment Revision
+
+Task Assessment Revision 保存 Triage Agent 对标题、六维复杂度、AI 自主度、置信度、依据和拆分建议的不可变评估。复杂度和自主度由后端固定算法从维度评分推导，不能由 Agent 直接指定。评估绑定 Task Assessment Input Version；影响评估输入的需求变化后旧评估作为历史保留并显示过期，单独编辑或锁定标题不使评估过期。它不改变 Points、P0–P3、Agent 权限或模型路由，详见 [ADR-0010](adr/0010-task-triage-title-complexity-and-autonomy.md)。
+
+### Clarification
+
+Clarification 保存 Agent 对 Task 提出的结构化阻塞问题、稳定选项、推荐说明和不可覆盖的人工答案。它与普通评论和 CLI 权限审批分离。开放问题进入全局待回答投影；回答后恢复 Task 并由新的 Continuation Run 继续，详见 [ADR-0011](adr/0011-durable-clarifications-continuation-runs-and-agent-config.md)。
+
+### Progress Projection
+
+Progress Projection 是从 Task、Estimate、Test、Run 和 Review 重建的项目级只读视图，同时展示严格已验收进度和带覆盖率、置信度的 AI 预测，不存储一个可任意修改的“完成百分比”。
+
 ### Run
 
-一次独立 AI CLI 执行。Run purpose 为 `PLANNING`、`IMPLEMENTATION`、`REVISION` 或 `REVIEW`，并通过受外键和 CHECK 约束的字段绑定恰好一个 Topic 或 Task。Run 从排队开始形成完整审计记录。Run 创建后，其 Agent Profile Revision、Model、Prompt、Context、环境配置、Workspace 和执行策略快照不可变。
+一次独立 AI CLI 执行。Run purpose 为 `PLANNING`、`TRIAGE`、`IMPLEMENTATION`、`REVISION` 或 `REVIEW`，并通过受外键和 CHECK 约束的字段绑定恰好一个 Topic 或 Task。Run 从排队开始形成完整审计记录。Run 创建后，其 Agent Profile Revision、Model、Prompt、Context、环境配置、Workspace 和执行策略快照不可变。Agent 提出阻塞问题时 Run 以 `NEEDS_INPUT` 结束并释放 Worker；人工回答后由新的 `continuation_of_run_id` Run 继续。
 
 ### AgentSession
 
@@ -359,6 +376,41 @@ created_at, updated_at, version
 
 Task 更新使用 `version` 乐观锁，避免 UI 重复提交覆盖较新的状态。
 
+正式 Task 的优先级为 `P0`、`P1`、`P2` 或 `P3`，默认 `P2`。Task 草稿仍属于 Plan Revision；只有正式 Task 自动进入 Worker 候选集。
+
+### task_estimate_revisions / task_test_cases / task_test_results
+
+```text
+task_estimate_revisions:
+id, task_id, revision
+initial_points, remaining_points, confidence
+rationale, assumptions, source_kind, source_run_id, model
+input_revision, created_at
+
+task_test_cases:
+id, task_id, title, description
+kind, required, position, created_by
+source_plan_revision_id, created_at, updated_at
+
+task_test_results:
+id, test_case_id, run_id
+status, evidence_kind
+command_summary, exit_code, artifact_id, message
+created_at
+```
+
+Estimate 和 Test Result 创建后不可原地修改。Progress Projection 只消费最新有效 Estimate 和每个 Test Case 的最新 Result；原始历史继续保留。
+
+### task_reviews
+
+```text
+id, task_id
+decision, comment, commit_sha
+created_at
+```
+
+Schema v9 保存不可变人工验收记录。拒绝必须有原因；通过时若 Task 有 Workspace，则 Workspace 必须 clean，并固化验收时完整 HEAD SHA。
+
 ### workspaces
 
 ```text
@@ -392,7 +444,7 @@ release_tasks:
 release_id, task_id, created_at
 ```
 
-Release 状态为 `CREATING`、`TAGGED` 或 `FAILED`。数据库先保留 `CREATING` 记录并固定 Commit，再执行 Git；失败可在相同输入下安全重放。`release_tasks` 是可选审计关联，不代表系统已经验证某 Task 的全部修改被合入该 Commit。
+Release 状态为 `CREATING`、`TAGGED` 或 `FAILED`。数据库先保留 `CREATING` 记录并固定 Commit，再执行 Git；失败可在相同输入下安全重放。系统会把最新通过 Review 的 Commit 作为候选，仅在它是 Release Commit 的 Git 祖先时自动写入 `release_tasks`；该关联证明对应验收 Commit 已包含，但不推断未记录到 Review 的外部修改。
 
 ### runs
 
@@ -418,8 +470,9 @@ exit_code, exit_signal
 stdout_artifact_id, stderr_artifact_id, events_artifact_id
 final_message_artifact_id, diff_artifact_id
 
-input_tokens, cached_input_tokens, output_tokens
-reasoning_tokens, total_tokens
+input_tokens, cached_input_tokens, cache_write_input_tokens
+output_tokens, reasoning_tokens, total_tokens
+model_requests, peak_input_tokens
 context_estimated_tokens
 context_included_items, context_omitted_items
 cost_amount, cost_currency, cost_source, cost_estimated
@@ -432,7 +485,7 @@ cancel_requested_at, cancel_requested_by
 created_at, updated_at
 ```
 
-Token 和 Cost 无法获取时保存 `NULL`，不能用零代替未知值。估算 Cost 必须保存价格快照和 `cost_estimated=true`。
+Token 和 Cost 无法获取时保存 `NULL`，不能用零代替未知值。`input_tokens` 是 Run 累计输入，`cached_input_tokens` 是它的子集；二者都不是单次请求上下文大小。只有 Adapter 能可靠提供时才记录 `model_requests` 和 `peak_input_tokens`。估算 Cost 必须保存价格快照和 `cost_estimated=true`。
 
 Run 使用数据库约束保证恰好绑定一个 Topic 或 Task。PLANNING Run 不得设置 Workspace；需要写代码的 Task Run 必须设置受管 Workspace。
 
@@ -547,14 +600,9 @@ Topic 的活跃 Planning Run 作为派生执行信息展示，不额外维护 `a
 ### Task 状态
 
 ```text
-BACKLOG
-   ↓ queue
 READY
    ↓ run claimed
 RUNNING
-   ├── needs input ─→ NEEDS_CLARIFICATION
-   │                        ↓ answer / new run
-   │                      READY
    ├── run failed ───────→ BLOCKED
    ├── cancel ───────────→ CANCELLED
    └── run succeeded
@@ -564,11 +612,11 @@ RUNNING
       accept           reject
         ↓                ↓
     ACCEPTED       CHANGES_REQUESTED
-                           ↓ rerun
-                         READY
+                           ↓ revision run claimed
+                         RUNNING
 ```
 
-`BLOCKED` 恢复到 `READY` 必须由人工确认，或者由一个已证明安全的基础设施重试策略触发。
+正式 Task 创建即进入 `READY`，不再暴露逐 Task Queue 命令。旧数据库中的 `BACKLOG` 由版本化 migration 连同审计事件迁移到 `READY`。`BLOCKED` 恢复到 `READY` 必须由人工确认，或者由一个已证明安全的基础设施重试策略触发。
 
 ### Run 状态
 
@@ -589,15 +637,16 @@ CANCELLED, LOST, POLICY_VIOLATED
 
 | 当前状态 | 命令/事件 | 目标状态 | 关键条件 |
 |---|---|---|---|
-| BACKLOG | QueueTask | READY | Project 和 Task 配置有效 |
+| TaskDraft | ApprovePlan / CreateTask | READY | 正式 Task 自动进入等待执行，默认 P2 |
+| READY | SubmitTaskReview | REVIEW | 人工或外部实现进入验收，不创建虚假 Run |
 | READY | RunClaimed | RUNNING | 原子 Claim 且 Workspace 可租用 |
-| RUNNING | ClarificationRequested | NEEDS_CLARIFICATION | Run 已保存问题并终止，不继续占用 Lease |
-| NEEDS_CLARIFICATION | AnswerAndQueue | READY | 保存回答并创建新 Run，不复用旧 Run |
+| RUNNING | ClarificationRequested | BLOCKED | Run 以 `NEEDS_INPUT` 终止并保存问题，不继续占用 Lease |
+| BLOCKED | AnswerAndQueue | READY / CHANGES_REQUESTED | 保存回答；Scheduler 创建 Continuation Run，不复用旧 Run |
 | RUNNING | RunSucceeded | REVIEW | Finalization 完成 |
 | RUNNING | RunFailed | BLOCKED | 没有安全自动重试 |
-| REVIEW | AcceptTask | ACCEPTED | 用户确认验收 |
+| REVIEW | AcceptTask | ACCEPTED | 用户确认验收；系统先自动提交 dirty Workspace，再固化 Review HEAD |
 | REVIEW | RejectTask | CHANGES_REQUESTED | 必须记录驳回原因 |
-| CHANGES_REQUESTED | QueueTask | READY | 创建新 Run，不复用旧 Run |
+| CHANGES_REQUESTED | RevisionClaimed | RUNNING | Worker 开启，创建新 Revision Run，不复用旧 Run |
 
 ## 8. Run Claim 与并发
 
@@ -661,6 +710,10 @@ PLANNING Run 不执行 Workspace 步骤，且其 Invocation 不得获得可写 T
 4. Runner 周期性续租并检查取消请求。
 5. 达到运行超时、空闲超时或策略限制时终止进程组。
 
+Agent 通过 MCP 调用外部工具时，结构化 Adapter 或受管 MCP Gateway 必须生成可审计 Run Event，记录 Server、Tool、开始/结束、耗时、结果状态和脱敏参数摘要；大结果写 Artifact。Generic Adapter 无法解析调用时明确显示未知，不得声称已经追踪。
+
+浏览器 page/context 等有生命周期的资源必须登记为当前 Run 所有的资源租约。AiTodos 只关闭当前 Run 创建的资源，不关闭用户窗口或其他 Run 的资源；不得使用系统 `open` 等无法返回受管资源 ID 的方式替 Agent 启动浏览器。具体边界见 [ADR-0012](adr/0012-traceable-mcp-calls-and-run-owned-browser-resources.md)。
+
 ### Finalization
 
 1. 确认 Agent 进程已退出。
@@ -671,6 +724,8 @@ PLANNING Run 不执行 Workspace 步骤，且其 Invocation 不得获得可写 T
 6. 使用 fencing token 原子写入 Run 终态和事件。
 7. 更新 Topic 或 Task 的派生状态。
 8. 释放 Workspace Lease。
+
+Finalization 在写入终态前回收当前 Run 所有的 MCP 资源。成功、失败、取消、超时和恢复对账共用幂等 Cleanup；清理失败必须保存诊断并在 Run Detail 显示，不能静默结束。
 
 Finalization 必须幂等。重复执行不得重复创建 Review、Run 或状态迁移。
 
@@ -719,6 +774,8 @@ outputProtocol
 
 Generic Process Adapter 只保证基本进程、日志、超时和 Git 采集；无法解析的信息保持未知。
 
+当前 Generic Process Profile 的参数模板支持 `{prompt_file}`、`{result_file}`、`{workspace}`、`{model}` 和 `{run_id}`。未使用 `{prompt_file}` 时 Prompt 通过 stdin 传入；Triage 的 Codex 推荐配置使用只读 Sandbox 和 `--output-last-message {result_file}`，让 Runner 校验最终 JSON，而不是要求 Agent 写入代码 Workspace。Implementation、Revision 和 Review 的最终说明通常是自然语言，不把 `--output-last-message` 指向结构化结果文件；需要提交 Estimate/Test 等机器结果时，由 Agent 显式写入 `ATS_RESULT_FILE`。Codex Profile 不得同时配置 `--approve-for-me` 与 `--sandbox`，当前 CLI 会在模型调用前拒绝这组参数。
+
 ### Agent Profile
 
 Adapter 是代码能力，Agent Profile 是用户配置。一个 Adapter 可以对应多个 Profile，例如 Planner、Implementer、Reviewer 或使用不同模型、Provider、Proxy 和 Sandbox 策略的同类 Profile。并发只由当前 Project 配置。
@@ -739,7 +796,11 @@ environment_policy
 
 Profile 在 UI 中可编辑，但编辑必须创建新 Revision。内置职责 Prompt 可以查看、比较和恢复默认值；系统安全约束不可被 Profile Prompt 覆盖。模板变量使用固定白名单，不允许执行代码、读取任意文件或展开 Secret。Profile 启用前必须执行 Probe，记录 CLI 路径、版本和能力。CLI 版本改变后重新 Probe；解析器必须按版本容错，不能把未知事件当成成功。
 
-Project 分别保存 PLANNING、IMPLEMENTATION、REVISION 和 REVIEW 的默认 Profile。最终 Prompt 的固定分层、Revision 兼容性和权限边界遵循 [ADR-0003](adr/0003-topic-plan-task-and-role-based-agent-runs.md)。
+项目维护 Skill Catalog 和 MCP Server Catalog；Agent Profile Revision 只引用项目目录中的稳定能力 ID，并保存 Skill、Server、Tool allowlist 与 required/optional 策略。Run 创建时固化解析后的 Tool Policy、版本/哈希与 Probe 结果。Task、Message、检索内容和 Agent 输出不得扩大能力范围。完整决策见 [ADR-0013](adr/0013-project-skills-mcp-catalog-and-profile-tool-policy.md)。
+
+Schema v19 已实现项目 Skill 路径/内容哈希、Codex MCP 配置名引用、Profile Revision 能力绑定和 Run Tool Policy 快照。MVP 不复制本机 MCP 的连接参数或 Secret；运行前通过 Codex CLI 校验配置是否存在，并对未选择的 Server 生成禁用配置。Codex `-c` 的覆盖路径不接受带引号的名称段，因此 MVP MCP 配置名只允许 ASCII 字母、数字、下划线和连字符。选中的 Skill 进入 Context Builder；optional Skill 可在失效或软预算不足时省略，required Skill 失效时在模型调用前失败。必需 Context 超出本地估算不会阻止 Run。Skill 文件变化后必须由用户重新校验并递增目录版本，已经创建的 Profile Revision 不原地修改。
+
+Project 分别保存 PLANNING、TRIAGE、IMPLEMENTATION、REVISION 和 REVIEW 的默认 Profile。最终 Prompt 的固定分层、Revision 兼容性和权限边界遵循 [ADR-0003](adr/0003-topic-plan-task-and-role-based-agent-runs.md) 与 [ADR-0010](adr/0010-task-triage-title-complexity-and-autonomy.md)。
 
 ## 11. Context、Search 与 MCP
 
@@ -756,13 +817,21 @@ Search Projection / Context Read Service
 
 Context 按 L0 固定规则、L1 当前工作集、L2 近期增量和 L3 历史档案分层。默认只装入有界的 L0、L1 和 L2；旧 Plan、旧 Run、完整日志和完整 Diff 通过搜索或工具按需读取。Acceptance Criteria、有效 Decision、开放 Clarification 和批准 Plan 不得只存在于自动 Summary 中。
 
-每个 Profile Revision 定义输入上限、输出预留、安全余量、近期 Message 数量、检索数量、关联对象数量和 Artifact 片段上限。Context Builder 按规则、当前对象、有效 Decision、批准 Plan、开放问题、近期增量、检索摘要和 Artifact 片段的顺序装入，并记录每项内容的来源、Revision、哈希、Token 估算、是否采用和省略原因。
+每个 Profile Revision 固化内部软预算、输出预留、安全余量、近期 Message 数量、检索数量、关联对象数量和 Artifact 片段上限。普通配置不要求用户调整 Token 预算。Context Builder 按规则、当前对象、有效 Decision、批准 Plan、开放问题、近期增量、检索摘要和 Artifact 片段的顺序装入，并记录每项内容的来源、Revision、哈希、Token 估算、是否采用和省略原因。Token 估算只服务于去重和低价值历史取舍，不是实际 Usage，也不得裁掉安全规则、当前任务、验收标准、项目规则、开放问题或当前修订所依据的驳回意见；必需内容超过软预算仍完整发送。
 
 Search Projection 使用项目 SQLite FTS5，覆盖 Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary。它是可重建的只读投影，不是事实来源；原始日志和完整 Diff 不进入默认全文索引。
 
 MCP 第一阶段只提供当前项目的有界只读搜索和读取能力，不直接暴露数据库，也不提供批准 Plan、启动 Run、验收 Task 或删除对象等高影响命令。检索内容始终视为不可信数据，不得提升到系统安全或 Project Instructions 层。
 
 详细决策见 [ADR-0004](adr/0004-durable-context-search-mcp-and-token-budget.md)。
+
+## 11.1 整体进度与测试证据
+
+整体进度页区分按非取消 Task 数计算的严格已验收进度和按 Points 计算的 AI 预测进度。未估算 Task 不进入 Points 分母，但必须展示估算覆盖率。MVP 尚未实现 Estimate stale 检测。测试通过率只根据结构化 Test Result 计算，并明确区分 Runner 命令、人工确认和 Agent 自报。
+
+正常验收要求 required Test Case 的最新结果全部为 `PASSED`；人工 Override 必须保存原因和审计事件。详细决策见 [ADR-0009](adr/0009-ai-estimates-progress-and-test-evidence.md)。
+
+整体进度页同时展示真实 Run Usage：累计输入、其中缓存、非缓存输入、缓存命中率、输出、采集覆盖率和按 Purpose 汇总。Schema v20 使用独立 `run_usage` 表保存 Codex 结构化事件提供的可空指标。累计输入不得标注为“上下文大小”；单次峰值、模型请求次数和 Cost 无可靠来源时保持未知。详细决策见 [ADR-0014](adr/0014-actual-usage-and-quality-first-soft-context-budget.md)。
 
 ## 12. Proxy、Provider 与环境变量
 
@@ -855,7 +924,7 @@ path:   <repo-root>/.ats/worktrees/<task-id>
 
 `.ats/worktrees` 被项目本地 `.ats/.gitignore` 忽略。Workspace 虽位于项目目录内，Run 前仍必须通过真实路径和 `gitCommonDir` 校验，删除时只允许操作 `.ats/worktrees` 下的已登记路径。
 
-MVP 默认不允许 Agent commit 或 push，不自动 merge，也不自动删除 Workspace。当前 Release 只接受已经存在于来源分支上的 Commit；后续“验收并提交”必须作为显式的人类领域命令实现，不能由 Agent 静默提交。
+MVP 默认不允许 Agent push，不自动 merge，也不自动删除 Workspace。Scheduler 领取正式 Task 后按需准备 Workspace；人工在 REVIEW 状态查看相对 Base Commit 的文件清单与按需 Diff，执行“验收通过”时系统自动提交 dirty Workspace，并让 Review 固化 HEAD。Release 只接受已经存在于来源分支上的 Commit，并根据 Git 祖先关系自动关联能够证明已包含的已验收 Task；Task Branch 不会自动合并到来源分支。
 
 Dirty Workspace 清理前必须保存恢复 Artifact；无法证明目标路径和 Git 身份时，将 Workspace 标记为 `QUARANTINED`，禁止自动删除。
 
@@ -933,14 +1002,16 @@ contextSafetyMarginTokens
 
 每次真正重新调用 AI 都创建新 Run，并通过 `retry_of_run_id` 建立关系。只有能证明 CLI 从未启动时，原 Run 才能重新排队。
 
-## 17. API 草案
+## 17. API
 
 API 使用领域命令，避免通用 PATCH 任意改状态。
 
+当前已实现的 REST 接口：
+
 ```text
 GET    /api/project
-GET    /api/board
-GET    /api/search
+POST   /api/project/workers
+GET    /api/progress
 
 POST   /api/topics
 GET    /api/topics
@@ -950,21 +1021,11 @@ POST   /api/topics/{topicId}/messages
 GET    /api/topics/{topicId}/relations
 POST   /api/topics/{topicId}/relations
 DELETE /api/topics/{topicId}/relations/{taskId}
-POST   /api/topics/{topicId}/plan-runs
-POST   /api/topics/{topicId}/clarifications/{clarificationId}/answer
-
-GET    /api/topics/{topicId}/plans
-GET    /api/plans/{planId}
-POST   /api/plans/{planId}/submit
-POST   /api/plans/{planId}/approve
-POST   /api/plans/{planId}/request-changes
 
 POST   /api/tasks
 GET    /api/tasks
 GET    /api/tasks/{taskId}
-PUT    /api/tasks/{taskId}
-POST   /api/tasks/{taskId}/queue
-POST   /api/tasks/{taskId}/cancel
+PUT    /api/tasks/{taskId}/title
 GET    /api/tasks/{taskId}/messages
 POST   /api/tasks/{taskId}/messages
 GET    /api/tasks/{taskId}/topics
@@ -973,29 +1034,40 @@ DELETE /api/tasks/{taskId}/topics/{topicId}
 GET    /api/tasks/{taskId}/relations
 POST   /api/tasks/{taskId}/relations
 DELETE /api/tasks/{taskId}/relations/{relatedTaskId}
-POST   /api/tasks/{taskId}/clarifications/{clarificationId}/answer
-POST   /api/tasks/{taskId}/accept
-POST   /api/tasks/{taskId}/reject
-GET    /api/tasks/{taskId}/runs
-GET    /api/runs/{runId}
-POST   /api/runs/{runId}/cancel
-POST   /api/runs/{runId}/retry
-GET    /api/runs/{runId}/events
-GET    /api/runs/{runId}/stream
-GET    /api/runs/{runId}/diff
+GET    /api/tasks/{taskId}/quality
+GET    /api/tasks/{taskId}/assessment
+POST   /api/tasks/{taskId}/estimates
+POST   /api/tasks/{taskId}/test-cases
+POST   /api/tasks/{taskId}/test-cases/{testCaseId}/results
+GET    /api/tasks/{taskId}/workspace
+POST   /api/tasks/{taskId}/workspace
+GET    /api/tasks/{taskId}/changes
+GET    /api/tasks/{taskId}/changes/file
+POST   /api/tasks/{taskId}/submit-review
+GET    /api/tasks/{taskId}/reviews
+POST   /api/tasks/{taskId}/reviews
+POST   /api/tasks/{taskId}/workspace/commit
 
 GET    /api/agent-profiles
-POST   /api/agent-profiles
 GET    /api/agent-profiles/{profileId}/revisions
 POST   /api/agent-profiles/{profileId}/revisions
-POST   /api/agent-profiles/{profileId}/probe
 
-GET    /api/labels
-POST   /api/labels
+GET    /api/project/capabilities
+POST   /api/project/capabilities/skills
+POST   /api/project/capabilities/skills/{skillId}/refresh
+POST   /api/project/capabilities/mcp-servers
 
-GET    /api/settings/concurrency
-PUT    /api/settings/concurrency
+GET    /api/clarifications
+GET    /api/tasks/{taskId}/clarifications
+POST   /api/clarifications/{clarificationId}/answer
+
+GET    /api/git
+GET    /api/releases
+POST   /api/releases
+POST   /api/artifacts/images
 ```
+
+Topic Planning Run、Topic Clarification、Run 查询/取消/重试/SSE、Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Plan Revision/人工审核/批准建 Task、Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
 
 写命令携带目标聚合的 `version` 或 `If-Match`，冲突返回 409。批准 Plan、批量生成 Task、回答 Clarification 和状态迁移必须使用领域命令，不提供通用状态 PATCH。
 
@@ -1012,10 +1084,10 @@ MCP 复用同一应用读取服务，但不等同于 REST 数据库镜像。第�
 ### Topic 与 Plan
 
 - 全局创建入口只要求用户描述“想做什么”，默认创建 Topic，同时保留显式“直接创建 Task”选项。
-- 创建时不要求用户填写标题；领域层从内容首个非空行生成临时标题。后续 Agent 可在 Planning Run 的结构化结果中同时建议更好的标题，不为标题单独调用模型。
+- 创建时不要求用户填写标题；领域层从内容首个非空行生成 `PROVISIONAL` 临时标题。Triage Agent 在 Worker 开启后生成正式标题和复杂度评估；人工明确填写或编辑的标题标记为 `HUMAN` 并锁定，后续 AI 不得覆盖。
 - Topic 与 Task 概念对用户可见，用于明确“讨论/规划”和“可执行/可验收”的边界；Plan 作为 Topic Detail 内的版本化方案展示，不作为顶层导航。
 - Topic 列表展示状态、Label、开放 Clarification、当前 Plan 和最近活动。
-- Topic Detail 当前展示描述与持久 Thread，并允许用户发布消息；有效 Decision、Clarification、Planning Run 和 Plan Revision 随对应领域能力补齐。
+- Topic Detail 当前展示描述、持久 Thread、Plan Revision、人工审核和批准后生成的关联 Task；有效 Decision、Topic Clarification 和 Planning Run 随对应领域能力补齐。Task Detail 已展示 Task Agent 的 Clarification 历史和就地回答入口。
 - Topic Detail 展示关联 Task；Task Detail 展示关联 Topic 和关联 Task。两侧均可搜索、添加、移除和点击跳转，Topic–Task 关系双向可见。
 - Topic 和 Task 评论均可引用多个 Task；发送后自动建立对应 Topic–Task 或 Task–Task 主体关系，消息内保留可点击的来源引用。
 - Topic、Task 和 Message 内容使用无工具栏 Markdown 输入，不引入富文本文档模型。粘贴自 `<pre>/<code>` 或明显为代码的多行文本时自动插入 fenced code block；长代码块默认只显示前 4 行，可手动展开和收起。
@@ -1029,20 +1101,21 @@ MCP 复用同一应用读取服务，但不等同于 REST 数据库镜像。第�
 UI 使用四列投影，不直接把内部状态机全部暴露为列：
 
 ```text
-待办      = BACKLOG | READY | CHANGES_REQUESTED | BLOCKED
+待办      = READY | CHANGES_REQUESTED | BLOCKED
 进行中    = RUNNING
 待验收    = REVIEW
 已完成    = ACCEPTED
 归档筛选  = CANCELLED
 ```
 
-卡片继续显示“待完善、可执行、需修改、已阻塞”等精确状态标签。拖动或操作仍必须转换成领域命令，UI 分组不得覆盖内部状态字符串。
+卡片继续显示“待完善、可执行、需修改、已阻塞”等精确状态标签；已评估的卡片显示 Complexity 与 Autonomy Badge，看板支持按 C1–C5 或“未评估”筛选。复杂度不改变列、优先级或调度顺序。拖动或操作仍必须转换成领域命令，UI 分组不得覆盖内部状态字符串。
 
 拖动卡片必须转换成明确领域命令；不允许绕过状态机直接写目标状态。
 
 ### Task Detail
 
 - Description 和 Acceptance Criteria。
+- 当前 AI 评估的 C1–C5、A0–A3、六维评分、置信度、依据、假设与拆分建议；标题可由人工编辑并锁定。
 - Status、持久讨论、关联 Topic、关联 Task、Clarification、Decision 和 Review History。
 - Workspace、Branch 和 Base SHA。
 - Run History。
@@ -1056,7 +1129,7 @@ UI 使用四列投影，不直接把内部状态机全部暴露为列：
 - 全局搜索统一检索 Topic、Plan、Task、Message、Decision、Clarification 和 Run Summary。
 - 支持类型、Label、状态、更新时间和“仅当前有效内容”过滤。
 - 结果显示匹配片段、来源、Revision、更新时间和稳定链接。
-- Agent Settings 可编辑 Profile Revision、职责 Prompt、Model、Context Budget 和权限策略，并支持查看最终 Prompt、与内置默认值对比和恢复默认值。
+- Agent Settings 可编辑 Profile Revision、职责 Prompt、Model、运行参数和权限策略，并支持查看最终 Prompt、与内置默认值对比和恢复默认值；Token 软预算由系统管理，不作为普通人工配置项。
 - Run Detail 显示 Context Manifest、Token 预算、采用/省略原因、Session Resume 和实际 Usage。
 
 ## 19. 仓库结构草案
@@ -1150,6 +1223,8 @@ AiTodos/
 - Summary 来源范围、增量更新、过期和人工修正测试。
 - 检索内容不能提升为系统指令的 Prompt Injection 边界测试。
 - MCP 分页、结果上限、项目隔离、只读能力和敏感数据测试。
+- MCP 调用事件的脱敏、顺序、失败与未知能力测试。
+- 浏览器 context/page 的 Run 归属、终态关闭和 Crash Recovery 重放清理测试。
 - Usage 可用和不可用时的 Token、Cache 与未知值展示测试。
 
 ### UI
@@ -1176,7 +1251,7 @@ MVP 包含：
 - Model、环境、Proxy 和 Provider Profile。
 - Agent Session Resume 与无法恢复时的 Context 重建。
 - SQLite FTS 全文搜索、结构化过滤和可重建 Search Projection。
-- 分层 Context Builder、增量 Summary、Token Budget 和 Context Manifest。
+- 分层 Context Builder、增量 Summary、质量优先的软 Token Budget 和 Context Manifest。
 - 当前项目只读 MCP 搜索与 Context Bundle。
 - Run History、日志、Diff、Commit 和 Usage。
 - Timeout、Cancel、Kill、手工 Retry。
@@ -1207,14 +1282,15 @@ MVP 不包含：
 4. TDD 实现 Topic、Plan、Task、Clarification、Decision、Label、关系和状态机。
 5. 实现 Thread、Plan Review、人工批准和批量创建 Task 的纵向切片。
 6. 实现版本化 Agent Profile、职责默认值和 Prompt 配置 UI。
-7. 实现 SQLite FTS Search Projection、Web Search 和只读 MCP。
-8. 实现分层 Context Builder、Summary、Token Budget、Context Manifest 和 Session 模型。
-9. TDD 实现 SQLite Claim 和 Git Workspace Manager。
-10. 实现本地 Release、annotated tag 和 Git 审计 UI。
-11. 实现 Runner、进程组、Artifact 和 Recovery。
-12. 实现 Codex Adapter 与 Generic Process Adapter。
-13. 实现 Review API、SSE、Task Detail 和 Run Detail。
-14. 完成并发、Context、MCP、Proxy、取消、重启和磁盘限制验证。
+7. 实现项目 Skill/MCP 目录、Profile Tool Policy 和 Run 能力快照。
+8. 实现 SQLite FTS Search Projection、Web Search 和只读 MCP。
+9. 实现分层 Context Builder、Summary、软 Token Budget、Context Manifest 和 Session 模型。
+10. TDD 实现 SQLite Claim 和 Git Workspace Manager。
+11. 实现本地 Release、annotated tag 和 Git 审计 UI。
+12. 实现 Runner、进程组、Artifact 和 Recovery。
+13. 实现 Codex Adapter 与 Generic Process Adapter。
+14. 实现 Review API、SSE、Task Detail 和 Run Detail。
+15. 完成并发、Context、MCP、Proxy、取消、重启和磁盘限制验证。
 
 ## 23. 尚待后续 ADR 决定
 
