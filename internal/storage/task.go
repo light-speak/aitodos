@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
 )
 
@@ -20,6 +21,10 @@ var (
 	ErrTaskVersionConflict = errors.New("task version conflict")
 	// ErrRequiredTestsNotPassed 表示必测项尚无可验证的通过证据。
 	ErrRequiredTestsNotPassed = errors.New("required tests not passed")
+	// ErrTaskWorkspaceExists 表示 Task 已绑定 Workspace，目标分支不可再修改。
+	ErrTaskWorkspaceExists = errors.New("task workspace already exists")
+	// ErrTaskRetryRequiresAnswer 表示 Task 正等待结构化 Clarification，不能绕过回答直接重试。
+	ErrTaskRetryRequiresAnswer = errors.New("task retry requires clarification answer")
 )
 
 const taskColumns = `
@@ -111,6 +116,51 @@ func (store *TaskStore) UpdateTitle(
 	return updated, nil
 }
 
+// UpdateTargetBranch 在 Workspace 创建前原子更新 Task 目标分支。
+func (store *TaskStore) UpdateTargetBranch(
+	ctx context.Context,
+	id string,
+	expectedVersion int64,
+	targetBranch string,
+) (task.Task, error) {
+	input := task.UpdateTargetBranchInput{TargetBranch: targetBranch}.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, err
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("begin task target branch update: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	if current.CurrentWorkspaceID != "" {
+		return task.Task{}, ErrTaskWorkspaceExists
+	}
+	if current.TargetBranch == input.TargetBranch {
+		return current, nil
+	}
+	updated, event, err := prepareTargetBranchUpdate(current, input.TargetBranch)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := updateTaskTargetBranch(ctx, transaction, current, updated); err != nil {
+		return task.Task{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, fmt.Errorf("commit task target branch update: %w", err)
+	}
+	return updated, nil
+}
+
 // List 按优先级和创建时间返回当前项目的全部 Task。
 func (store *TaskStore) List(ctx context.Context) ([]task.Task, error) {
 	rows, err := store.database.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks ORDER BY priority ASC, created_at ASC")
@@ -169,6 +219,53 @@ func (store *TaskStore) ApplyCommand(
 	}
 	if err := transaction.Commit(); err != nil {
 		return task.Task{}, fmt.Errorf("commit task command: %w", err)
+	}
+	return updated, nil
+}
+
+// RetryBlocked 将失败或取消的 Task 按最近一次 Run purpose 放回正确队列。
+func (store *TaskStore) RetryBlocked(ctx context.Context, id string, expectedVersion int64) (task.Task, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("begin retry blocked task: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	var purpose, runStatus string
+	err = transaction.QueryRowContext(ctx, `
+SELECT purpose, status FROM runs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT 1`, id).Scan(&purpose, &runStatus)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("read latest run for retry: %w", err)
+	}
+	if domainrun.Status(runStatus) == domainrun.StatusNeedsInput {
+		return task.Task{}, ErrTaskRetryRequiresAnswer
+	}
+	command := task.CommandRetry
+	if domainrun.Purpose(purpose) == domainrun.PurposeRevision {
+		command = task.CommandResumeRevision
+	}
+	next, err := task.Transition(current.Status, command)
+	if err != nil {
+		return task.Task{}, err
+	}
+	updated, event, err := prepareTransition(current, next, command)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := updateTaskStatus(ctx, transaction, current, updated); err != nil {
+		return task.Task{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, fmt.Errorf("commit retry blocked task: %w", err)
 	}
 	return updated, nil
 }
@@ -385,6 +482,29 @@ func prepareTitleUpdate(
 	}, nil
 }
 
+func prepareTargetBranchUpdate(current task.Task, targetBranch string) (task.Task, task.Event, error) {
+	eventID, err := newID()
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	now := time.Now().UTC()
+	updated := current
+	updated.TargetBranch = targetBranch
+	updated.AssessmentInputVersion++
+	updated.Version++
+	updated.UpdatedAt = now
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1, "from": current.TargetBranch, "to": targetBranch,
+	})
+	if err != nil {
+		return task.Task{}, task.Event{}, fmt.Errorf("encode task target branch event: %w", err)
+	}
+	return updated, task.Event{
+		ID: eventID, TaskID: current.ID, Sequence: updated.Version,
+		Type: task.EventTargetBranchChanged, Payload: payload, OccurredAt: now,
+	}, nil
+}
+
 func prepareTransition(current task.Task, next task.Status, command task.Command) (task.Task, task.Event, error) {
 	eventID, err := newID()
 	if err != nil {
@@ -441,6 +561,19 @@ WHERE id = ? AND version = ?`,
 	)
 	if err != nil {
 		return fmt.Errorf("update task title: %w", err)
+	}
+	return requireSingleChange(result)
+}
+
+func updateTaskTargetBranch(ctx context.Context, transaction *sql.Tx, current, updated task.Task) error {
+	result, err := transaction.ExecContext(ctx, `
+UPDATE tasks SET target_branch = ?, assessment_input_version = ?, version = ?, updated_at = ?
+WHERE id = ? AND version = ? AND current_workspace_id = ''`,
+		updated.TargetBranch, updated.AssessmentInputVersion, updated.Version,
+		formatTime(updated.UpdatedAt), current.ID, current.Version,
+	)
+	if err != nil {
+		return fmt.Errorf("update task target branch: %w", err)
 	}
 	return requireSingleChange(result)
 }

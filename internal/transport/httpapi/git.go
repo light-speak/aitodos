@@ -26,12 +26,32 @@ func RegisterGitWorkflowRoutes(mux *http.ServeMux, manager *gitworkflow.Manager)
 	mux.HandleFunc("POST /api/releases", handler.createRelease)
 	mux.HandleFunc("GET /api/tasks/{taskID}/workspace", handler.taskWorkspace)
 	mux.HandleFunc("POST /api/tasks/{taskID}/workspace", handler.createTaskWorkspace)
+	mux.HandleFunc("PUT /api/tasks/{taskID}/target-branch", handler.updateTaskTargetBranch)
 	mux.HandleFunc("GET /api/tasks/{taskID}/changes", handler.taskChanges)
 	mux.HandleFunc("GET /api/tasks/{taskID}/changes/file", handler.taskFileDiff)
 	mux.HandleFunc("POST /api/tasks/{taskID}/submit-review", handler.submitReview)
 	mux.HandleFunc("POST /api/tasks/{taskID}/workspace/commit", handler.commitWorkspace)
 	mux.HandleFunc("GET /api/tasks/{taskID}/reviews", handler.listReviews)
 	mux.HandleFunc("POST /api/tasks/{taskID}/reviews", handler.reviewTask)
+}
+
+func (handler *gitWorkflowHandler) updateTaskTargetBranch(response http.ResponseWriter, request *http.Request) {
+	var input struct {
+		TargetBranch    string `json:"target_branch"`
+		ExpectedVersion int64  `json:"expected_version"`
+	}
+	if err := decodeJSON(response, request, &input); err != nil || input.ExpectedVersion < 1 {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的目标分支更新")
+		return
+	}
+	updated, err := handler.manager.UpdateTaskTargetBranch(
+		request.Context(), request.PathValue("taskID"), input.ExpectedVersion, input.TargetBranch,
+	)
+	if err != nil {
+		writeGitWorkflowError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
 }
 
 func (handler *gitWorkflowHandler) taskChanges(response http.ResponseWriter, request *http.Request) {
@@ -186,6 +206,10 @@ func writeGitWorkflowError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusConflict, "WORKSPACE_CLEAN", "Workspace 没有可提交的修改")
 	case errors.Is(err, gitworkflow.ErrRepositoryUnborn):
 		writeError(response, http.StatusConflict, "REPOSITORY_UNBORN", "仓库尚无 Commit；请先创建首个 Commit")
+	case errors.Is(err, gitworkflow.ErrTargetBranchInvalid), errors.Is(err, gitworkflow.ErrTargetBranchNotFound):
+		writeError(response, http.StatusBadRequest, "INVALID_TARGET_BRANCH", "目标分支必须是当前仓库中已有 Commit 的本地分支")
+	case errors.Is(err, storage.ErrTaskWorkspaceExists):
+		writeError(response, http.StatusConflict, "TARGET_BRANCH_LOCKED", "Task 已创建 Workspace，目标分支不可再修改")
 	case errors.Is(err, gitworkflow.ErrChangeNotFound):
 		writeError(response, http.StatusNotFound, "CHANGE_NOT_FOUND", "该文件不在 Task 变更清单中")
 	case errors.Is(err, storage.ErrTaskVersionConflict):

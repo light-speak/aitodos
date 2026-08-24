@@ -3,7 +3,7 @@ import type { FormEvent, KeyboardEvent } from 'react'
 import { ListTodoIcon, MessageSquareTextIcon, XIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
-import type { CreateTaskInput, CreateTopicInput } from '../types'
+import type { CreateTaskInput, CreateTopicInput, RepositoryInfo } from '../types'
 import { Button } from './ui/button'
 import {
   Dialog,
@@ -22,13 +22,15 @@ interface CreateItemDialogProps {
   onClose: () => void
   onCreateTopic: (input: CreateTopicInput) => Promise<void>
   onCreateTask: (input: CreateTaskInput) => Promise<void>
+	repository: RepositoryInfo | null
 }
 
-export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask }: CreateItemDialogProps) {
+export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask, repository }: CreateItemDialogProps) {
   const [kind, setKind] = useState<ItemKind>('topic')
   const [content, setContent] = useState('')
   const [submitting, setSubmitting] = useState(false)
   const [error, setError] = useState('')
+	const [targetBranch, setTargetBranch] = useState(() => preferredTargetBranch(repository))
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
@@ -44,7 +46,10 @@ export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask }: Creat
       if (kind === 'topic') {
         await onCreateTopic({ title: '', description: normalized })
       } else {
-		await onCreateTask({ title: '', description: normalized, acceptance_criteria: '', priority: 2 })
+		await onCreateTask({
+			title: '', description: normalized, acceptance_criteria: '', priority: 2,
+			...(targetBranch ? { target_branch: targetBranch } : {}),
+		})
       }
       onClose()
     } catch (submitError: unknown) {
@@ -88,6 +93,23 @@ export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask }: Creat
                 onChange={setContent}
               />
             </div>
+			{kind === 'task' ? (
+				<div className="grid gap-2 rounded-xl border bg-muted/20 p-3">
+					<Label htmlFor="new-task-target-branch">目标分支</Label>
+					<select
+						id="new-task-target-branch"
+						className="h-9 w-full rounded-lg border bg-background px-3 font-mono text-sm outline-none focus-visible:ring-3 focus-visible:ring-ring/50"
+						value={targetBranch}
+						disabled={!repository?.has_head || repository.branches.length === 0}
+						onChange={(event) => setTargetBranch(event.target.value)}
+					>
+						{repository?.branches.map((branch) => <option value={branch.name} key={branch.name}>{branch.name}</option>)}
+					</select>
+					<p className="text-xs leading-5 text-muted-foreground">
+						Worker 会从该本地分支的固定 Commit 创建独立 Workspace。
+					</p>
+				</div>
+			) : null}
             {error ? (
               <p className="rounded-lg border border-destructive/20 bg-destructive/5 px-3 py-2 text-sm text-destructive" role="alert">
                 {error}
@@ -102,6 +124,13 @@ export function CreateItemDialog({ onClose, onCreateTopic, onCreateTask }: Creat
       </DialogContent>
     </Dialog>
   )
+}
+
+function preferredTargetBranch(repository: RepositoryInfo | null): string {
+	if (repository === null) return ''
+	const preferred = repository.default_branch || repository.remote_default_branch || repository.current_branch
+	if (repository.branches.some((branch) => branch.name === preferred)) return preferred
+	return repository.branches[0]?.name ?? ''
 }
 
 function submitWithModifierEnter(event: KeyboardEvent<HTMLFormElement>) {

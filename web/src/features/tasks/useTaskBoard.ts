@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { createTask, createTopic, getProject, getTasks, getTopics, updateWorkerSettings } from '../../api/client'
+import { createTask, createTopic, getProject, getTasks, getTopics, updateTaskTargetBranch, updateWorkerSettings } from '../../api/client'
 import type { CreateTaskInput, CreateTopicInput, ProjectInfo, Task, Topic } from '../../types'
 
 interface BoardState {
@@ -39,8 +39,8 @@ export function useTaskBoard() {
     const timer = window.setInterval(() => {
       if (loading) return
       loading = true
-      void getTasks(controller.signal).then(
-        (tasks) => setState((current) => ({ ...current, tasks })),
+		void Promise.all([getTopics(controller.signal), getTasks(controller.signal)]).then(
+			([topics, tasks]) => setState((current) => ({ ...current, topics, tasks })),
         (error: unknown) => {
           if (!controller.signal.aborted) {
             setState((current) => ({ ...current, error }))
@@ -62,6 +62,7 @@ export function useTaskBoard() {
   const createNewTopic = useCallback(async (input: CreateTopicInput) => {
     const created = await createTopic(input)
     setState((current) => ({ ...current, topics: [created, ...current.topics] }))
+		return created
   }, [])
 
 	const updateWorkers = useCallback(async (enabled: boolean, maxWorkers: number) => {
@@ -83,6 +84,16 @@ export function useTaskBoard() {
 		setState((current) => ({ ...current, tasks: replaceTask(current.tasks, updated) }))
 	}, [])
 
+	const updateTopic = useCallback((updated: Topic) => {
+		setState((current) => ({ ...current, topics: replaceTopic(current.topics, updated) }))
+	}, [])
+
+	const changeTargetBranch = useCallback(async (current: Task, targetBranch: string) => {
+		const updated = await updateTaskTargetBranch(current.id, targetBranch, current.version)
+		setState((state) => ({ ...state, tasks: replaceTask(state.tasks, updated) }))
+		return updated
+	}, [])
+
   return useMemo(
     () => ({
       ...state,
@@ -91,10 +102,16 @@ export function useTaskBoard() {
       createTopic: createNewTopic,
 		updateWorkers,
 			updateTask,
+			updateTopic,
+			updateTargetBranch: changeTargetBranch,
       reload,
     }),
-		[create, createNewTopic, reload, state, updateTask, updateWorkers, updatingWorkers],
+		[changeTargetBranch, create, createNewTopic, reload, state, updateTask, updateTopic, updateWorkers, updatingWorkers],
   )
+}
+
+function replaceTopic(items: Topic[], updated: Topic): Topic[] {
+	return items.map((item) => item.id === updated.id ? updated : item)
 }
 
 async function loadBoard(signal: AbortSignal) {

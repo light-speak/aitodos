@@ -42,6 +42,10 @@ func TestDiscussionStoreAppendsAndListsTopicMessages(t *testing.T) {
 	if len(messages) != 2 || messages[0].ID != first.ID || messages[1].ID != second.ID {
 		t.Fatalf("messages = %#v", messages)
 	}
+	updatedTopic, err := topicStore.Get(ctx, createdTopic.ID)
+	if err != nil || updatedTopic.Version != createdTopic.Version+2 {
+		t.Fatalf("topic after human messages = %#v, %v", updatedTopic, err)
+	}
 }
 
 func TestDiscussionStoreAppendsTaskMessagesWithTaskReferences(t *testing.T) {

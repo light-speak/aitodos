@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from 'react'
-import { AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
+import { ActivityIcon, AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from './api/client'
 import { AppHeader } from './components/AppHeader'
@@ -7,6 +7,7 @@ import { AgentProfilesPage } from './components/AgentProfilesPage'
 import { CreateItemDialog } from './components/CreateItemDialog'
 import { KanbanBoard } from './components/KanbanBoard'
 import { ReleaseDialog } from './components/ReleaseDialog'
+import { RepositoryDialog } from './components/RepositoryDialog'
 import { ProgressPage } from './components/ProgressPage'
 import { ProjectCapabilitiesPanel } from './components/ProjectCapabilitiesPanel'
 import { TaskDetailsDialog } from './components/TaskDetailsDialog'
@@ -14,6 +15,7 @@ import { TopicDetailsDialog } from './components/TopicDetailsDialog'
 import { TopicList } from './components/TopicList'
 import { WorkerSettingsDialog } from './components/WorkerSettingsDialog'
 import { ClarificationInboxDialog } from './components/ClarificationsPanel'
+import { RunsPage } from './components/RunsPage'
 import { Badge } from './components/ui/badge'
 import { Button } from './components/ui/button'
 import { useTaskBoard } from './features/tasks/useTaskBoard'
@@ -29,14 +31,19 @@ import { useTaskQuality } from './features/quality/useTaskQuality'
 import { useTaskAssessment } from './features/assessment/useTaskAssessment'
 import { useClarifications } from './features/clarifications/useClarifications'
 import { useTopicPlan } from './features/plans/useTopicPlan'
+import { useApprovals } from './features/approvals/useApprovals'
+import { useBrowserNotifications } from './features/notifications/useBrowserNotifications'
+import { useTopicPlanning } from './features/runs/useTopicPlanning'
+import { useAgentActivity } from './features/runs/useAgentActivity'
 
-type AppView = 'topics' | 'tasks' | 'progress' | 'agents'
+type AppView = 'topics' | 'tasks' | 'runs' | 'progress' | 'agents'
 
 export default function App() {
   const board = useTaskBoard()
 	const [view, setView] = useState<AppView>('topics')
   const [creating, setCreating] = useState(false)
   const [showReleases, setShowReleases] = useState(false)
+	const [showRepository, setShowRepository] = useState(false)
 	const [showWorkerSettings, setShowWorkerSettings] = useState(false)
 	const [showClarifications, setShowClarifications] = useState(false)
   const [selectedTaskID, setSelectedTaskID] = useState<string | null>(null)
@@ -59,10 +66,31 @@ export default function App() {
 	const quality = useTaskQuality(selectedTaskID)
 	const assessment = useTaskAssessment(selectedTaskID)
 	const clarifications = useClarifications(selectedTaskID, board.project?.workers_enabled ?? false)
+	const approvals = useApprovals(board.project?.workers_enabled ?? false)
+	const notifications = useBrowserNotifications(board.project?.root, board.project?.workers_enabled ?? false, approvals.items, clarifications.open)
 	const progress = useProjectProgress(view === 'progress')
 	const agents = useAgentProfiles(view === 'agents')
 	const capabilities = useProjectCapabilities(view === 'agents')
 	const topicPlan = useTopicPlan(selectedTopicID)
+	const topicPlanning = useTopicPlanning(selectedTopic, board.project?.workers_enabled ?? false)
+	const agentActivity = useAgentActivity(board.project !== null)
+	const selectedTaskActiveRun = useMemo(
+		() => agentActivity.runs.find((run) => run.task_id === selectedTaskID) ?? null,
+		[agentActivity.runs, selectedTaskID],
+	)
+	const reloadBoard = board.reload
+	const reloadDiscussion = discussion.reload
+	const reloadTopicPlan = topicPlan.reload
+	const planningCompletionKey = topicPlanning.run && ['NEEDS_INPUT', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'].includes(topicPlanning.run.status)
+		? `${topicPlanning.run.id}:${topicPlanning.run.status}:${topicPlanning.run.updated_at}`
+		: null
+
+	useEffect(() => {
+		if (planningCompletionKey === null) return
+		reloadDiscussion()
+		reloadTopicPlan()
+		reloadBoard()
+	}, [planningCompletionKey, reloadBoard, reloadDiscussion, reloadTopicPlan])
 
   function openTask(taskID: string) {
     setSelectedTopicID(null)
@@ -79,6 +107,10 @@ export default function App() {
   async function sendMessage(content: string, linkedTaskIDs: string[]) {
     await discussion.sendMessage(content, linkedTaskIDs)
     associations.includeTaskIDs(linkedTaskIDs)
+		if (selectedTopicID !== null) {
+			board.reload()
+			topicPlanning.reload()
+		}
   }
 
   useEffect(() => {
@@ -112,14 +144,28 @@ export default function App() {
         repository={git.repository}
         latestRelease={git.releases[0] ?? null}
         onOpenReleases={() => setShowReleases(true)}
+		onOpenRepository={() => setShowRepository(true)}
 		onToggleWorkers={() => {
 			if (!board.project) return
 			void board.updateWorkers(!board.project.workers_enabled, board.project.max_workers)
 		}}
 		onConfigureWorkers={() => setShowWorkerSettings(true)}
 		workersPending={board.updatingWorkers}
-		clarificationCount={clarifications.open.length}
+		activeRuns={agentActivity.runs}
+		agentActivityError={agentActivity.error}
+		onOpenRuns={() => {
+			setSelectedTaskID(null)
+			setSelectedTopicID(null)
+			setView('runs')
+		}}
+		onReloadAgentActivity={agentActivity.reload}
+		attentionCount={clarifications.open.length + approvals.items.length}
 		onOpenClarifications={() => setShowClarifications(true)}
+		notificationLabel={notifications.label}
+		notificationsEnabled={notifications.enabled}
+		notificationsSupported={notifications.supported}
+		notificationsBlocked={notifications.blocked}
+		onToggleNotifications={() => { void notifications.toggle() }}
         onCreate={() => setCreating(true)}
       />
       <main className="min-w-0 py-6">
@@ -151,6 +197,8 @@ export default function App() {
           <TopicList topics={board.topics} loading={board.loading} onOpenTopic={setSelectedTopicID} />
 		) : view === 'tasks' ? (
           <KanbanBoard tasks={board.tasks} loading={board.loading} onOpenTask={setSelectedTaskID} />
+		) : view === 'runs' ? (
+			<RunsPage enabled tasks={board.tasks} onOpenTask={openTask} />
 		) : view === 'progress' ? (
 			<ProgressPage {...progress} onReload={progress.reload} />
 		) : (
@@ -159,9 +207,10 @@ export default function App() {
       </main>
       {creating ? (
         <CreateItemDialog
+			repository={git.repository}
           onClose={() => setCreating(false)}
           onCreateTopic={async (input) => {
-            await board.createTopic(input)
+			await board.createTopic(input)
             setView('topics')
           }}
           onCreateTask={async (input) => {
@@ -174,6 +223,7 @@ export default function App() {
         <TaskDetailsDialog
           key={selectedTask.id}
           task={selectedTask}
+		  activeRun={selectedTaskActiveRun}
           tasks={board.tasks}
           topics={board.topics}
           messages={discussion.messages}
@@ -202,7 +252,7 @@ export default function App() {
 		clarifications={clarifications.history}
 		clarificationError={clarifications.error}
 		answeringClarificationID={clarifications.answeringID}
-			repositoryHasHead={git.repository?.has_head !== false}
+			repository={git.repository}
           onClose={() => setSelectedTaskID(null)}
           onReloadDiscussion={discussion.reload}
           onSendMessage={sendMessage}
@@ -226,6 +276,9 @@ export default function App() {
 		onUpdateTitle={async (title) => {
 			const updated = await assessment.updateTitle(selectedTask, title)
 			board.updateTask(updated)
+		}}
+		onUpdateTargetBranch={async (targetBranch) => {
+			await board.updateTargetBranch(selectedTask, targetBranch)
 		}}
 			onWorkspaceChanged={() => {
 			workspace.reload()
@@ -256,7 +309,16 @@ export default function App() {
 			planLoading={topicPlan.loading}
 			planSubmitting={topicPlan.submitting}
 			planError={topicPlan.error}
+			planningRun={topicPlanning.run}
+			planningLoading={topicPlanning.loading}
+			planningError={topicPlanning.error}
+			requestingPlanning={topicPlanning.requesting}
+			workersEnabled={board.project?.workers_enabled ?? false}
 			onReloadPlan={() => topicPlan.reload()}
+			onRequestPlanning={async () => {
+				const updated = await topicPlanning.requestPlanning()
+				board.updateTopic(updated)
+			}}
 			onSubmitPlan={async (input) => {
 				await topicPlan.submit(selectedTopic, input)
 				board.reload()
@@ -281,6 +343,9 @@ export default function App() {
           onCreate={git.createRelease}
         />
       ) : null}
+		{showRepository && git.repository ? (
+			<RepositoryDialog repository={git.repository} onClose={() => setShowRepository(false)} />
+		) : null}
 		{showWorkerSettings && board.project ? (
 			<WorkerSettingsDialog
 				project={board.project}
@@ -291,14 +356,17 @@ export default function App() {
 		{showClarifications ? (
 			<ClarificationInboxDialog
 				items={clarifications.open}
+				approvals={approvals.items}
 				tasks={board.tasks}
 				answeringID={clarifications.answeringID}
+				decidingApprovalID={approvals.decidingID}
 				onClose={() => setShowClarifications(false)}
 				onOpenTask={(taskID) => { setShowClarifications(false); openTask(taskID) }}
 				onAnswer={async (item, input) => {
 					const updated = await clarifications.answer(item, input)
 					board.updateTask(updated)
 				}}
+				onDecideApproval={approvals.decide}
 			/>
 		) : null}
     </div>
@@ -343,6 +411,9 @@ function ViewTabs({
       >
         <ListTodoIcon />任务 Tasks <Badge variant="outline">{taskCount}</Badge>
       </Button>
+		<Button variant={view === 'runs' ? 'secondary' : 'ghost'} size="sm" type="button" role="tab" aria-selected={view === 'runs'} onClick={() => onChange('runs')}>
+			<ActivityIcon />Runs
+		</Button>
 		<Button variant={view === 'progress' ? 'secondary' : 'ghost'} size="sm" type="button" role="tab" aria-selected={view === 'progress'} onClick={() => onChange('progress')}>
 			<GaugeIcon />整体进度
 		</Button>
@@ -354,5 +425,5 @@ function ViewTabs({
 }
 
 function viewTitle(view: AppView): string {
-	return ({ topics: '议题', tasks: '任务看板', progress: '整体进度', agents: 'Agent 配置' })[view]
+	return ({ topics: '议题', tasks: '任务看板', runs: '执行历史', progress: '整体进度', agents: 'Agent 配置' })[view]
 }

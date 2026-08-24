@@ -33,11 +33,37 @@ func discoverRepository(ctx context.Context, start string) (string, string, erro
 }
 
 func defaultBranch(ctx context.Context, root string) string {
-	branch, err := gitOutput(ctx, root, "symbolic-ref", "--short", "HEAD")
+	if branch := remoteDefaultBranch(ctx, root); branch != "" {
+		return branch
+	}
+	for _, branch := range []string{"main", "master", "trunk", "develop"} {
+		if _, err := gitOutput(ctx, root, "show-ref", "--verify", "--quiet", "refs/heads/"+branch); err == nil {
+			return branch
+		}
+	}
+	branch, _ := gitOutput(ctx, root, "symbolic-ref", "--short", "HEAD")
+	return branch
+}
+
+func remoteDefaultBranch(ctx context.Context, root string) string {
+	remotes, err := gitOutput(ctx, root, "remote")
 	if err != nil {
 		return ""
 	}
-	return branch
+	names := strings.Fields(remotes)
+	for index, name := range names {
+		if name == "origin" && index > 0 {
+			names[0], names[index] = names[index], names[0]
+			break
+		}
+	}
+	for _, name := range names {
+		ref, refErr := gitOutput(ctx, root, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+name+"/HEAD")
+		if refErr == nil {
+			return strings.TrimPrefix(ref, name+"/")
+		}
+	}
+	return ""
 }
 
 func gitOutput(ctx context.Context, directory string, args ...string) (string, error) {

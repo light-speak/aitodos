@@ -50,7 +50,7 @@ func TestGitRoutesCreateWorkspaceAndRelease(t *testing.T) {
 	if err := json.Unmarshal(infoBody, &info); err != nil {
 		t.Fatal(err)
 	}
-	if info.CurrentBranch != "main" || info.HeadSHA == "" || len(info.Branches) != 2 {
+	if info.CurrentBranch != "main" || info.HeadSHA == "" || len(info.Branches) != 3 {
 		t.Fatalf("repository info = %#v", info)
 	}
 
@@ -79,6 +79,44 @@ func TestGitRoutesValidateAndReportMissingTask(t *testing.T) {
 	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/releases",
 		`{"version":"one","source_branch":"main"}`, http.StatusBadRequest)
 	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/missing/workspace", "", http.StatusNotFound)
+}
+
+func TestGitRoutesUpdateTaskTargetBranchBeforeWorkspace(t *testing.T) {
+	server, database := newGitTestServer(t)
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(context.Background(), task.CreateInput{Title: "选择目标分支", TargetBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	body := requestJSON(t, server.Client(), http.MethodPut,
+		server.URL+"/api/tasks/"+created.ID+"/target-branch",
+		fmt.Sprintf(`{"target_branch":"release/macos","expected_version":%d}`, created.Version), http.StatusOK)
+	var updated task.Task
+	if err := json.Unmarshal(body, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.TargetBranch != "release/macos" {
+		t.Fatalf("updated task = %#v", updated)
+	}
+	requestJSON(t, server.Client(), http.MethodPut,
+		server.URL+"/api/tasks/"+created.ID+"/target-branch",
+		fmt.Sprintf(`{"target_branch":"missing","expected_version":%d}`, updated.Version), http.StatusBadRequest)
+}
+
+func TestTaskRouteValidatesSelectedLocalTargetBranch(t *testing.T) {
+	server, _ := newGitTestServer(t)
+	body := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks",
+		`{"description":"构建 macOS 包","target_branch":"release/macos"}`, http.StatusCreated)
+	var created task.Task
+	if err := json.Unmarshal(body, &created); err != nil {
+		t.Fatal(err)
+	}
+	if created.TargetBranch != "release/macos" {
+		t.Fatalf("created task = %#v", created)
+	}
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks",
+		`{"description":"错误分支","target_branch":"missing"}`, http.StatusBadRequest)
 }
 
 func TestGitRoutesExposeChangesAndManualReview(t *testing.T) {
@@ -135,6 +173,7 @@ func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	}
 	runHTTPGit(t, repositoryRoot, "add", "README.md")
 	runHTTPGit(t, repositoryRoot, "commit", "--quiet", "-m", "initial")
+	runHTTPGit(t, repositoryRoot, "branch", "release/macos")
 	currentProject, _, err := project.Initialize(context.Background(), repositoryRoot)
 	if err != nil {
 		t.Fatal(err)
@@ -148,7 +187,7 @@ func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	manager := gitworkflow.New(currentProject, database)
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
-	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore, storage.NewAssessmentStore(database))
+	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore, storage.NewAssessmentStore(database), manager)
 	RegisterGitWorkflowRoutes(mux, manager)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)

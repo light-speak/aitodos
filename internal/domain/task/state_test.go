@@ -17,7 +17,7 @@ func TestTransitionAllowsDocumentedCommands(t *testing.T) {
 		{name: "succeed run", current: StatusRunning, command: CommandRunSucceeded, want: StatusReview},
 		{name: "fail run", current: StatusRunning, command: CommandRunFailed, want: StatusBlocked},
 		{name: "run needs input", current: StatusRunning, command: CommandNeedsInput, want: StatusBlocked},
-		{name: "cancel run", current: StatusRunning, command: CommandCancelRun, want: StatusCancelled},
+		{name: "cancel run", current: StatusRunning, command: CommandCancelRun, want: StatusBlocked},
 		{name: "accept task", current: StatusReview, command: CommandAccept, want: StatusAccepted},
 		{name: "reject task", current: StatusReview, command: CommandReject, want: StatusChangesRequested},
 		{name: "claim revision", current: StatusChangesRequested, command: CommandClaimRun, want: StatusRunning},

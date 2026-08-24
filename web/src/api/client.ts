@@ -1,4 +1,4 @@
-import { messageAuthorKinds, releaseStatuses, runPurposes, taskStatuses, topicStatuses, workspaceStates } from '../types'
+import { messageAuthorKinds, releaseStatuses, runPurposes, runStatuses, taskStatuses, topicStatuses, workspaceStates } from '../types'
 import type {
   CreateTaskInput,
   CreateTopicInput,
@@ -43,6 +43,16 @@ import type {
 	ProjectSkill,
 	ProjectMCPServer,
 	RunUsageSummary,
+	AgentRun,
+	RunArtifact,
+	RunDetail,
+	RunLog,
+	RunUsage,
+	RunWorkspaceSnapshot,
+	RunPage,
+	RunQueryInput,
+	ApprovalRequest,
+	ApprovalDecision,
 } from '../types'
 
 interface RequestOptions {
@@ -79,6 +89,61 @@ export async function getProjectProgress(signal?: AbortSignal): Promise<ProjectP
 
 export async function getRunUsageSummary(signal?: AbortSignal): Promise<RunUsageSummary> {
 	return parseRunUsageSummary(await requestJSON('/api/runs/usage', { signal }))
+}
+
+export async function getTaskRuns(taskID: string, signal?: AbortSignal): Promise<AgentRun[]> {
+	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/runs`, { signal })
+	if (!Array.isArray(value)) throw new ApiError('Run 历史格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseAgentRun)
+}
+
+export async function getRuns(query: RunQueryInput, signal?: AbortSignal): Promise<RunPage> {
+	const parameters = new URLSearchParams()
+	if (query.active) parameters.set('active', 'true')
+	if (query.status) parameters.set('status', query.status)
+	if (query.purpose) parameters.set('purpose', query.purpose)
+	if (query.task_id) parameters.set('task_id', query.task_id)
+	if (query.topic_id) parameters.set('topic_id', query.topic_id)
+	if (query.limit) parameters.set('limit', String(query.limit))
+	if (query.cursor) parameters.set('cursor', query.cursor)
+	const suffix = parameters.size > 0 ? `?${parameters.toString()}` : ''
+	return parseRunPage(await requestJSON(`/api/runs${suffix}`, { signal }))
+}
+
+export async function requestRunCancellation(runID: string, reason: string): Promise<AgentRun> {
+	return parseAgentRun(await requestJSON(`/api/runs/${encodeURIComponent(runID)}/cancel`, {
+		method: 'POST', body: { reason },
+	}))
+}
+
+export async function retryTask(taskID: string, expectedVersion: number): Promise<Task> {
+	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/retry`, {
+		method: 'POST', body: { expected_version: expectedVersion },
+	}))
+}
+
+export async function getOpenApprovalRequests(signal?: AbortSignal): Promise<ApprovalRequest[]> {
+	const value = await requestJSON('/api/approvals', { signal })
+	if (!Array.isArray(value)) throw new ApiError('权限请求格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseApprovalRequest)
+}
+
+export async function decideApprovalRequest(
+	approvalID: string,
+	decision: ApprovalDecision,
+	expectedVersion: number,
+): Promise<ApprovalRequest> {
+	return parseApprovalRequest(await requestJSON(`/api/approvals/${encodeURIComponent(approvalID)}/decision`, {
+		method: 'POST', body: { decision, expected_version: expectedVersion },
+	}))
+}
+
+export async function getRunDetail(runID: string, signal?: AbortSignal): Promise<RunDetail> {
+	return parseRunDetail(await requestJSON(`/api/runs/${encodeURIComponent(runID)}`, { signal }))
+}
+
+export async function getRunLog(runID: string, stream: RunLog['stream'], signal?: AbortSignal): Promise<RunLog> {
+	return parseRunLog(await requestJSON(`/api/runs/${encodeURIComponent(runID)}/logs?stream=${stream}`, { signal }))
 }
 
 export async function getAgentProfiles(signal?: AbortSignal): Promise<AgentProfile[]> {
@@ -139,6 +204,12 @@ export async function updateTaskTitle(taskID: string, title: string, expectedVer
 	}))
 }
 
+export async function updateTaskTargetBranch(taskID: string, targetBranch: string, expectedVersion: number): Promise<Task> {
+	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/target-branch`, {
+		method: 'PUT', body: { target_branch: targetBranch, expected_version: expectedVersion },
+	}))
+}
+
 export async function createTaskEstimate(taskID: string, input: CreateTaskEstimateInput): Promise<TaskEstimate> {
 	return parseTaskEstimate(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/estimates`, { method: 'POST', body: input }))
 }
@@ -177,6 +248,12 @@ export async function getTopics(signal?: AbortSignal): Promise<Topic[]> {
 
 export async function createTopic(input: CreateTopicInput): Promise<Topic> {
   return parseTopic(await requestJSON('/api/topics', { method: 'POST', body: input }))
+}
+
+export async function requestTopicPlanning(topicID: string, expectedVersion: number): Promise<Topic> {
+	return parseTopic(await requestJSON(`/api/topics/${encodeURIComponent(topicID)}/planning`, {
+		method: 'POST', body: { expected_version: expectedVersion },
+	}))
 }
 
 export async function getTopicPlan(topicID: string, signal?: AbortSignal): Promise<PlanView | null> {
@@ -426,6 +503,119 @@ function parseRunUsageSummary(value: unknown): RunUsageSummary {
 		throw new ApiError('Run 用量格式无效', 502, 'INVALID_RESPONSE')
 	}
 	return { ...parseUsageMetrics(value), by_purpose: value.by_purpose.map(parsePurposeUsage) }
+}
+
+function parseAgentRun(value: unknown): AgentRun {
+	if (!isRecord(value) || !hasStringFields(value, [
+		'id', 'profile_revision_id', 'lease_expires_at', 'queued_at', 'claimed_at', 'created_at', 'updated_at',
+	]) || !runPurposes.includes(value.purpose as (typeof runPurposes)[number]) ||
+		!runStatuses.includes(value.status as (typeof runStatuses)[number]) ||
+		typeof value.subject_version !== 'number' || typeof value.lease_generation !== 'number') {
+		throw new ApiError('Run 信息格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const result: AgentRun = {
+		id: value.id as string, purpose: value.purpose as AgentRun['purpose'], status: value.status as AgentRun['status'],
+		profile_revision_id: value.profile_revision_id as string, subject_version: value.subject_version,
+		session_resumed: value.session_resumed === true,
+		lease_generation: value.lease_generation, lease_expires_at: value.lease_expires_at as string,
+		queued_at: value.queued_at as string, claimed_at: value.claimed_at as string,
+		created_at: value.created_at as string, updated_at: value.updated_at as string,
+	}
+	for (const field of ['topic_id', 'task_id', 'retry_of_run_id', 'continuation_of_run_id', 'agent_session_id', 'started_at', 'finished_at', 'failure_kind', 'failure_code', 'failure_message', 'cancel_requested_at', 'cancel_reason'] as const) {
+		if (typeof value[field] === 'string') result[field] = value[field]
+	}
+	if (typeof value.exit_code === 'number') result.exit_code = value.exit_code
+	if (typeof value.failure_retryable === 'boolean') result.failure_retryable = value.failure_retryable
+	return result
+}
+
+function parseRunPage(value: unknown): RunPage {
+	if (!isRecord(value) || !Array.isArray(value.items) || !isOptionalString(value.next_cursor)) {
+		throw new ApiError('Run 查询结果格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		items: value.items.map(parseAgentRun),
+		...(typeof value.next_cursor === 'string' ? { next_cursor: value.next_cursor } : {}),
+	}
+}
+
+function parseApprovalRequest(value: unknown): ApprovalRequest {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'run_id', 'kind', 'status', 'created_at', 'updated_at']) ||
+		typeof value.version !== 'number' || !Array.isArray(value.available_decisions) ||
+		!value.available_decisions.every((item) => typeof item === 'string')) {
+		throw new ApiError('权限请求格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const result: ApprovalRequest = {
+		id: value.id as string, run_id: value.run_id as string,
+		kind: value.kind as ApprovalRequest['kind'], status: value.status as ApprovalRequest['status'],
+		available_decisions: value.available_decisions as ApprovalDecision[], version: value.version,
+		created_at: value.created_at as string, updated_at: value.updated_at as string,
+	}
+	for (const field of ['task_id', 'item_id', 'reason', 'command', 'cwd', 'host', 'protocol', 'grant_root', 'decision', 'resolved_at'] as const) {
+		if (typeof value[field] === 'string') result[field] = value[field] as never
+	}
+	return result
+}
+
+function parseRunDetail(value: unknown): RunDetail {
+	if (!isRecord(value) || !Array.isArray(value.artifacts)) {
+		throw new ApiError('Run 详情格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		run: parseAgentRun(value.run),
+		artifacts: value.artifacts.map(parseRunArtifact),
+		...(isRecord(value.usage) ? { usage: parseRunUsage(value.usage) } : {}),
+		...(isRecord(value.workspace_snapshot) ? { workspace_snapshot: parseRunWorkspaceSnapshot(value.workspace_snapshot) } : {}),
+	}
+}
+
+function parseRunArtifact(value: unknown): RunArtifact {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'run_id', 'kind', 'relative_path', 'sha256', 'created_at']) ||
+		typeof value.size !== 'number' || typeof value.truncated !== 'boolean') {
+		throw new ApiError('Run Artifact 格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id as string, run_id: value.run_id as string, kind: value.kind as string,
+		relative_path: value.relative_path as string, sha256: value.sha256 as string,
+		size: value.size, truncated: value.truncated, created_at: value.created_at as string,
+	}
+}
+
+function parseRunUsage(value: unknown): RunUsage {
+	if (!isRecord(value) || !hasStringFields(value, ['run_id', 'source', 'captured_at'])) {
+		throw new ApiError('Run 用量格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const result: RunUsage = { run_id: value.run_id as string, source: value.source as string, captured_at: value.captured_at as string }
+	for (const field of ['input_tokens', 'cached_input_tokens', 'cache_write_input_tokens', 'output_tokens', 'reasoning_output_tokens', 'model_requests', 'peak_input_tokens'] as const) {
+		if (value[field] !== null && value[field] !== undefined && typeof value[field] !== 'number') {
+			throw new ApiError('Run 用量格式无效', 502, 'INVALID_RESPONSE')
+		}
+		if (typeof value[field] === 'number') result[field] = value[field]
+	}
+	return result
+}
+
+function parseRunWorkspaceSnapshot(value: unknown): RunWorkspaceSnapshot {
+	if (!isRecord(value) || !hasStringFields(value, [
+		'run_id', 'workspace_id', 'branch_name', 'target_branch', 'base_commit_sha', 'head_before', 'head_after', 'captured_at',
+	]) || typeof value.dirty_before !== 'boolean' || typeof value.dirty_after !== 'boolean' || !isWorkspaceState(value.state_after)) {
+		throw new ApiError('Run Workspace 快照格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		run_id: value.run_id as string, workspace_id: value.workspace_id as string,
+		branch_name: value.branch_name as string, target_branch: value.target_branch as string,
+		base_commit_sha: value.base_commit_sha as string, head_before: value.head_before as string,
+		head_after: value.head_after as string, dirty_before: value.dirty_before,
+		dirty_after: value.dirty_after, state_after: value.state_after, captured_at: value.captured_at as string,
+	}
+}
+
+function parseRunLog(value: unknown): RunLog {
+	if (!isRecord(value) || (value.stream !== 'stdout' && value.stream !== 'stderr') ||
+		typeof value.content !== 'string' || typeof value.size !== 'number' || typeof value.truncated !== 'boolean') {
+		throw new ApiError('Run 日志格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return { stream: value.stream, content: value.content, size: value.size, truncated: value.truncated }
 }
 
 function parsePurposeUsage(value: unknown) {
@@ -972,11 +1162,24 @@ function parseUploadedImage(value: unknown): UploadedImage {
 function parseRepositoryInfo(value: unknown): RepositoryInfo {
   if (
     !isRecord(value) ||
+		typeof value.root !== 'string' ||
+		typeof value.git_common_dir !== 'string' ||
+		typeof value.git_version !== 'string' ||
+		typeof value.default_branch !== 'string' ||
     typeof value.current_branch !== 'string' ||
     typeof value.head_sha !== 'string' ||
 		typeof value.has_head !== 'boolean' ||
     typeof value.dirty !== 'boolean' ||
-    !Array.isArray(value.branches)
+		typeof value.identity_configured !== 'boolean' ||
+		!isOptionalString(value.remote_default_branch) ||
+		!isOptionalString(value.exact_tag) ||
+		!isOptionalString(value.upstream) ||
+		!isOptionalNumber(value.ahead) ||
+		!isOptionalNumber(value.behind) ||
+		!isOptionalString(value.user_name) ||
+		!isOptionalString(value.user_email) ||
+    !Array.isArray(value.branches) ||
+		!Array.isArray(value.remotes)
   ) {
     throw new ApiError('Git 仓库信息格式无效', 502, 'INVALID_RESPONSE')
   }
@@ -986,14 +1189,40 @@ function parseRepositoryInfo(value: unknown): RepositoryInfo {
     }
     return { name: branch.name, head_sha: branch.head_sha }
   })
+	const remotes = value.remotes.map((remote) => {
+		if (!isRecord(remote) || typeof remote.name !== 'string' || typeof remote.fetch_url !== 'string' || typeof remote.push_url !== 'string') {
+			throw new ApiError('Git Remote 信息格式无效', 502, 'INVALID_RESPONSE')
+		}
+		return { name: remote.name, fetch_url: remote.fetch_url, push_url: remote.push_url }
+	})
   return {
+		root: value.root,
+		git_common_dir: value.git_common_dir,
+		git_version: value.git_version,
+		default_branch: value.default_branch,
     current_branch: value.current_branch,
     head_sha: value.head_sha,
 		has_head: value.has_head,
     dirty: value.dirty,
     branches,
+		remotes,
+		identity_configured: value.identity_configured,
+		...(typeof value.remote_default_branch === 'string' ? { remote_default_branch: value.remote_default_branch } : {}),
     ...(typeof value.exact_tag === 'string' ? { exact_tag: value.exact_tag } : {}),
+		...(typeof value.upstream === 'string' ? { upstream: value.upstream } : {}),
+		...(typeof value.ahead === 'number' ? { ahead: value.ahead } : {}),
+		...(typeof value.behind === 'number' ? { behind: value.behind } : {}),
+		...(typeof value.user_name === 'string' ? { user_name: value.user_name } : {}),
+		...(typeof value.user_email === 'string' ? { user_email: value.user_email } : {}),
   }
+}
+
+function isOptionalString(value: unknown): value is string | undefined {
+	return value === undefined || typeof value === 'string'
+}
+
+function isOptionalNumber(value: unknown): value is number | undefined {
+	return value === undefined || typeof value === 'number'
 }
 
 function parseTaskChanges(value: unknown): TaskChanges {

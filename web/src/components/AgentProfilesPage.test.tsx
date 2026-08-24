@@ -59,7 +59,7 @@ describe('AgentProfilesPage', () => {
 		}))
 	})
 
-	it('为任务评估 Agent 填入只读 Codex 结果文件配置', async () => {
+	it('为任务评估 Agent 填入支持面板审批的 Codex App Server 配置', async () => {
 		const user = userEvent.setup()
 		const onSave = vi.fn().mockResolvedValue(undefined)
 		render(<AgentProfilesPage profiles={[triagerProfile]} capabilities={{ skills: [], mcp_servers: [] }} loading={false} error={null} saving={false} onReload={() => undefined} onSave={onSave} />)
@@ -68,20 +68,18 @@ describe('AgentProfilesPage', () => {
 		await user.click(screen.getByRole('button', { name: '填入 Codex 推荐配置' }))
 		expect(screen.getByLabelText('模型（可留空）')).toHaveValue('gpt-5.3-codex')
 		await user.click(screen.getByText('高级配置'))
-		expect(screen.getByLabelText('参数（每行一项）')).toHaveValue([
-			'exec', '--json', '--model', '{model}', '--sandbox', 'read-only',
-			'--output-last-message', '{result_file}', '-',
-		].join('\n'))
+		expect(screen.getByLabelText('额外参数（每行一项）')).toHaveValue('')
 		await user.click(screen.getByRole('button', { name: '保存为 Revision 2' }))
 
 		expect(onSave).toHaveBeenCalledWith('profile-triager', expect.objectContaining({
 			command: 'codex',
+			adapter: 'codex-app-server',
 			model: 'gpt-5.3-codex',
-			args: ['exec', '--json', '--model', '{model}', '--sandbox', 'read-only', '--output-last-message', '{result_file}', '-'],
+			args: [],
 		}))
 	})
 
-	it('为实现 Agent 填入不冲突的 workspace-write 配置', async () => {
+	it('为实现 Agent 填入无需人工维护沙箱参数的 App Server 配置', async () => {
 		const user = userEvent.setup()
 		const onSave = vi.fn().mockResolvedValue(undefined)
 		render(<AgentProfilesPage profiles={[profile]} capabilities={{ skills: [], mcp_servers: [] }} loading={false} error={null} saving={false} onReload={() => undefined} onSave={onSave} />)
@@ -89,12 +87,8 @@ describe('AgentProfilesPage', () => {
 		await user.click(screen.getByRole('button', { name: '配置实现 Agent' }))
 		await user.click(screen.getByRole('button', { name: '填入 Codex 推荐配置' }))
 		await user.click(screen.getByText('高级配置'))
-		const args = screen.getByLabelText('参数（每行一项）')
-		expect(args).toHaveValue([
-			'exec', '--json', '--model', '{model}', '--sandbox', 'workspace-write',
-			'-',
-		].join('\n'))
-		expect((args as HTMLTextAreaElement).value).not.toContain('--approve-for-me')
+		expect(screen.getByLabelText('额外参数（每行一项）')).toHaveValue('')
+		expect(screen.getByLabelText('Adapter')).toHaveValue('codex-app-server')
 	})
 
 	it('把项目 MCP 和 Tool 白名单保存到新修订', async () => {
@@ -115,7 +109,7 @@ describe('AgentProfilesPage', () => {
 		await user.click(screen.getByRole('button', { name: '保存为 Revision 2' }))
 
 		expect(onSave).toHaveBeenCalledWith('profile-implementer', expect.objectContaining({
-			adapter: 'codex',
+			adapter: 'codex-app-server',
 			tool_policy: { skills: [], mcp_servers: [{ server_id: 'mcp-playwright', required: true, enabled_tools: ['browser_navigate', 'browser_close'] }] },
 		}))
 	})

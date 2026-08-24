@@ -63,6 +63,26 @@ type UpdateTitleInput struct {
 	Title string `json:"title"`
 }
 
+// UpdateTargetBranchInput 是 Workspace 创建前允许修改的目标分支。
+type UpdateTargetBranchInput struct {
+	TargetBranch string `json:"target_branch"`
+}
+
+// Normalized 清理目标分支名称。
+func (input UpdateTargetBranchInput) Normalized() UpdateTargetBranchInput {
+	input.TargetBranch = strings.TrimSpace(input.TargetBranch)
+	return input
+}
+
+// Validate 校验目标分支的领域层长度约束；Git ref 规则由 Git Workflow 校验。
+func (input UpdateTargetBranchInput) Validate() error {
+	input = input.Normalized()
+	if utf8.RuneCountInString(input.TargetBranch) < 1 || utf8.RuneCountInString(input.TargetBranch) > 255 {
+		return errors.New("target branch 长度必须为 1 到 255")
+	}
+	return nil
+}
+
 // Normalized 清理人工标题。
 func (input UpdateTitleInput) Normalized() UpdateTitleInput {
 	input.Title = strings.TrimSpace(input.Title)
@@ -141,6 +161,8 @@ const (
 	EventStatusChanged EventType = "TASK_STATUS_CHANGED"
 	// EventTitleChanged 表示标题被 AI 应用或由人工锁定。
 	EventTitleChanged EventType = "TASK_TITLE_CHANGED"
+	// EventTargetBranchChanged 表示 Workspace 创建前更换了目标分支。
+	EventTargetBranchChanged EventType = "TASK_TARGET_BRANCH_CHANGED"
 )
 
 // Event 是 Task 聚合内按序追加的审计记录。

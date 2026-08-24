@@ -4,15 +4,120 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
+	"github.com/light-speak/aitodos/internal/domain/approvalrequest"
 	"github.com/light-speak/aitodos/internal/domain/capability"
+	"github.com/light-speak/aitodos/internal/domain/clarification"
+	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/plan"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
+	"github.com/light-speak/aitodos/internal/domain/workspace"
 )
+
+func TestRunStoreClaimsTopicPlanningOncePerVersionAndFinalizesDraft(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureProfile(t, database, agentprofile.RolePlanner)
+	created, err := NewTopicStore(database).Create(ctx, topic.CreateInput{
+		Title: "设计社区发帖", Description: "用户可以发布帖子",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Run.Purpose != run.PurposePlanning || claim.Run.TopicID != created.ID ||
+		claim.Run.TaskID != "" || claim.Run.SubjectVersion != created.Version {
+		t.Fatalf("planning claim = %#v", claim)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	planning := plan.PlanningResult{
+		Reply: "需求已经足够明确，我整理了一版可审核方案。",
+		Plan: &plan.RevisionInput{
+			Summary: "实现最小社区发帖闭环",
+			Drafts: []plan.TaskDraftInput{{
+				Title: "实现帖子发布", Description: "提供创建和展示帖子能力",
+				AcceptanceCriteria: "用户发布后可以看到帖子", Priority: 1,
+				TestCases: []plan.TestCaseInput{{Title: "发布帖子", Required: true}},
+			}},
+		},
+	}
+	if _, err := store.BeginFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, FinalizationIntent{
+		Finish: RunFinish{Status: run.StatusSucceeded, ExitCode: 0}, Planning: &planning,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	view, err := NewPlanStore(database).GetByTopic(ctx, created.ID)
+	if err != nil || view.Revision.SourceRunID != claim.Run.ID || view.Revision.Summary != planning.Plan.Summary {
+		t.Fatalf("generated plan = %#v, %v", view, err)
+	}
+	messages, err := NewDiscussionStore(database).ListTopicMessages(ctx, created.ID)
+	if err != nil || len(messages) != 1 || messages[0].AuthorKind != discussion.AuthorAgent || messages[0].Content != planning.Reply {
+		t.Fatalf("agent messages = %#v, %v", messages, err)
+	}
+	if _, err := store.ClaimNextTask(ctx, 1, time.Minute); !errors.Is(err, ErrNoRunnableTask) {
+		t.Fatalf("second planning claim error = %v", err)
+	}
+}
+
+func TestRunStoreQueuesLatestTopicVersionAfterActivePlanningFinishes(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureProfile(t, database, agentprofile.RolePlanner)
+	created, err := NewTopicStore(database).Create(ctx, topic.CreateInput{Title: "连续讨论"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	first, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewDiscussionStore(database).AppendTopicMessage(ctx, created.ID, discussion.CreateMessageInput{Content: "运行期间补充的新约束"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginFinalization(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration, FinalizationIntent{
+		Finish:   RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+		Planning: &plan.PlanningResult{Reply: "收到，我会结合新约束继续分析。"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.CompleteFinalization(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Run.TopicID != created.ID || second.Run.SubjectVersion != created.Version+1 ||
+		second.Run.ContinuationOfRunID != first.Run.ID {
+		t.Fatalf("continuation claim = %#v", second)
+	}
+}
 
 func TestRunStoreClaimsRevisionThenPriorityAndHonorsCapacity(t *testing.T) {
 	ctx := context.Background()
@@ -194,10 +299,10 @@ func TestRunStoreAuthorizesLeaseAndFinalizesTask(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Start(ctx, claim.Run.ID, "wrong", claim.Run.LeaseGeneration, 123, time.Hour); !errors.Is(err, ErrRunClaimMismatch) {
+	if _, err := store.Start(ctx, claim.Run.ID, "wrong", claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); !errors.Is(err, ErrRunClaimMismatch) {
 		t.Fatalf("Start(wrong token) error = %v", err)
 	}
-	started, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, time.Hour)
+	started, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -208,6 +313,37 @@ func TestRunStoreAuthorizesLeaseAndFinalizesTask(t *testing.T) {
 	if err != nil || running.Status != run.StatusRunning {
 		t.Fatalf("MarkRunning() = %#v, %v", running, err)
 	}
+	finalizing, err := store.MarkFinalizing(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration)
+	if err != nil || finalizing.Status != run.StatusFinalizing {
+		t.Fatalf("MarkFinalizing() = %#v, %v", finalizing, err)
+	}
+	now := formatTime(time.Now().UTC())
+	if _, err := database.ExecContext(ctx, `
+INSERT INTO workspaces(
+    id, task_id, path, branch_name, target_branch, base_commit_sha, head_sha,
+    state, dirty, created_at, updated_at
+) VALUES ('workspace-1', ?, '/managed/workspace-1', 'aitodos/task-1', 'main', 'base-sha', 'head-one', 'READY', 0, ?, ?)`, created.ID, now, now); err != nil {
+		t.Fatal(err)
+	}
+	firstSnapshot, err := store.RecordWorkspaceSnapshot(ctx, run.WorkspaceSnapshot{
+		RunID: claim.Run.ID, WorkspaceID: "workspace-1", BranchName: "aitodos/task-1",
+		TargetBranch: "main", BaseCommitSHA: "base-sha", HeadBefore: "head-one",
+		HeadAfter: "head-two", DirtyAfter: true, StateAfter: workspace.StateDirty,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replayed, err := store.RecordWorkspaceSnapshot(ctx, run.WorkspaceSnapshot{
+		RunID: claim.Run.ID, WorkspaceID: "workspace-1", BranchName: "aitodos/task-1",
+		TargetBranch: "main", BaseCommitSHA: "base-sha", HeadBefore: "wrong-head",
+		HeadAfter: "wrong-after", StateAfter: workspace.StateReady,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if replayed.HeadBefore != firstSnapshot.HeadBefore || replayed.HeadAfter != firstSnapshot.HeadAfter || !replayed.DirtyAfter {
+		t.Fatalf("replayed snapshot overwrote audit fact: %#v", replayed)
+	}
 	artifact, err := store.RecordArtifact(ctx, run.Artifact{
 		RunID: claim.Run.ID, Kind: "PROMPT", RelativePath: "runs/example/prompt.md",
 		SHA256: "abc", Size: 123,
@@ -215,21 +351,133 @@ func TestRunStoreAuthorizesLeaseAndFinalizesTask(t *testing.T) {
 	if err != nil || artifact.ID == "" {
 		t.Fatalf("RecordArtifact() = %#v, %v", artifact, err)
 	}
+	artifacts, err := store.ListArtifacts(ctx, claim.Run.ID)
+	if err != nil || len(artifacts) != 1 || artifacts[0].ID != artifact.ID {
+		t.Fatalf("ListArtifacts() = %#v, %v", artifacts, err)
+	}
 	finished, err := store.Finish(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, RunFinish{
-		Status: run.StatusSucceeded, ExitCode: 0,
+		Status: run.StatusFailed, ExitCode: 7, FailureKind: "AGENT_PROCESS",
+		FailureCode: "NON_ZERO_EXIT", FailureMessage: "agent exited with status 7",
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if finished.Status != run.StatusSucceeded || finished.FinishedAt.IsZero() {
+	if finished.Status != run.StatusFailed || finished.FinishedAt.IsZero() || finished.ExitCode == nil || *finished.ExitCode != 7 || finished.FailureCode != "NON_ZERO_EXIT" {
 		t.Fatalf("finished run = %#v", finished)
+	}
+	events, err := store.ListEvents(ctx, claim.Run.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 5 || events[0].Type != run.EventClaimed || events[4].Type != run.EventStatusChanged {
+		t.Fatalf("run events = %#v", events)
+	}
+	for index, event := range events {
+		if event.Sequence != int64(index+1) {
+			t.Fatalf("event sequence = %d at index %d", event.Sequence, index)
+		}
+	}
+	resumed, err := store.ListEvents(ctx, claim.Run.ID, 3, 100)
+	if err != nil || len(resumed) != 2 || resumed[0].Sequence != 4 {
+		t.Fatalf("resumed events = %#v, %v", resumed, err)
 	}
 	loaded, err := tasks.Get(ctx, created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Status != task.StatusReview || loaded.LatestRunID != claim.Run.ID {
+	if loaded.Status != task.StatusBlocked || loaded.LatestRunID != claim.Run.ID {
 		t.Fatalf("task after finish = %#v", loaded)
+	}
+}
+
+func TestRunStoreRenewsLeaseAndRecoversFrozenFinalization(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "恢复 Finalization"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Second); err != nil {
+		t.Fatal(err)
+	}
+	before, err := store.Get(ctx, claim.Run.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RenewLease(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	after, err := store.Get(ctx, claim.Run.ID)
+	if err != nil || !after.LeaseExpiresAt.After(before.LeaseExpiresAt) {
+		t.Fatalf("renewed run = %#v, %v", after, err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.BeginFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, FinalizationIntent{
+		Finish: RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.RecoverFinalization(ctx, claim.Run.ID, claim.Run.LeaseGeneration)
+	if err != nil || recovered.Status != run.StatusSucceeded {
+		t.Fatalf("RecoverFinalization() = %#v, %v", recovered, err)
+	}
+	replayed, err := store.RecoverFinalization(ctx, claim.Run.ID, claim.Run.LeaseGeneration)
+	if err != nil || replayed.Status != run.StatusSucceeded {
+		t.Fatalf("replayed finalization = %#v, %v", replayed, err)
+	}
+	updated, err := NewTaskStore(database).Get(ctx, created.ID)
+	if err != nil || updated.Status != task.StatusReview {
+		t.Fatalf("task = %#v, %v", updated, err)
+	}
+}
+
+func TestRunStoreRecoversNeedsInputFinalizationWithClarification(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "恢复澄清"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	request := clarification.Request{
+		Category: clarification.CategoryDecision, Question: "选择兼容策略？",
+		Options:             []clarification.Option{{ID: "safe", Label: "兼容", Description: "保留旧数据"}},
+		RecommendedOptionID: "safe", AllowCustomAnswer: true,
+	}
+	if _, err := store.BeginFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, FinalizationIntent{
+		Finish: RunFinish{Status: run.StatusNeedsInput, ExitCode: 0}, Clarification: &request,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.RecoverFinalization(ctx, claim.Run.ID, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	open, err := NewClarificationStore(database).ListOpen(ctx)
+	if err != nil || len(open) != 1 || open[0].TaskID != created.ID {
+		t.Fatalf("clarifications = %#v, %v", open, err)
+	}
+	updated, err := NewTaskStore(database).Get(ctx, created.ID)
+	if err != nil || updated.Status != task.StatusBlocked {
+		t.Fatalf("task = %#v, %v", updated, err)
 	}
 }
 
@@ -278,6 +526,161 @@ func TestRunStoreRecordsUsageAndBuildsPurposeSummary(t *testing.T) {
 	}
 }
 
+func TestRunStoreRequestsCancellationAndBlocksTaskAfterRunnerFinalizes(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "取消当前执行"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.RequestCancel(ctx, claim.Run.ID, "停止错误方向")
+	if err != nil || cancelled.CancelRequestedAt == nil || cancelled.CancelReason != "停止错误方向" {
+		t.Fatalf("RequestCancel() = %#v, %v", cancelled, err)
+	}
+	if _, err := store.RequestCancel(ctx, claim.Run.ID, "不得覆盖第一次原因"); err != nil {
+		t.Fatal(err)
+	}
+	requested, err := store.CancellationRequested(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration)
+	if err != nil || !requested {
+		t.Fatalf("CancellationRequested() = %v, %v", requested, err)
+	}
+	if _, err := store.MarkFinalizing(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Finish(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, RunFinish{
+		Status: run.StatusCancelled, ExitCode: -1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	updated, err := NewTaskStore(database).Get(ctx, created.ID)
+	if err != nil || updated.Status != task.StatusBlocked {
+		t.Fatalf("task after cancellation = %#v, %v", updated, err)
+	}
+	retried, err := NewTaskStore(database).RetryBlocked(ctx, created.ID, updated.Version)
+	if err != nil || retried.Status != task.StatusReady {
+		t.Fatalf("retried task = %#v, %v", retried, err)
+	}
+	events, err := store.ListEvents(ctx, claim.Run.ID, 0, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelEvents := 0
+	for _, event := range events {
+		if event.Type == run.EventCancelRequested {
+			cancelEvents++
+		}
+	}
+	if cancelEvents != 1 {
+		t.Fatalf("cancel events = %d, events = %#v", cancelEvents, events)
+	}
+}
+
+func TestRunStorePersistsCodexSessionAndBindsCompatibleRetry(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureCodexImplementer(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "复用 Agent Session"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	first, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	session, err := store.RecordAgentSession(ctx, first.Run.ID, "019c8b9f-c6d5-7020-a5ed-e3a92c861e5d")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if session.ExternalSessionID == "" || session.LastRunID != first.Run.ID {
+		t.Fatalf("session = %#v", session)
+	}
+	if _, err := store.Finish(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration, RunFinish{
+		Status: run.StatusCancelled, ExitCode: -1,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := NewTaskStore(database).Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewTaskStore(database).RetryBlocked(ctx, created.ID, blocked.Version); err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.Run.AgentSessionID != session.ID || !second.Run.SessionResumed {
+		t.Fatalf("retry run = %#v, want session %q", second.Run, session.ID)
+	}
+	loaded, err := store.GetAgentSessionForRun(ctx, second.Run.ID)
+	if err != nil || loaded.ExternalSessionID != session.ExternalSessionID {
+		t.Fatalf("GetAgentSessionForRun() = %#v, %v", loaded, err)
+	}
+	if err := store.InvalidateAgentSessionForRun(ctx, second.Run.ID); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err = store.GetAgentSessionForRun(ctx, second.Run.ID)
+	if err != nil || loaded.Status != "INVALID" {
+		t.Fatalf("invalidated session = %#v, %v", loaded, err)
+	}
+}
+
+func TestRunStoreBridgesStructuredApprovalDecision(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	if _, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "等待命令权限"}); err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	created, err := store.CreateApprovalRequest(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, approvalrequest.CreateInput{
+		ExternalRequestID: "rpc-17", ItemID: "item-1", Kind: approvalrequest.KindCommand,
+		Reason: "需要运行项目测试", Command: "go test ./...", CWD: "/workspace",
+		Available: []approvalrequest.Decision{
+			approvalrequest.DecisionAcceptOnce, approvalrequest.DecisionAcceptSession,
+			approvalrequest.DecisionDecline, approvalrequest.DecisionCancelRun,
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open, err := store.ListOpenApprovalRequests(ctx)
+	if err != nil || len(open) != 1 || open[0].ID != created.ID {
+		t.Fatalf("open approvals = %#v, %v", open, err)
+	}
+	resolved, err := store.ResolveApprovalRequest(ctx, created.ID, created.Version, approvalrequest.DecisionAcceptSession)
+	if err != nil || resolved.Status != approvalrequest.StatusResolved || resolved.Decision != approvalrequest.DecisionAcceptSession {
+		t.Fatalf("resolved approval = %#v, %v", resolved, err)
+	}
+	if _, err := store.ResolveApprovalRequest(ctx, created.ID, created.Version, approvalrequest.DecisionDecline); !errors.Is(err, ErrApprovalRequestConflict) {
+		t.Fatalf("second decision error = %v", err)
+	}
+}
+
 func tokenCount(value int64) *int64 {
 	return &value
 }
@@ -302,6 +705,26 @@ func configureProfile(t *testing.T, database *sql.DB, role agentprofile.Role) {
 		Args: []string{}, Model: "", MaxInputTokens: revision.MaxInputTokens,
 		ReservedOutputTokens: revision.ReservedOutputTokens,
 		RecentMessageLimit:   revision.RecentMessageLimit, RetrievalLimit: revision.RetrievalLimit,
+		TimeoutSeconds: revision.TimeoutSeconds,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
+func configureCodexImplementer(t *testing.T, database *sql.DB) {
+	t.Helper()
+	store := NewAgentProfileStore(database)
+	profile, err := store.GetByRole(context.Background(), agentprofile.RoleImplementer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	_, err = store.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "codex", Command: "codex",
+		Args: []string{"exec", "--json", "--sandbox", "workspace-write", "-"}, Model: "gpt-5.3-codex",
+		MaxInputTokens: revision.MaxInputTokens, ReservedOutputTokens: revision.ReservedOutputTokens,
+		RecentMessageLimit: revision.RecentMessageLimit, RetrievalLimit: revision.RetrievalLimit,
 		TimeoutSeconds: revision.TimeoutSeconds,
 	})
 	if err != nil {

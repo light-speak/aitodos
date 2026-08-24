@@ -1,8 +1,8 @@
 import { useMemo, useState } from 'react'
-import { CheckIcon, ClipboardListIcon, PlusIcon, RefreshCwIcon, Trash2Icon, XIcon } from 'lucide-react'
+import { BotIcon, CheckIcon, ClipboardListIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, Trash2Icon, XIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
-import type { CreatePlanRevisionInput, PlanTaskDraftInput, PlanView, Topic } from '../types'
+import type { AgentRun, CreatePlanRevisionInput, PlanTaskDraftInput, PlanView, Topic } from '../types'
 import { MarkdownContent } from './MarkdownContent'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -15,7 +15,13 @@ interface PlanPanelProps {
 	loading: boolean
 	submitting: boolean
 	error: unknown
+	planningRun: AgentRun | null
+	planningLoading: boolean
+	planningError: unknown
+	requestingPlanning: boolean
+	workersEnabled: boolean
 	onReload: () => void
+	onRequestPlanning: () => Promise<void>
 	onSubmit: (input: CreatePlanRevisionInput) => Promise<void>
 	onReject: (comment: string) => Promise<void>
 	onApprove: (comment: string) => Promise<void>
@@ -38,12 +44,14 @@ export function PlanPanel(props: PlanPanelProps) {
 		<section className="py-5" aria-label="Plan">
 			<div className="mb-3 flex items-center justify-between gap-3">
 				<h3 className="flex items-center gap-2 text-xs font-medium text-muted-foreground"><ClipboardListIcon className="size-4" />执行方案</h3>
-				{canEdit ? <Button size="sm" type="button" onClick={() => setEditing(true)}>{props.plan ? '提交新修订' : '编写方案'}</Button> : null}
+				{canEdit ? <Button variant="outline" size="sm" type="button" onClick={() => setEditing(true)}>{props.plan ? '手动提交修订' : '手动编写'}</Button> : null}
 			</div>
 			{props.error ? <div className="mb-3 flex items-center gap-2 rounded-lg border border-destructive/20 p-3 text-sm text-destructive">
 				<span className="flex-1">{errorMessage(props.error)}</span><Button variant="ghost" size="icon-sm" onClick={props.onReload}><RefreshCwIcon /></Button>
 			</div> : null}
-			{props.plan === null ? <p className="rounded-xl border border-dashed p-4 text-sm text-muted-foreground">讨论稳定后提交方案；批准前 Task 草案不会进入 Worker 队列。</p> : (
+			{props.planningError ? <div className="mb-3 rounded-lg border border-destructive/20 p-3 text-sm text-destructive">规划状态读取失败：{errorMessage(props.planningError)}</div> : null}
+			<PlanningNotice {...props} />
+			{props.plan === null ? null : (
 				<div className="grid gap-4 rounded-xl border bg-muted/20 p-4">
 					<div className="flex flex-wrap items-center gap-2"><Badge>{planStatus(props.plan)}</Badge><Badge variant="outline">Revision {props.plan.revision.revision}</Badge><span className="font-mono text-xs text-muted-foreground">{props.plan.plan.key}</span></div>
 					<div><p className="mb-1 text-xs text-muted-foreground">方案摘要</p><MarkdownContent content={props.plan.revision.summary} /></div>
@@ -67,6 +75,38 @@ export function PlanPanel(props: PlanPanelProps) {
 			)}
 		</section>
 	)
+}
+
+function PlanningNotice(props: PlanPanelProps) {
+	if (props.plan !== null && props.plan.plan.status !== 'CHANGES_REQUESTED') return null
+	if (props.planningLoading) {
+		return <p className="mb-3 rounded-xl border border-dashed p-4 text-sm text-muted-foreground">正在确认 Agent 规划状态…</p>
+	}
+	const current = props.planningRun
+	if (current && ['CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING'].includes(current.status)) {
+		return <div className="mb-3 flex items-center gap-3 rounded-xl border bg-muted/20 p-4 text-sm">
+			<LoaderCircleIcon className="size-4 shrink-0 animate-spin" />
+			<span>Agent 正在分析讨论并整理方案…</span>
+		</div>
+	}
+	if (current && ['FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'].includes(current.status)) {
+		return <div className="mb-3 flex items-start gap-3 rounded-xl border border-destructive/20 bg-destructive/5 p-4 text-sm">
+			<BotIcon className="mt-0.5 size-4 shrink-0" />
+			<div className="min-w-0 flex-1"><p>Agent 本轮规划未完成。</p>{current.failure_message ? <p className="mt-1 text-muted-foreground">{current.failure_message}</p> : null}</div>
+			<Button variant="outline" size="sm" disabled={props.requestingPlanning} onClick={() => { void props.onRequestPlanning().catch(() => undefined) }}>重新让 Agent 分析</Button>
+		</div>
+	}
+	if (current?.status === 'SUCCEEDED' && props.plan === null) {
+		return <div className="mb-3 flex items-start gap-3 rounded-xl border bg-muted/20 p-4 text-sm">
+			<BotIcon className="mt-0.5 size-4 shrink-0" />
+			<div className="min-w-0 flex-1"><p>Agent 已在讨论中回复，等待你补充信息。</p><p className="mt-1 text-muted-foreground">发送消息后会自动继续分析。</p></div>
+			<Button variant="outline" size="sm" disabled={props.requestingPlanning} onClick={() => { void props.onRequestPlanning().catch(() => undefined) }}>让 Agent 再分析</Button>
+		</div>
+	}
+	return <div className="mb-3 flex items-start gap-3 rounded-xl border border-dashed p-4 text-sm text-muted-foreground">
+		<BotIcon className="mt-0.5 size-4 shrink-0" />
+		<p>{props.workersEnabled ? '已进入规划队列，Agent 会自动读取讨论并生成可审核方案。' : 'Worker 已关闭；开启后 Agent 会自动读取讨论并整理方案。'}</p>
+	</div>
 }
 
 function PlanEditor({ current, submitting, onCancel, onSubmit }: { current: PlanView | null; submitting: boolean; onCancel: () => void; onSubmit: (input: CreatePlanRevisionInput) => Promise<void> }) {

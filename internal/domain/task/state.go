@@ -42,7 +42,7 @@ var transitions = map[Status]map[Command]Status{
 		CommandRunSucceeded: StatusReview,
 		CommandRunFailed:    StatusBlocked,
 		CommandNeedsInput:   StatusBlocked,
-		CommandCancelRun:    StatusCancelled,
+		CommandCancelRun:    StatusBlocked,
 	},
 	StatusReview: {
 		CommandAccept: StatusAccepted,

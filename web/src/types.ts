@@ -199,6 +199,118 @@ export interface RunUsageSummary extends Omit<PurposeUsage, 'purpose'> {
 	by_purpose: PurposeUsage[]
 }
 
+export const runStatuses = [
+	'CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING', 'NEEDS_INPUT',
+	'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST',
+] as const
+
+export type RunStatus = (typeof runStatuses)[number]
+
+export interface AgentRun {
+	id: string
+	purpose: RunPurpose
+	topic_id?: string
+	task_id?: string
+	status: RunStatus
+	profile_revision_id: string
+	subject_version: number
+	retry_of_run_id?: string
+	continuation_of_run_id?: string
+	agent_session_id?: string
+	session_resumed: boolean
+	lease_generation: number
+	lease_expires_at: string
+	queued_at: string
+	claimed_at: string
+	started_at?: string
+	finished_at?: string
+	exit_code?: number
+	failure_kind?: string
+	failure_code?: string
+	failure_message?: string
+	failure_retryable?: boolean
+	cancel_requested_at?: string
+	cancel_reason?: string
+	created_at: string
+	updated_at: string
+}
+
+export interface RunPage {
+	items: AgentRun[]
+	next_cursor?: string
+}
+
+export interface RunQueryInput {
+	active?: boolean
+	status?: RunStatus
+	purpose?: RunPurpose
+	task_id?: string
+	topic_id?: string
+	limit?: number
+	cursor?: string
+}
+
+export interface RunEvent {
+	id: string
+	run_id: string
+	sequence: number
+	type: string
+	payload: unknown
+	occurred_at: string
+}
+
+export interface RunUsage {
+	run_id: string
+	input_tokens?: number
+	cached_input_tokens?: number
+	cache_write_input_tokens?: number
+	output_tokens?: number
+	reasoning_output_tokens?: number
+	model_requests?: number
+	peak_input_tokens?: number
+	source: string
+	captured_at: string
+}
+
+export interface RunArtifact {
+	id: string
+	run_id: string
+	kind: string
+	relative_path: string
+	sha256: string
+	size: number
+	truncated: boolean
+	created_at: string
+}
+
+export interface RunWorkspaceSnapshot {
+	run_id: string
+	workspace_id: string
+	branch_name: string
+	target_branch: string
+	base_commit_sha: string
+	head_before: string
+	head_after: string
+	dirty_before: boolean
+	dirty_after: boolean
+	state_after: WorkspaceState
+	captured_at: string
+}
+
+export interface RunDetail {
+	run: AgentRun
+	usage?: RunUsage
+	artifacts: RunArtifact[]
+	workspace_snapshot?: RunWorkspaceSnapshot
+}
+
+export interface RunLog {
+	stream: 'stdout' | 'stderr'
+	content: string
+	size: number
+	truncated: boolean
+}
+
 export const agentRoles = ['PLANNER', 'TRIAGER', 'IMPLEMENTER', 'REVISION', 'REVIEWER'] as const
 export type AgentRole = (typeof agentRoles)[number]
 
@@ -312,6 +424,30 @@ export interface ClarificationAnswerInput {
 	selected_option_id: string
 	custom_answer: string
 	expected_version: number
+}
+
+export type ApprovalKind = 'COMMAND' | 'FILE_CHANGE' | 'NETWORK' | 'PERMISSIONS'
+export type ApprovalDecision = 'ACCEPT_ONCE' | 'ACCEPT_SESSION' | 'DECLINE' | 'CANCEL_RUN'
+
+export interface ApprovalRequest {
+	id: string
+	run_id: string
+	task_id?: string
+	item_id?: string
+	kind: ApprovalKind
+	reason?: string
+	command?: string
+	cwd?: string
+	host?: string
+	protocol?: string
+	grant_root?: string
+	available_decisions: ApprovalDecision[]
+	status: 'OPEN' | 'RESOLVED' | 'CLEARED'
+	decision?: ApprovalDecision
+	version: number
+	created_at: string
+	updated_at: string
+	resolved_at?: string
 }
 
 export type AgentProfileRevisionInput = Omit<
@@ -468,13 +604,31 @@ export interface GitBranch {
   head_sha: string
 }
 
+export interface GitRemote {
+	name: string
+	fetch_url: string
+	push_url: string
+}
+
 export interface RepositoryInfo {
+	root: string
+	git_common_dir: string
+	git_version: string
+	default_branch: string
+	remote_default_branch?: string
   current_branch: string
   head_sha: string
 	has_head: boolean
   dirty: boolean
   exact_tag?: string
+	upstream?: string
+	ahead?: number
+	behind?: number
+	user_name?: string
+	user_email?: string
+	identity_configured: boolean
   branches: GitBranch[]
+	remotes: GitRemote[]
 }
 
 export interface ChangedFile {
@@ -540,6 +694,7 @@ export interface CreateTaskInput {
   description: string
   acceptance_criteria: string
   priority: number
+	target_branch?: string
 }
 
 export interface CreateTopicInput {

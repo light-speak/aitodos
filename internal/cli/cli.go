@@ -55,11 +55,12 @@ func runRunner(ctx context.Context, args []string, stderr io.Writer) error {
 	flags.SetOutput(stderr)
 	projectRoot := flags.String("project", "", "项目根目录")
 	runID := flags.String("run", "", "Run ID")
+	runNonce := flags.String("nonce", "", "Run nonce")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
-	if flags.NArg() != 0 || *projectRoot == "" || *runID == "" {
-		return errors.New("runner 需要 --project 和 --run")
+	if flags.NArg() != 0 || *projectRoot == "" || *runID == "" || *runNonce == "" {
+		return errors.New("runner 需要 --project、--run 和 --nonce")
 	}
 	claimToken, err := readRunnerClaimToken()
 	generationText := os.Getenv("ATS_LEASE_GENERATION")
@@ -74,7 +75,7 @@ func runRunner(ctx context.Context, args []string, stderr io.Writer) error {
 	if err != nil {
 		return err
 	}
-	return runner.Execute(ctx, currentProject, *runID, claimToken, generation)
+	return runner.Execute(ctx, currentProject, *runID, claimToken, generation, *runNonce)
 }
 
 func readRunnerClaimToken() (string, error) {

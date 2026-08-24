@@ -1,7 +1,8 @@
-import { BotIcon, CircleHelpIcon, GitBranchIcon, ListTodoIcon, MessageSquareIcon, PlusIcon, Settings2Icon, SquareKanbanIcon, TagIcon } from 'lucide-react'
+import { AlertCircleIcon, BellIcon, BellOffIcon, BotIcon, CircleHelpIcon, GitBranchIcon, ListTodoIcon, LoaderCircleIcon, MessageSquareIcon, PlusIcon, Settings2Icon, SquareKanbanIcon, TagIcon } from 'lucide-react'
 
+import { errorMessage } from '../api/client'
 import { shortGitSHA } from '../lib/utils'
-import type { ProjectInfo, Release, RepositoryInfo } from '../types'
+import type { AgentRun, ProjectInfo, Release, RepositoryInfo } from '../types'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Separator } from './ui/separator'
@@ -13,16 +14,26 @@ interface AppHeaderProps {
   repository: RepositoryInfo | null
   latestRelease: Release | null
   onOpenReleases: () => void
+	onOpenRepository: () => void
 	onToggleWorkers: () => void
 	onConfigureWorkers: () => void
 	workersPending: boolean
-	clarificationCount: number
+	activeRuns: AgentRun[]
+	agentActivityError: unknown
+	onOpenRuns: () => void
+	onReloadAgentActivity: () => void
+	attentionCount: number
 	onOpenClarifications: () => void
+	notificationLabel: string
+	notificationsEnabled: boolean
+	notificationsSupported: boolean
+	notificationsBlocked: boolean
+	onToggleNotifications: () => void
   onCreate: () => void
 }
 
 export function AppHeader(props: AppHeaderProps) {
-	const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onToggleWorkers, onConfigureWorkers, workersPending, clarificationCount, onOpenClarifications, onCreate } = props
+	const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onOpenRepository, onToggleWorkers, onConfigureWorkers, workersPending, activeRuns, agentActivityError, onOpenRuns, onReloadAgentActivity, attentionCount, onOpenClarifications, notificationLabel, notificationsEnabled, notificationsSupported, notificationsBlocked, onToggleNotifications, onCreate } = props
   const branchSummary = repository === null
     ? '正在读取…'
 		: repository.has_head
@@ -46,10 +57,19 @@ export function AppHeader(props: AppHeaderProps) {
           <Separator orientation="vertical" className="h-8" />
           <Metric icon={<ListTodoIcon />} label="Tasks" value={String(taskCount)} />
           <Separator orientation="vertical" className="h-8" />
-          <Metric icon={<GitBranchIcon />} label={repository?.dirty ? 'Git · 有修改' : 'Git'} value={branchSummary} />
+			<Metric icon={<GitBranchIcon />} label={repository?.dirty ? 'Git · 有修改' : 'Git'} value={branchSummary} onClick={onOpenRepository} ariaLabel="Git 仓库信息" />
           <Separator orientation="vertical" className="h-8" />
           <Metric icon={<TagIcon />} label="Release" value={latestRelease?.tag_name ?? '尚未发布'} />
         </div>
+		{activeRuns.length > 0 ? (
+			<Button variant="secondary" size="lg" type="button" aria-label={`${activeRuns.length} 个 Agent 运行中`} onClick={onOpenRuns}>
+				<LoaderCircleIcon className="animate-spin" />{activeRuns.length} 个 Agent 运行中
+			</Button>
+		) : agentActivityError ? (
+			<Button variant="outline" size="lg" type="button" aria-label="Agent 状态未知" title={errorMessage(agentActivityError)} onClick={onReloadAgentActivity}>
+				<AlertCircleIcon />Agent 状态未知
+			</Button>
+		) : null}
 		<Button
 			variant={project?.workers_enabled ? 'default' : 'outline'}
 			size="lg"
@@ -64,10 +84,11 @@ export function AppHeader(props: AppHeaderProps) {
 		<Button variant="ghost" size="icon-lg" type="button" aria-label="配置 Workers" disabled={project === null} onClick={onConfigureWorkers}>
 			<Settings2Icon />
 		</Button>
-		<Button aria-label={clarificationCount > 0 ? `待回答 ${clarificationCount}` : '待回答'} variant={clarificationCount > 0 ? 'default' : 'outline'} size="lg" type="button" onClick={onOpenClarifications}>
-			<CircleHelpIcon />待回答
-			{clarificationCount > 0 ? <Badge variant="secondary">{clarificationCount}</Badge> : null}
+		<Button aria-label={attentionCount > 0 ? `待处理 ${attentionCount}` : '待处理'} variant={attentionCount > 0 ? 'default' : 'outline'} size="lg" type="button" onClick={onOpenClarifications}>
+			<CircleHelpIcon />待处理
+			{attentionCount > 0 ? <Badge variant="secondary">{attentionCount}</Badge> : null}
 		</Button>
+		{notificationsSupported ? <Button variant={notificationsEnabled ? 'secondary' : 'ghost'} size="icon-lg" type="button" aria-label={notificationLabel} title={notificationLabel} disabled={notificationsBlocked} onClick={onToggleNotifications}>{notificationsBlocked ? <BellOffIcon /> : <BellIcon />}</Button> : null}
         <Button variant="outline" size="lg" type="button" aria-label="Releases" onClick={onOpenReleases}>
           <TagIcon />Releases
         </Button>
@@ -81,14 +102,22 @@ export function AppHeader(props: AppHeaderProps) {
   )
 }
 
-function Metric({ icon, label, value }: { icon: React.ReactNode; label: string; value: string }) {
-  return (
-    <div className="flex min-w-20 max-w-44 items-center gap-2.5">
-      <span className="text-muted-foreground [&_svg]:size-4">{icon}</span>
+function Metric(props: { icon: React.ReactNode; label: string; value: string; onClick?: () => void; ariaLabel?: string }) {
+	const content = (
+		<>
+		<span className="text-muted-foreground [&_svg]:size-4">{props.icon}</span>
       <span className="min-w-0">
-        <span className="block truncate text-sm font-medium leading-4">{value}</span>
-        <span className="block text-[11px] leading-4 text-muted-foreground">{label}</span>
+			<span className="block truncate text-sm font-medium leading-4">{props.value}</span>
+			<span className="block text-[11px] leading-4 text-muted-foreground">{props.label}</span>
       </span>
+		</>
+	)
+	if (props.onClick) {
+		return <button className="flex min-w-20 max-w-44 items-center gap-2.5 rounded-lg text-left outline-none hover:text-foreground focus-visible:ring-3 focus-visible:ring-ring/50" type="button" aria-label={props.ariaLabel} onClick={props.onClick}>{content}</button>
+	}
+	return (
+		<div className="flex min-w-20 max-w-44 items-center gap-2.5">
+			{content}
     </div>
   )
 }

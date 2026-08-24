@@ -176,6 +176,33 @@ func TestInitializeRejectsDirectoryOutsideGitRepository(t *testing.T) {
 	}
 }
 
+func TestInitializePrefersConventionalBranchOverCurrentFeatureBranch(t *testing.T) {
+	repoRoot := t.TempDir()
+	command := exec.Command("git", "init", "--quiet", "--initial-branch=feature/current", repoRoot)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v: %s", err, output)
+	}
+	for _, args := range [][]string{
+		{"config", "user.name", "AiTodos Test"},
+		{"config", "user.email", "aitodos@example.invalid"},
+		{"commit", "--allow-empty", "--quiet", "-m", "initial"},
+		{"branch", "main"},
+	} {
+		command = exec.Command("git", append([]string{"-C", repoRoot}, args...)...)
+		if output, err := command.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v: %s", args, err, output)
+		}
+	}
+
+	initialized, _, err := Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if initialized.Config.DefaultBranch != "main" {
+		t.Fatalf("default branch = %q, want main", initialized.Config.DefaultBranch)
+	}
+}
+
 func initGitRepository(t *testing.T) string {
 	t.Helper()
 
@@ -212,7 +239,7 @@ func assertDatabaseInitialized(t *testing.T, databasePath string, instanceID str
 	if err := database.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 20 {
-		t.Fatalf("schema version = %d, want 20", version)
+	if version != 28 {
+		t.Fatalf("schema version = %d, want 28", version)
 	}
 }

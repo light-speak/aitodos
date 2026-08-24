@@ -117,6 +117,40 @@ func TestTaskStoreRejectsStaleVersionWithoutPartialWrite(t *testing.T) {
 	}
 }
 
+func TestTaskStoreUpdatesTargetBranchBeforeWorkspaceOnly(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewTaskStore(database)
+	created, err := store.Create(ctx, task.CreateInput{Title: "选择发布分支", TargetBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	updated, err := store.UpdateTargetBranch(ctx, created.ID, created.Version, "release/macos")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.TargetBranch != "release/macos" || updated.Version != 2 || updated.AssessmentInputVersion != 2 {
+		t.Fatalf("updated task = %#v", updated)
+	}
+	events, err := store.ListEvents(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(events) != 2 || events[1].Type != task.EventTargetBranchChanged {
+		t.Fatalf("events = %#v", events)
+	}
+
+	_, err = database.ExecContext(ctx, `UPDATE tasks SET current_workspace_id = 'workspace-1' WHERE id = ?`, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = store.UpdateTargetBranch(ctx, created.ID, updated.Version, "main")
+	if !errors.Is(err, ErrTaskWorkspaceExists) {
+		t.Fatalf("UpdateTargetBranch() error = %v, want ErrTaskWorkspaceExists", err)
+	}
+}
+
 func TestTaskStoreReturnsNotFound(t *testing.T) {
 	store := NewTaskStore(openTaskTestDatabase(t))
 	_, err := store.Get(context.Background(), "missing")

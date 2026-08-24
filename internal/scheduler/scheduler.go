@@ -15,6 +15,7 @@ import (
 
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/runner"
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
@@ -22,11 +23,13 @@ type launchClaim struct {
 	RunID           string
 	ClaimToken      string
 	LeaseGeneration int64
+	RunNonce        string
 }
 
 // Scheduler 只调度当前项目，不创建跨项目全局队列。
 type Scheduler struct {
 	project    *project.Project
+	database   *sql.DB
 	runs       *storage.RunStore
 	executable string
 	execError  error
@@ -37,7 +40,7 @@ type Scheduler struct {
 func New(currentProject *project.Project, database *sql.DB) *Scheduler {
 	executable, err := os.Executable()
 	scheduler := &Scheduler{
-		project: currentProject, runs: storage.NewRunStore(database),
+		project: currentProject, database: database, runs: storage.NewRunStore(database),
 		executable: executable, execError: err,
 	}
 	scheduler.launch = scheduler.launchRunner
@@ -73,7 +76,7 @@ func (scheduler *Scheduler) DispatchOnce(ctx context.Context) error {
 	}
 	launch := launchClaim{
 		RunID: claim.Run.ID, ClaimToken: claim.ClaimToken,
-		LeaseGeneration: claim.Run.LeaseGeneration,
+		LeaseGeneration: claim.Run.LeaseGeneration, RunNonce: claim.Run.RunNonce,
 	}
 	if err := scheduler.launch(ctx, launch); err != nil {
 		scheduler.failUnstartedRun(launch, "RUNNER_SPAWN_FAILED", err)
@@ -93,7 +96,7 @@ func (scheduler *Scheduler) launchRunner(_ context.Context, claim launchClaim) e
 	defer claimReader.Close()
 	defer claimWriter.Close()
 	command := exec.Command(scheduler.executable,
-		"runner", "--project", scheduler.project.Root, "--run", claim.RunID,
+		"runner", "--project", scheduler.project.Root, "--run", claim.RunID, "--nonce", claim.RunNonce,
 	)
 	command.Dir = scheduler.project.Root
 	command.ExtraFiles = []*os.File{claimReader}
@@ -125,11 +128,17 @@ func (scheduler *Scheduler) waitAndReconcile(command *exec.Cmd, claim launchClai
 	if err != nil || !activeRunStatus(current.Status) {
 		return
 	}
+	if current.Status == domainrun.StatusFinalizing {
+		recovery := storage.RecoveryRun{Run: current, RunNonce: current.RunNonce}
+		if err := runner.RecoverFinalization(context.Background(), scheduler.project, scheduler.database, recovery); err == nil {
+			return
+		}
+	}
 	message := "Runner 进程在 Finalization 前退出"
 	if waitErr != nil {
 		message = waitErr.Error()
 	}
-	scheduler.failUnstartedRun(claim, "RUNNER_LOST", errors.New(message))
+	_, _ = scheduler.runs.RecoverLost(context.Background(), claim.RunID, claim.LeaseGeneration, "RUNNER_LOST", message)
 }
 
 func (scheduler *Scheduler) failUnstartedRun(claim launchClaim, code string, cause error) {
