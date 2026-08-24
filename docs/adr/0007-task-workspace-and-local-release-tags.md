@@ -2,7 +2,7 @@
 
 - 状态：Accepted
 - 日期：2026-08-19
-- 更新：2026-08-20
+- 更新：2026-08-21
 
 ## 背景
 
@@ -30,6 +30,9 @@ Task 的数据库 `version` 是乐观锁修订号，不是软件版本。若 UI 
 12. 文件清单相对 Workspace Base Commit 计算，完整单文件 Diff 仅在人类点击时读取，最大返回 512 KiB；不写入主数据库、不默认展开。
 13. 正式 Task 自动进入 `READY`；Scheduler 在第一次写入型 Run Claim 后、启动 Runner 前自动且幂等地准备 Workspace。普通 UI 不提供“创建 Workspace”按钮；路径、Branch 和 SHA 只作为技术详情展示。仓库无首个 Commit 或 Workspace 身份不可信时不得启动 Agent，并返回可操作错误。
 14. 创建 Release 时，根据最新通过 Review 的 Commit 是否为 Release Commit 的 Git 祖先，自动关联能够证明已包含的 Task；无法证明的 Task 不自动关联。
+15. `ats init` 选择默认分支时，依次采用本地已知的 Remote HEAD、常规本地分支 `main/master/trunk/develop`、当前分支，避免在已有主分支时把初始化时恰好 checkout 的 feature 分支静默设为默认分支。
+16. 创建 Task 时可以从本地分支列表选择 `target_branch`。Workspace 创建前允许通过乐观锁领域命令修改，并记录 `TASK_TARGET_BRANCH_CHANGED`；一旦绑定 Workspace 就不可修改。创建与修改入口都必须验证该名称是已有 Commit 的本地 Branch，不接受 Remote-only Branch。
+17. Git 仓库面板只读取本地事实：仓库路径、`gitCommonDir`、Git 版本、默认分支、当前 Branch/HEAD/dirty、Upstream、ahead/behind、本地 Branch、Git 身份和 Remote。读取不触发 fetch；Remote URL 移除 URL UserInfo、Query 和 Fragment 后才返回 UI，系统仍不自动 push。
 
 ## 备选方案
 
@@ -56,6 +59,8 @@ Task 的数据库 `version` 是乐观锁修订号，不是软件版本。若 UI 
 ## 后果
 
 - 用户能从 Task 详情看到真实 Git 工作身份，从 Release 面板看到版本、来源分支和固定 Commit。
+- 用户在 Task 创建时即可确认目标分支，并且只有在系统尚未创建 Workspace 时才能调整；目标分支变化会让已有任务评估标记为过期。
+- Repository 面板中的 Upstream、ahead/behind 和 Remote HEAD 都是本地 Git 记录，可能落后于远端服务器；刷新面板不会执行网络操作。
 - 创建 Release 前必须确保目标内容已经提交到所选来源分支，并配置本地 Git 用户信息以创建 annotated tag。
 - Release 与可选 Task 关联只用于审计，当前不证明 Task 修改已经合入 Commit。
-- Workspace/Release 数据使用 Schema v7/v8 持久化，人工 Review 使用 Schema v9；Git 操作失败不会丢失恢复所需事实。
+- Workspace/Release 数据使用 Schema v7/v8 持久化，人工 Review 使用 Schema v9，目标分支审计事件使用 Schema v21；Git 操作失败不会丢失恢复所需事实。

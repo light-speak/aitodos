@@ -2,6 +2,7 @@
 package httpapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -21,6 +22,12 @@ type taskHandler struct {
 	discussion  *storage.DiscussionStore
 	relations   *storage.RelationStore
 	assessments *storage.AssessmentStore
+	branches    TargetBranchValidator
+}
+
+// TargetBranchValidator 校验 Task 创建时选择的本地目标分支。
+type TargetBranchValidator interface {
+	ValidateTargetBranch(context.Context, string) error
 }
 
 type createTaskRequest struct {
@@ -34,6 +41,10 @@ type createTaskRequest struct {
 type updateTaskTitleRequest struct {
 	Title           string `json:"title"`
 	ExpectedVersion int64  `json:"expected_version"`
+}
+
+type retryTaskRequest struct {
+	ExpectedVersion int64 `json:"expected_version"`
 }
 
 type taskListItem struct {
@@ -58,15 +69,17 @@ func RegisterTaskRoutes(
 	discussionStore *storage.DiscussionStore,
 	relationStore *storage.RelationStore,
 	assessmentStore *storage.AssessmentStore,
+	branchValidator TargetBranchValidator,
 ) {
 	handler := &taskHandler{
 		store: store, discussion: discussionStore, relations: relationStore,
-		assessments: assessmentStore,
+		assessments: assessmentStore, branches: branchValidator,
 	}
 	mux.HandleFunc("POST /api/tasks", handler.create)
 	mux.HandleFunc("GET /api/tasks", handler.list)
 	mux.HandleFunc("GET /api/tasks/{taskID}", handler.get)
 	mux.HandleFunc("PUT /api/tasks/{taskID}/title", handler.updateTitle)
+	mux.HandleFunc("POST /api/tasks/{taskID}/retry", handler.retry)
 	mux.HandleFunc("GET /api/tasks/{taskID}/messages", handler.listMessages)
 	mux.HandleFunc("POST /api/tasks/{taskID}/messages", handler.createMessage)
 	mux.HandleFunc("GET /api/tasks/{taskID}/relations", handler.listRelations)
@@ -75,6 +88,20 @@ func RegisterTaskRoutes(
 	mux.HandleFunc("GET /api/tasks/{taskID}/topics", handler.listTopics)
 	mux.HandleFunc("POST /api/tasks/{taskID}/topics", handler.createTopicRelation)
 	mux.HandleFunc("DELETE /api/tasks/{taskID}/topics/{topicID}", handler.deleteTopicRelation)
+}
+
+func (handler *taskHandler) retry(response http.ResponseWriter, request *http.Request) {
+	var body retryTaskRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "重新排队请求格式无效")
+		return
+	}
+	updated, err := handler.store.RetryBlocked(request.Context(), request.PathValue("taskID"), body.ExpectedVersion)
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
 }
 
 func (handler *taskHandler) updateTitle(response http.ResponseWriter, request *http.Request) {
@@ -210,6 +237,12 @@ func (handler *taskHandler) create(response http.ResponseWriter, request *http.R
 		Title: body.Title, Description: body.Description, AcceptanceCriteria: body.AcceptanceCriteria,
 		Priority: priority, TargetBranch: body.TargetBranch,
 	}
+	if input.TargetBranch != "" {
+		if handler.branches == nil || handler.branches.ValidateTargetBranch(request.Context(), input.TargetBranch) != nil {
+			writeError(response, http.StatusBadRequest, "INVALID_TARGET_BRANCH", "目标分支必须是当前仓库中已有 Commit 的本地分支")
+			return
+		}
+	}
 	if err := input.Validate(); err != nil {
 		writeError(response, http.StatusBadRequest, "INVALID_TASK", err.Error())
 		return
@@ -262,6 +295,8 @@ func writeTaskError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusNotFound, "TOPIC_NOT_FOUND", "Topic 不存在")
 	case errors.Is(err, storage.ErrTaskVersionConflict):
 		writeError(response, http.StatusConflict, "TASK_VERSION_CONFLICT", "Task 已被更新，请刷新后重试")
+	case errors.Is(err, storage.ErrTaskRetryRequiresAnswer):
+		writeError(response, http.StatusConflict, "CLARIFICATION_ANSWER_REQUIRED", "请先回答 Agent 的结构化问题，再继续执行")
 	case errors.Is(err, storage.ErrSelfTaskLink):
 		writeError(response, http.StatusBadRequest, "INVALID_RELATION", "Task 不能关联自身")
 	default:

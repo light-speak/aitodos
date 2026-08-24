@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"strings"
 	"testing"
 	"time"
 
@@ -108,7 +109,7 @@ func startTriageRun(t *testing.T, database *sql.DB) run.Claim {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, time.Hour); err != nil {
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {

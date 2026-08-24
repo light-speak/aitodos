@@ -16,8 +16,10 @@ import (
 
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
+	"github.com/light-speak/aitodos/internal/domain/plan"
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
 )
 
 var (
@@ -33,6 +35,10 @@ var (
 	ErrRunNotFound = errors.New("run not found")
 	// ErrRunUsageNotFound 表示指定 Run 尚未采集到实际用量。
 	ErrRunUsageNotFound = errors.New("run usage not found")
+	// ErrRunWorkspaceSnapshotNotFound 表示 Run 尚未完成 Workspace Finalization。
+	ErrRunWorkspaceSnapshotNotFound = errors.New("run workspace snapshot not found")
+	// ErrRunArtifactNotFound 表示 Run 没有指定类型的 Artifact。
+	ErrRunArtifactNotFound = errors.New("run artifact not found")
 )
 
 // RunFinish 描述 Runner 提交的终态和结构化失败。
@@ -45,12 +51,47 @@ type RunFinish struct {
 	FailureRetryable *bool
 }
 
+// FinalizationIntent 在 Agent 退出后、Workspace 收尾前冻结预期终态，供崩溃恢复幂等重放。
+type FinalizationIntent struct {
+	Finish        RunFinish
+	Clarification *clarification.Request
+	Planning      *plan.PlanningResult
+}
+
+// RecoveryRun 是 Recovery Manager 校验旧 Runner 所需的最小进程身份快照。
+type RecoveryRun struct {
+	Run            domainrun.Run
+	RunnerPID      int
+	RunnerIdentity string
+	RunNonce       string
+}
+
+// RunQuery 是项目内 Run 历史的有界筛选条件。
+type RunQuery struct {
+	TaskID      string
+	TopicID     string
+	ActiveOnly  bool
+	Status      domainrun.Status
+	Purpose     domainrun.Purpose
+	BeforeTime  time.Time
+	BeforeRunID string
+	Limit       int
+}
+
+// RunPage 返回一页稳定排序的 Run 和是否存在下一页。
+type RunPage struct {
+	Items   []domainrun.Run
+	HasMore bool
+}
+
 const runColumns = `
 id, purpose, COALESCE(topic_id, ''), COALESCE(task_id, ''), status,
 profile_revision_id, COALESCE(retry_of_run_id, ''), COALESCE(continuation_of_run_id, ''), lease_generation,
 lease_expires_at, queued_at, claimed_at,
 COALESCE(started_at, ''), COALESCE(finished_at, ''), created_at, updated_at,
-subject_version`
+subject_version, exit_code, failure_kind, failure_code, failure_message, failure_retryable,
+COALESCE(cancel_requested_at, ''), cancel_reason,
+COALESCE(agent_session_id, ''), session_resumed, run_nonce`
 
 // RunStore 原子领取 Task 并持久化 Run 生命周期。
 type RunStore struct {
@@ -78,7 +119,7 @@ func (store *RunStore) FinishNeedsInput(
 	if err != nil {
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
-	if (current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting) ||
+	if (current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusFinalizing) ||
 		(current.Purpose != domainrun.PurposeImplementation && current.Purpose != domainrun.PurposeRevision) {
 		return domainrun.Run{}, clarification.Clarification{}, ErrRunStateConflict
 	}
@@ -95,7 +136,7 @@ func (store *RunStore) FinishNeedsInput(
 	now := time.Now().UTC()
 	result, err := transaction.ExecContext(ctx, `
 UPDATE runs SET status = 'NEEDS_INPUT', finished_at = ?, exit_code = 0, updated_at = ?
-WHERE id = ? AND status IN ('STARTING', 'RUNNING') AND lease_generation = ?`,
+WHERE id = ? AND status IN ('STARTING', 'RUNNING', 'FINALIZING') AND lease_generation = ?`,
 		formatTime(now), formatTime(now), runID, leaseGeneration)
 	if err != nil {
 		return domainrun.Run{}, clarification.Clarification{}, fmt.Errorf("finish run for clarification: %w", err)
@@ -103,7 +144,12 @@ WHERE id = ? AND status IN ('STARTING', 'RUNNING') AND lease_generation = ?`,
 	if err := requireSingleChange(result); err != nil {
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
+	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, current.Status, domainrun.StatusNeedsInput, ""); err != nil {
+		return domainrun.Run{}, clarification.Clarification{}, err
+	}
 	current.Status = domainrun.StatusNeedsInput
+	exitCode := 0
+	current.ExitCode = &exitCode
 	current.FinishedAt = now
 	current.UpdatedAt = now
 	if err := transaction.Commit(); err != nil {
@@ -115,6 +161,74 @@ WHERE id = ? AND status IN ('STARTING', 'RUNNING') AND lease_generation = ?`,
 // NewRunStore 创建 Run 持久化服务。
 func NewRunStore(database *sql.DB) *RunStore {
 	return &RunStore{database: database}
+}
+
+// RequestCancel 只记录取消意图；Runner 确认 Agent 进程组退出并完成 Finalization 后才能写 CANCELLED 终态。
+func (store *RunStore) RequestCancel(ctx context.Context, runID string, reason string) (domainrun.Run, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" {
+		reason = "用户请求取消当前 Run"
+	}
+	if len([]rune(reason)) > 1000 {
+		return domainrun.Run{}, errors.New("cancel reason must not exceed 1000 characters")
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("begin request run cancel: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getRun(ctx, transaction, runID)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if current.CancelRequestedAt != nil {
+		return current, nil
+	}
+	if current.Status != domainrun.StatusClaimed && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusRunning {
+		return domainrun.Run{}, ErrRunStateConflict
+	}
+	now := time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
+WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING') AND cancel_requested_at IS NULL`,
+		formatTime(now), reason, formatTime(now), runID)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("request run cancel: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := appendRunEvent(ctx, transaction, runID, domainrun.EventCancelRequested, map[string]any{
+		"schema_version": 1, "reason": reason,
+	}); err != nil {
+		return domainrun.Run{}, err
+	}
+	current.CancelRequestedAt = &now
+	current.CancelReason = reason
+	current.UpdatedAt = now
+	if err := transaction.Commit(); err != nil {
+		return domainrun.Run{}, fmt.Errorf("commit request run cancel: %w", err)
+	}
+	return current, nil
+}
+
+// CancellationRequested 让当前持有 fencing token 的 Runner 检查取消意图。
+func (store *RunStore) CancellationRequested(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+) (bool, error) {
+	transaction, err := store.database.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return false, fmt.Errorf("begin read run cancellation: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration)
+	if err != nil {
+		return false, err
+	}
+	return current.CancelRequestedAt != nil, nil
 }
 
 // ClaimNextTask 按“修订优先、P0-P3、FIFO”领取一个 Task。
@@ -133,7 +247,7 @@ func (store *RunStore) ClaimNextTask(ctx context.Context, maxWorkers int, leaseD
 	if err := ensureRunCapacity(ctx, transaction, maxWorkers); err != nil {
 		return domainrun.Claim{}, err
 	}
-	selected, err := selectRunnableTask(ctx, transaction)
+	selected, err := selectRunnableWork(ctx, transaction)
 	if err != nil {
 		return domainrun.Claim{}, err
 	}
@@ -141,13 +255,23 @@ func (store *RunStore) ClaimNextTask(ctx context.Context, maxWorkers int, leaseD
 	if err != nil {
 		return domainrun.Claim{}, err
 	}
+	claim.Run.AgentSessionID, err = findCompatibleAgentSession(ctx, transaction, selected)
+	if err != nil {
+		return domainrun.Claim{}, err
+	}
+	claim.Run.SessionResumed = claim.Run.AgentSessionID != ""
 	if err := insertClaimedRun(ctx, transaction, claim); err != nil {
+		return domainrun.Claim{}, err
+	}
+	if _, err := appendRunEvent(ctx, transaction, claim.Run.ID, domainrun.EventClaimed, map[string]any{
+		"schema_version": 1, "status": claim.Run.Status, "purpose": claim.Run.Purpose,
+	}); err != nil {
 		return domainrun.Claim{}, err
 	}
 	if err := createRunToolPolicySnapshot(ctx, transaction, claim.Run.ID, claim.Run.ProfileRevisionID); err != nil {
 		return domainrun.Claim{}, err
 	}
-	if selected.Purpose != domainrun.PurposeTriage {
+	if claim.Run.TaskID != "" && selected.Purpose != domainrun.PurposeTriage {
 		if err := claimTask(ctx, transaction, selected, claim.Run); err != nil {
 			return domainrun.Claim{}, err
 		}
@@ -180,9 +304,195 @@ FROM runs WHERE task_id = ? ORDER BY created_at DESC`, taskID)
 	return runs, nil
 }
 
+// Query 按 created_at 和 id 倒序分页查询当前项目 Run。
+func (store *RunStore) Query(ctx context.Context, query RunQuery) (RunPage, error) {
+	if query.Limit < 1 || query.Limit > 100 {
+		return RunPage{}, errors.New("run query limit must be between 1 and 100")
+	}
+	conditions := []string{"1 = 1"}
+	arguments := make([]any, 0, 7)
+	if query.TaskID != "" {
+		conditions = append(conditions, "task_id = ?")
+		arguments = append(arguments, query.TaskID)
+	}
+	if query.TopicID != "" {
+		conditions = append(conditions, "topic_id = ?")
+		arguments = append(arguments, query.TopicID)
+	}
+	if query.ActiveOnly {
+		conditions = append(conditions, "status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')")
+	}
+	if query.Status != "" {
+		conditions = append(conditions, "status = ?")
+		arguments = append(arguments, query.Status)
+	}
+	if query.Purpose != "" {
+		conditions = append(conditions, "purpose = ?")
+		arguments = append(arguments, query.Purpose)
+	}
+	if !query.BeforeTime.IsZero() {
+		if query.BeforeRunID == "" {
+			return RunPage{}, errors.New("run query cursor ID is required")
+		}
+		conditions = append(conditions, "(created_at < ? OR (created_at = ? AND id < ?))")
+		formatted := formatTime(query.BeforeTime)
+		arguments = append(arguments, formatted, formatted, query.BeforeRunID)
+	}
+	arguments = append(arguments, query.Limit+1)
+	rows, err := store.database.QueryContext(ctx, `SELECT `+runColumns+`
+FROM runs WHERE `+strings.Join(conditions, " AND ")+`
+ORDER BY created_at DESC, id DESC LIMIT ?`, arguments...)
+	if err != nil {
+		return RunPage{}, fmt.Errorf("query runs: %w", err)
+	}
+	defer rows.Close()
+	items := make([]domainrun.Run, 0, query.Limit+1)
+	for rows.Next() {
+		item, scanErr := scanRun(rows)
+		if scanErr != nil {
+			return RunPage{}, scanErr
+		}
+		items = append(items, item)
+	}
+	if err := rows.Err(); err != nil {
+		return RunPage{}, fmt.Errorf("iterate queried runs: %w", err)
+	}
+	hasMore := len(items) > query.Limit
+	if hasMore {
+		items = items[:query.Limit]
+	}
+	return RunPage{Items: items, HasMore: hasMore}, nil
+}
+
+// ListEvents 返回指定 sequence 之后的 Run Event，供查询和 SSE 断线续传复用。
+func (store *RunStore) ListEvents(ctx context.Context, runID string, afterSequence int64, limit int) ([]domainrun.Event, error) {
+	if afterSequence < 0 {
+		return nil, errors.New("run event sequence must not be negative")
+	}
+	if limit < 1 || limit > 500 {
+		return nil, errors.New("run event limit must be between 1 and 500")
+	}
+	rows, err := store.database.QueryContext(ctx, `
+SELECT id, run_id, sequence, event_type, payload_json, occurred_at
+FROM run_events WHERE run_id = ? AND sequence > ? ORDER BY sequence LIMIT ?`, runID, afterSequence, limit)
+	if err != nil {
+		return nil, fmt.Errorf("list run events: %w", err)
+	}
+	defer rows.Close()
+	events := make([]domainrun.Event, 0)
+	for rows.Next() {
+		var event domainrun.Event
+		var payload, occurredAt string
+		if err := rows.Scan(&event.ID, &event.RunID, &event.Sequence, &event.Type, &payload, &occurredAt); err != nil {
+			return nil, fmt.Errorf("scan run event: %w", err)
+		}
+		event.Payload = json.RawMessage(payload)
+		event.OccurredAt, err = parseTime(occurredAt)
+		if err != nil {
+			return nil, err
+		}
+		events = append(events, event)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate run events: %w", err)
+	}
+	return events, nil
+}
+
 // Get 按 ID 返回 Run 当前状态。
 func (store *RunStore) Get(ctx context.Context, runID string) (domainrun.Run, error) {
 	return getRun(ctx, store.database, runID)
+}
+
+// ListRecoveryRuns 返回 Daemon 启动时仍处于非终态的 Run 及其 Runner 身份。
+func (store *RunStore) ListRecoveryRuns(ctx context.Context) ([]RecoveryRun, error) {
+	rows, err := store.database.QueryContext(ctx, `
+SELECT id, COALESCE(runner_pid, 0), runner_identity, run_nonce
+FROM runs WHERE status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')
+ORDER BY created_at, id`)
+	if err != nil {
+		return nil, fmt.Errorf("list recovery runs: %w", err)
+	}
+	defer rows.Close()
+	result := make([]RecoveryRun, 0)
+	for rows.Next() {
+		var item RecoveryRun
+		if err := rows.Scan(&item.Run.ID, &item.RunnerPID, &item.RunnerIdentity, &item.RunNonce); err != nil {
+			return nil, err
+		}
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	for index := range result {
+		result[index].Run, err = store.Get(ctx, result[index].Run.ID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	return result, nil
+}
+
+// RecoverLost 在 Recovery Manager 证明旧 Runner 不存在后，将不明确执行标为 LOST。
+func (store *RunStore) RecoverLost(
+	ctx context.Context,
+	runID string,
+	leaseGeneration int64,
+	code string,
+	message string,
+) (domainrun.Run, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("begin recover lost run: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getRun(ctx, transaction, runID)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if current.LeaseGeneration != leaseGeneration {
+		return domainrun.Run{}, ErrRunClaimMismatch
+	}
+	if current.Status != domainrun.StatusClaimed && current.Status != domainrun.StatusStarting &&
+		current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusFinalizing {
+		return current, nil
+	}
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+		if err := finishTaskRun(ctx, transaction, current, domainrun.StatusLost); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	now := time.Now().UTC()
+	retryable := false
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET status = 'LOST', finished_at = ?, exit_code = -1,
+    failure_kind = 'INFRASTRUCTURE', failure_code = ?, failure_message = ?,
+    failure_retryable = ?, updated_at = ?
+WHERE id = ? AND lease_generation = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')`,
+		formatTime(now), code, message, retryable, formatTime(now), runID, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("recover lost run: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := clearOpenApprovals(ctx, transaction, runID, now); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := appendRunStatusEvent(ctx, transaction, runID, current.Status, domainrun.StatusLost, code); err != nil {
+		return domainrun.Run{}, err
+	}
+	current.Status, current.FinishedAt, current.UpdatedAt = domainrun.StatusLost, now, now
+	current.ExitCode, current.FailureKind, current.FailureCode = intPointer(-1), "INFRASTRUCTURE", code
+	current.FailureMessage, current.FailureRetryable = message, &retryable
+	if err := transaction.Commit(); err != nil {
+		return domainrun.Run{}, fmt.Errorf("commit recovered lost run: %w", err)
+	}
+	return current, nil
 }
 
 // GetToolPolicySnapshot 返回 Run 创建时固化的能力范围并校验内容哈希。
@@ -418,6 +728,57 @@ VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, created.ID, created.RunID, created.Kind,
 	return created, nil
 }
 
+// ListArtifacts 按类型返回一个 Run 的 Artifact 索引。
+func (store *RunStore) ListArtifacts(ctx context.Context, runID string) ([]domainrun.Artifact, error) {
+	rows, err := store.database.QueryContext(ctx, `
+SELECT id, run_id, kind, relative_path, sha256, size, truncated, created_at
+FROM run_artifacts WHERE run_id = ? ORDER BY kind`, runID)
+	if err != nil {
+		return nil, fmt.Errorf("list run artifacts: %w", err)
+	}
+	defer rows.Close()
+	result := make([]domainrun.Artifact, 0)
+	for rows.Next() {
+		artifact, scanErr := scanRunArtifact(rows)
+		if scanErr != nil {
+			return nil, scanErr
+		}
+		result = append(result, artifact)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate run artifacts: %w", err)
+	}
+	return result, nil
+}
+
+// GetArtifact 返回一个 Run 的指定类型 Artifact。
+func (store *RunStore) GetArtifact(ctx context.Context, runID, kind string) (domainrun.Artifact, error) {
+	artifact, err := scanRunArtifact(store.database.QueryRowContext(ctx, `
+SELECT id, run_id, kind, relative_path, sha256, size, truncated, created_at
+FROM run_artifacts WHERE run_id = ? AND kind = ?`, runID, kind))
+	if errors.Is(err, sql.ErrNoRows) {
+		return domainrun.Artifact{}, ErrRunArtifactNotFound
+	}
+	return artifact, err
+}
+
+func scanRunArtifact(scanner rowScanner) (domainrun.Artifact, error) {
+	var artifact domainrun.Artifact
+	var truncated int
+	var createdAt string
+	if err := scanner.Scan(&artifact.ID, &artifact.RunID, &artifact.Kind, &artifact.RelativePath,
+		&artifact.SHA256, &artifact.Size, &truncated, &createdAt); err != nil {
+		return domainrun.Artifact{}, err
+	}
+	artifact.Truncated = truncated == 1
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return domainrun.Artifact{}, fmt.Errorf("parse run artifact time: %w", err)
+	}
+	artifact.CreatedAt = parsed
+	return artifact, nil
+}
+
 func validArtifactKind(kind string) bool {
 	switch kind {
 	case "PROMPT", "CONTEXT_MANIFEST", "STDOUT", "STDERR", "RESULT":
@@ -434,8 +795,12 @@ func (store *RunStore) Start(
 	claimToken string,
 	leaseGeneration int64,
 	runnerPID int,
+	runnerIdentity string,
 	leaseDuration time.Duration,
 ) (domainrun.Run, error) {
+	if runnerPID < 1 || len(runnerIdentity) != 64 {
+		return domainrun.Run{}, errors.New("invalid runner process identity")
+	}
 	transaction, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
 		return domainrun.Run{}, fmt.Errorf("begin run start: %w", err)
@@ -454,11 +819,11 @@ func (store *RunStore) Start(
 	current.UpdatedAt = now
 	current.LeaseExpiresAt = now.Add(leaseDuration)
 	result, err := transaction.ExecContext(ctx, `
-UPDATE runs SET status = ?, runner_pid = ?, runner_started_at = ?, started_at = ?,
-                lease_expires_at = ?, updated_at = ?
+UPDATE runs SET status = ?, runner_pid = ?, runner_started_at = ?, runner_identity = ?,
+                started_at = ?, lease_expires_at = ?, lease_heartbeat_at = ?, updated_at = ?
 WHERE id = ? AND status = 'CLAIMED' AND lease_generation = ?`,
-		current.Status, runnerPID, formatTime(now), formatTime(now),
-		formatTime(current.LeaseExpiresAt), formatTime(now), runID, leaseGeneration,
+		current.Status, runnerPID, formatTime(now), runnerIdentity, formatTime(now),
+		formatTime(current.LeaseExpiresAt), formatTime(now), formatTime(now), runID, leaseGeneration,
 	)
 	if err != nil {
 		return domainrun.Run{}, fmt.Errorf("start run: %w", err)
@@ -466,10 +831,50 @@ WHERE id = ? AND status = 'CLAIMED' AND lease_generation = ?`,
 	if err := requireSingleChange(result); err != nil {
 		return domainrun.Run{}, err
 	}
+	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, domainrun.StatusClaimed, domainrun.StatusStarting, ""); err != nil {
+		return domainrun.Run{}, err
+	}
 	if err := transaction.Commit(); err != nil {
 		return domainrun.Run{}, fmt.Errorf("commit run start: %w", err)
 	}
 	return current, nil
+}
+
+// RenewLease 由持有 fencing token 的 Runner 定期续租；失败后 Runner 必须停止 Agent。
+func (store *RunStore) RenewLease(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+	leaseDuration time.Duration,
+) error {
+	if leaseDuration <= 0 {
+		return errors.New("lease duration must be positive")
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin renew run lease: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	if current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusFinalizing {
+		return ErrRunStateConflict
+	}
+	now := time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET lease_expires_at = ?, lease_heartbeat_at = ?, updated_at = ?
+WHERE id = ? AND lease_generation = ? AND status IN ('STARTING', 'RUNNING', 'FINALIZING')`,
+		formatTime(now.Add(leaseDuration)), formatTime(now), formatTime(now), runID, leaseGeneration)
+	if err != nil {
+		return fmt.Errorf("renew run lease: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return err
+	}
+	return transaction.Commit()
 }
 
 // MarkRunning 在 Workspace 和 Context 准备完成后进入 Agent 执行阶段。
@@ -502,12 +907,369 @@ WHERE id = ? AND status = 'STARTING' AND lease_generation = ?`,
 	if err := requireSingleChange(result); err != nil {
 		return domainrun.Run{}, err
 	}
+	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, domainrun.StatusStarting, domainrun.StatusRunning, ""); err != nil {
+		return domainrun.Run{}, err
+	}
 	current.Status = domainrun.StatusRunning
 	current.UpdatedAt = now
 	if err := transaction.Commit(); err != nil {
 		return domainrun.Run{}, fmt.Errorf("commit mark run running: %w", err)
 	}
 	return current, nil
+}
+
+// MarkFinalizing 在 Agent 退出后进入 Artifact、Result 和 Workspace 收尾阶段。
+func (store *RunStore) MarkFinalizing(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+) (domainrun.Run, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("begin mark run finalizing: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if current.Status != domainrun.StatusRunning {
+		return domainrun.Run{}, ErrRunStateConflict
+	}
+	now := time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET status = 'FINALIZING', updated_at = ?
+WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?`, formatTime(now), runID, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("mark run finalizing: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, domainrun.StatusRunning, domainrun.StatusFinalizing, ""); err != nil {
+		return domainrun.Run{}, err
+	}
+	current.Status = domainrun.StatusFinalizing
+	current.UpdatedAt = now
+	if err := transaction.Commit(); err != nil {
+		return domainrun.Run{}, fmt.Errorf("commit mark run finalizing: %w", err)
+	}
+	return current, nil
+}
+
+// BeginFinalization 原子冻结预期终态并进入 FINALIZING。
+func (store *RunStore) BeginFinalization(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+	intent FinalizationIntent,
+) (domainrun.Run, error) {
+	payload, err := validateFinalizationIntent(intent)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("begin run finalization: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if current.Status != domainrun.StatusRunning {
+		return domainrun.Run{}, ErrRunStateConflict
+	}
+	if err := validateFinalizationSubject(current, intent); err != nil {
+		return domainrun.Run{}, err
+	}
+	now := time.Now().UTC()
+	_, err = transaction.ExecContext(ctx, `
+INSERT INTO run_finalization_intents(
+    run_id, terminal_status, exit_code, failure_kind, failure_code,
+    failure_message, failure_retryable, clarification_json, planning_result_json, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		runID, intent.Finish.Status, intent.Finish.ExitCode, intent.Finish.FailureKind,
+		intent.Finish.FailureCode, intent.Finish.FailureMessage, nullableBool(intent.Finish.FailureRetryable),
+		payload.ClarificationJSON, payload.PlanningJSON, formatTime(now))
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("record finalization intent: %w", err)
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET status = 'FINALIZING', updated_at = ?
+WHERE id = ? AND status = 'RUNNING' AND lease_generation = ?`, formatTime(now), runID, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("mark run finalizing: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := appendRunStatusEvent(ctx, transaction, runID, domainrun.StatusRunning, domainrun.StatusFinalizing, ""); err != nil {
+		return domainrun.Run{}, err
+	}
+	current.Status, current.UpdatedAt = domainrun.StatusFinalizing, now
+	if err := transaction.Commit(); err != nil {
+		return domainrun.Run{}, fmt.Errorf("commit run finalization intent: %w", err)
+	}
+	return current, nil
+}
+
+// CompleteFinalization 使用当前 Runner fencing token 幂等提交已冻结的终态。
+func (store *RunStore) CompleteFinalization(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+) (domainrun.Run, error) {
+	return store.completeFinalization(ctx, runID, claimToken, leaseGeneration, false)
+}
+
+// RecoverFinalization 仅供 Recovery Manager 在证明旧 Runner 已死亡后重放终态。
+func (store *RunStore) RecoverFinalization(ctx context.Context, runID string, leaseGeneration int64) (domainrun.Run, error) {
+	return store.completeFinalization(ctx, runID, "", leaseGeneration, true)
+}
+
+func (store *RunStore) completeFinalization(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+	recovery bool,
+) (domainrun.Run, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("begin complete finalization: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getRun(ctx, transaction, runID)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if recovery {
+		if current.LeaseGeneration != leaseGeneration {
+			return domainrun.Run{}, ErrRunClaimMismatch
+		}
+	} else if _, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration); err != nil {
+		return domainrun.Run{}, err
+	}
+	intent, request, planning, completedAt, err := loadFinalizationIntent(ctx, transaction, runID)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if completedAt != "" {
+		return current, nil
+	}
+	if current.Status != domainrun.StatusFinalizing {
+		return domainrun.Run{}, ErrRunStateConflict
+	}
+	if request != nil {
+		created, buildErr := buildClarification(current, *request)
+		if buildErr != nil {
+			return domainrun.Run{}, buildErr
+		}
+		if err := insertClarification(ctx, transaction, created); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	if planning != nil {
+		if err := applyPlanningResult(ctx, transaction, current, *planning); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+		if err := finishTaskRun(ctx, transaction, current, intent.Status); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	now := time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, failure_kind = ?,
+                failure_code = ?, failure_message = ?, failure_retryable = ?, updated_at = ?
+WHERE id = ? AND status = 'FINALIZING' AND lease_generation = ?`,
+		intent.Status, formatTime(now), intent.ExitCode, intent.FailureKind, intent.FailureCode,
+		intent.FailureMessage, nullableBool(intent.FailureRetryable), formatTime(now), runID, leaseGeneration)
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("complete run finalization: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := clearOpenApprovals(ctx, transaction, runID, now); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := appendRunStatusEvent(ctx, transaction, runID, domainrun.StatusFinalizing, intent.Status, intent.FailureCode); err != nil {
+		return domainrun.Run{}, err
+	}
+	if _, err := transaction.ExecContext(ctx, `UPDATE run_finalization_intents SET completed_at = ? WHERE run_id = ? AND completed_at IS NULL`, formatTime(now), runID); err != nil {
+		return domainrun.Run{}, err
+	}
+	current.Status, current.FinishedAt, current.UpdatedAt = intent.Status, now, now
+	current.ExitCode, current.FailureKind, current.FailureCode = &intent.ExitCode, intent.FailureKind, intent.FailureCode
+	current.FailureMessage, current.FailureRetryable = intent.FailureMessage, intent.FailureRetryable
+	if err := transaction.Commit(); err != nil {
+		return domainrun.Run{}, fmt.Errorf("commit completed finalization: %w", err)
+	}
+	return current, nil
+}
+
+type finalizationPayload struct {
+	ClarificationJSON any
+	PlanningJSON      any
+}
+
+func validateFinalizationIntent(intent FinalizationIntent) (finalizationPayload, error) {
+	if _, err := finishTaskCommand(intent.Finish.Status); err != nil {
+		return finalizationPayload{}, err
+	}
+	payload := finalizationPayload{}
+	if intent.Finish.Status == domainrun.StatusNeedsInput {
+		if intent.Clarification == nil {
+			return finalizationPayload{}, errors.New("needs-input finalization requires clarification")
+		}
+		request := intent.Clarification.Normalized()
+		if err := request.Validate(); err != nil {
+			return finalizationPayload{}, err
+		}
+		encoded, err := json.Marshal(request)
+		if err != nil {
+			return finalizationPayload{}, err
+		}
+		payload.ClarificationJSON = string(encoded)
+	}
+	if intent.Finish.Status != domainrun.StatusNeedsInput && intent.Clarification != nil {
+		return finalizationPayload{}, errors.New("terminal finalization cannot include clarification")
+	}
+	if intent.Planning != nil {
+		normalized := intent.Planning.Normalized()
+		if err := normalized.Validate(); err != nil {
+			return finalizationPayload{}, err
+		}
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return finalizationPayload{}, err
+		}
+		payload.PlanningJSON = string(encoded)
+	}
+	return payload, nil
+}
+
+func validateFinalizationSubject(current domainrun.Run, intent FinalizationIntent) error {
+	if current.Purpose == domainrun.PurposePlanning {
+		if intent.Finish.Status == domainrun.StatusSucceeded && intent.Planning == nil {
+			return errors.New("successful planning finalization requires planning result")
+		}
+		if intent.Clarification != nil {
+			return errors.New("planning run writes questions as topic replies")
+		}
+		return nil
+	}
+	if intent.Planning != nil {
+		return errors.New("non-planning run cannot write planning result")
+	}
+	return nil
+}
+
+func loadFinalizationIntent(
+	ctx context.Context,
+	transaction *sql.Tx,
+	runID string,
+) (RunFinish, *clarification.Request, *plan.PlanningResult, string, error) {
+	var finish RunFinish
+	var retryable sql.NullBool
+	var clarificationJSON, planningJSON, completedAt sql.NullString
+	err := transaction.QueryRowContext(ctx, `
+SELECT terminal_status, exit_code, failure_kind, failure_code, failure_message,
+       failure_retryable, clarification_json, planning_result_json, completed_at
+FROM run_finalization_intents WHERE run_id = ?`, runID).Scan(
+		&finish.Status, &finish.ExitCode, &finish.FailureKind, &finish.FailureCode,
+		&finish.FailureMessage, &retryable, &clarificationJSON, &planningJSON, &completedAt)
+	if err != nil {
+		return RunFinish{}, nil, nil, "", err
+	}
+	finish.FailureRetryable = optionalBool(retryable)
+	var request *clarification.Request
+	if clarificationJSON.Valid {
+		request = &clarification.Request{}
+		if err := json.Unmarshal([]byte(clarificationJSON.String), request); err != nil {
+			return RunFinish{}, nil, nil, "", err
+		}
+	}
+	var planning *plan.PlanningResult
+	if planningJSON.Valid {
+		planning = &plan.PlanningResult{}
+		if err := json.Unmarshal([]byte(planningJSON.String), planning); err != nil {
+			return RunFinish{}, nil, nil, "", err
+		}
+	}
+	return finish, request, planning, completedAt.String, nil
+}
+
+func applyPlanningResult(
+	ctx context.Context,
+	transaction *sql.Tx,
+	current domainrun.Run,
+	result plan.PlanningResult,
+) error {
+	result = result.Normalized()
+	if err := result.Validate(); err != nil {
+		return err
+	}
+	if _, err := appendAgentTopicMessage(ctx, transaction, current.TopicID, result.Reply); err != nil {
+		return err
+	}
+	if result.Plan == nil {
+		return nil
+	}
+	currentTopic, err := getTopic(ctx, transaction, current.TopicID)
+	if err != nil {
+		return err
+	}
+	if currentTopic.Status != topic.StatusOpen || currentTopic.Version != current.SubjectVersion {
+		return nil
+	}
+	currentPlan, creating, err := findOrCreatePlan(ctx, transaction, current.TopicID)
+	if err != nil {
+		return err
+	}
+	if !creating && currentPlan.Status != plan.StatusChangesRequested {
+		return ErrPlanConflict
+	}
+	revisionNumber := int64(1)
+	if !creating {
+		previous, loadErr := loadPlanRevision(ctx, transaction, currentPlan.CurrentRevisionID)
+		if loadErr != nil {
+			return loadErr
+		}
+		revisionNumber = previous.Revision + 1
+	}
+	input := result.Plan.Normalized()
+	input.SourceRunID = current.ID
+	revision, err := buildPlanRevision(currentPlan, revisionNumber, input)
+	if err != nil {
+		return err
+	}
+	if creating {
+		currentPlan.CurrentRevisionID = revision.ID
+		if err := insertPlan(ctx, transaction, currentPlan); err != nil {
+			return err
+		}
+	} else if err := activatePlanRevision(ctx, transaction, &currentPlan, revision.ID); err != nil {
+		return err
+	}
+	if err := insertPlanRevision(ctx, transaction, revision); err != nil {
+		return err
+	}
+	updatedTopic, event, err := prepareTopicTransition(currentTopic, topic.StatusPlanReview, topic.CommandSubmitPlan)
+	if err != nil {
+		return err
+	}
+	updatedTopic.CurrentPlanID = currentPlan.ID
+	if err := updateTopicForPlan(ctx, transaction, currentTopic, updatedTopic); err != nil {
+		return err
+	}
+	return insertTopicEvent(ctx, transaction, event)
 }
 
 // Finish 原子写入 Run 终态并迁移对应 Task 状态。
@@ -527,10 +1289,10 @@ func (store *RunStore) Finish(
 	if err != nil {
 		return domainrun.Run{}, err
 	}
-	if current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusClaimed {
+	if current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusClaimed && current.Status != domainrun.StatusFinalizing {
 		return domainrun.Run{}, ErrRunStateConflict
 	}
-	if current.Purpose != domainrun.PurposeTriage {
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
 		if err := finishTaskRun(ctx, transaction, current, finish.Status); err != nil {
 			return domainrun.Run{}, err
 		}
@@ -540,7 +1302,7 @@ func (store *RunStore) Finish(
 	result, err := transaction.ExecContext(ctx, `
 UPDATE runs SET status = ?, finished_at = ?, exit_code = ?, failure_kind = ?,
                 failure_code = ?, failure_message = ?, failure_retryable = ?, updated_at = ?
-WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING') AND lease_generation = ?`,
+WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING') AND lease_generation = ?`,
 		finish.Status, formatTime(now), finish.ExitCode, finish.FailureKind,
 		finish.FailureCode, finish.FailureMessage, retryable, formatTime(now), runID, leaseGeneration,
 	)
@@ -550,13 +1312,73 @@ WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING') AND lease_generati
 	if err := requireSingleChange(result); err != nil {
 		return domainrun.Run{}, err
 	}
+	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, current.Status, finish.Status, finish.FailureCode); err != nil {
+		return domainrun.Run{}, err
+	}
 	current.Status = finish.Status
+	exitCode := finish.ExitCode
+	current.ExitCode = &exitCode
+	current.FailureKind = finish.FailureKind
+	current.FailureCode = finish.FailureCode
+	current.FailureMessage = finish.FailureMessage
+	current.FailureRetryable = finish.FailureRetryable
 	current.FinishedAt = now
 	current.UpdatedAt = now
 	if err := transaction.Commit(); err != nil {
 		return domainrun.Run{}, fmt.Errorf("commit run finish: %w", err)
 	}
 	return current, nil
+}
+
+// RecordWorkspaceSnapshot 首次保存 Run Finalization 观察到的 Workspace 前后状态；重复调用返回原始事实。
+func (store *RunStore) RecordWorkspaceSnapshot(
+	ctx context.Context,
+	snapshot domainrun.WorkspaceSnapshot,
+) (domainrun.WorkspaceSnapshot, error) {
+	if snapshot.RunID == "" || snapshot.WorkspaceID == "" || snapshot.HeadBefore == "" || snapshot.HeadAfter == "" {
+		return domainrun.WorkspaceSnapshot{}, errors.New("invalid run workspace snapshot")
+	}
+	snapshot.CapturedAt = time.Now().UTC()
+	_, err := store.database.ExecContext(ctx, `
+INSERT INTO run_workspace_snapshots(
+    run_id, workspace_id, branch_name, target_branch, base_commit_sha,
+    head_before, head_after, dirty_before, dirty_after, state_after, captured_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(run_id) DO NOTHING`,
+		snapshot.RunID, snapshot.WorkspaceID, snapshot.BranchName, snapshot.TargetBranch,
+		snapshot.BaseCommitSHA, snapshot.HeadBefore, snapshot.HeadAfter,
+		boolInt(snapshot.DirtyBefore), boolInt(snapshot.DirtyAfter), snapshot.StateAfter,
+		formatTime(snapshot.CapturedAt),
+	)
+	if err != nil {
+		return domainrun.WorkspaceSnapshot{}, fmt.Errorf("record run workspace snapshot: %w", err)
+	}
+	return store.GetWorkspaceSnapshot(ctx, snapshot.RunID)
+}
+
+// GetWorkspaceSnapshot 返回 Run 已完成的 Workspace Finalization 快照。
+func (store *RunStore) GetWorkspaceSnapshot(ctx context.Context, runID string) (domainrun.WorkspaceSnapshot, error) {
+	var snapshot domainrun.WorkspaceSnapshot
+	var dirtyBefore, dirtyAfter int
+	var capturedAt string
+	err := store.database.QueryRowContext(ctx, `
+SELECT run_id, workspace_id, branch_name, target_branch, base_commit_sha,
+       head_before, head_after, dirty_before, dirty_after, state_after, captured_at
+FROM run_workspace_snapshots WHERE run_id = ?`, runID).Scan(
+		&snapshot.RunID, &snapshot.WorkspaceID, &snapshot.BranchName, &snapshot.TargetBranch,
+		&snapshot.BaseCommitSHA, &snapshot.HeadBefore, &snapshot.HeadAfter,
+		&dirtyBefore, &dirtyAfter, &snapshot.StateAfter, &capturedAt,
+	)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domainrun.WorkspaceSnapshot{}, ErrRunWorkspaceSnapshotNotFound
+	}
+	if err != nil {
+		return domainrun.WorkspaceSnapshot{}, fmt.Errorf("get run workspace snapshot: %w", err)
+	}
+	snapshot.DirtyBefore = dirtyBefore == 1
+	snapshot.DirtyAfter = dirtyAfter == 1
+	snapshot.CapturedAt, err = parseTime(capturedAt)
+	return snapshot, err
 }
 
 func finishTaskRun(
@@ -632,6 +1454,49 @@ func nullableBool(value *bool) any {
 	return *value
 }
 
+func optionalBool(value sql.NullBool) *bool {
+	if !value.Valid {
+		return nil
+	}
+	result := value.Bool
+	return &result
+}
+
+func intPointer(value int) *int { return &value }
+
+func clearOpenApprovals(ctx context.Context, transaction *sql.Tx, runID string, now time.Time) error {
+	rows, err := transaction.QueryContext(ctx, `SELECT id FROM approval_requests WHERE run_id = ? AND status = 'OPEN'`, runID)
+	if err != nil {
+		return fmt.Errorf("list open approvals for finalization: %w", err)
+	}
+	ids := make([]string, 0, 1)
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return err
+		}
+		ids = append(ids, id)
+	}
+	if err := rows.Close(); err != nil {
+		return err
+	}
+	if _, err := transaction.ExecContext(ctx, `
+UPDATE approval_requests SET status = 'CLEARED', version = version + 1,
+    updated_at = ?, resolved_at = ? WHERE run_id = ? AND status = 'OPEN'`,
+		formatTime(now), formatTime(now), runID); err != nil {
+		return fmt.Errorf("clear open approvals for finalization: %w", err)
+	}
+	for _, id := range ids {
+		if _, err := appendRunEvent(ctx, transaction, runID, domainrun.EventApprovalResolve, map[string]any{
+			"schema_version": 1, "approval_request_id": id, "status": "CLEARED",
+		}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 func requireSingleChange(result sql.Result) error {
 	changed, err := result.RowsAffected()
 	if err != nil {
@@ -643,7 +1508,58 @@ func requireSingleChange(result sql.Result) error {
 	return nil
 }
 
-type runnableTask struct {
+func appendRunStatusEvent(
+	ctx context.Context,
+	transaction *sql.Tx,
+	runID string,
+	from domainrun.Status,
+	to domainrun.Status,
+	failureCode string,
+) (domainrun.Event, error) {
+	payload := map[string]any{"schema_version": 1, "from": from, "to": to}
+	if failureCode != "" {
+		payload["failure_code"] = failureCode
+	}
+	return appendRunEvent(ctx, transaction, runID, domainrun.EventStatusChanged, payload)
+}
+
+func appendRunEvent(
+	ctx context.Context,
+	transaction *sql.Tx,
+	runID string,
+	eventType domainrun.EventType,
+	payloadValue any,
+) (domainrun.Event, error) {
+	if runID == "" || eventType == "" {
+		return domainrun.Event{}, errors.New("run event identity is required")
+	}
+	payload, err := json.Marshal(payloadValue)
+	if err != nil {
+		return domainrun.Event{}, fmt.Errorf("encode run event payload: %w", err)
+	}
+	var sequence int64
+	if err := transaction.QueryRowContext(ctx, `
+SELECT COALESCE(MAX(sequence), 0) + 1 FROM run_events WHERE run_id = ?`, runID).Scan(&sequence); err != nil {
+		return domainrun.Event{}, fmt.Errorf("next run event sequence: %w", err)
+	}
+	eventID, err := newID()
+	if err != nil {
+		return domainrun.Event{}, err
+	}
+	now := time.Now().UTC()
+	if _, err := transaction.ExecContext(ctx, `
+INSERT INTO run_events(id, run_id, sequence, event_type, payload_json, occurred_at)
+VALUES (?, ?, ?, ?, ?, ?)`, eventID, runID, sequence, eventType, string(payload), formatTime(now)); err != nil {
+		return domainrun.Event{}, fmt.Errorf("insert run event: %w", err)
+	}
+	return domainrun.Event{
+		ID: eventID, RunID: runID, Sequence: sequence, Type: eventType,
+		Payload: payload, OccurredAt: now,
+	}, nil
+}
+
+type runnableWork struct {
+	Topic               topic.Topic
 	Task                task.Task
 	ProfileRevisionID   string
 	Purpose             domainrun.Purpose
@@ -664,8 +1580,11 @@ WHERE status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')`).Scan(&active)
 	return nil
 }
 
-func selectRunnableTask(ctx context.Context, transaction *sql.Tx) (runnableTask, error) {
+func selectRunnableWork(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	if selected, err := selectRevisionTask(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
+		return selected, err
+	}
+	if selected, err := selectPlanningTopic(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
 		return selected, err
 	}
 	if selected, err := selectTriageTask(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
@@ -674,7 +1593,7 @@ func selectRunnableTask(ctx context.Context, transaction *sql.Tx) (runnableTask,
 	return selectImplementationTask(ctx, transaction)
 }
 
-func selectRevisionTask(ctx context.Context, transaction *sql.Tx) (runnableTask, error) {
+func selectRevisionTask(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	return selectTaskForPurpose(ctx, transaction, `
 SELECT t.id, r.id, 'REVISION', COALESCE((
     SELECT c.source_run_id FROM clarifications c
@@ -690,7 +1609,47 @@ WHERE t.status = 'CHANGES_REQUESTED' AND length(trim(r.command)) > 0
 ORDER BY t.priority ASC, t.created_at ASC, t.id ASC LIMIT 1`)
 }
 
-func selectTriageTask(ctx context.Context, transaction *sql.Tx) (runnableTask, error) {
+func selectPlanningTopic(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
+	var selected runnableWork
+	var topicID string
+	err := transaction.QueryRowContext(ctx, `
+SELECT t.id, r.id, COALESCE((
+    SELECT previous.id FROM runs previous
+    WHERE previous.topic_id = t.id AND previous.purpose = 'PLANNING'
+    ORDER BY previous.created_at DESC, previous.id DESC LIMIT 1
+), '')
+FROM topics t
+JOIN project_agent_defaults d ON d.purpose = 'PLANNING'
+JOIN agent_profiles p ON p.id = d.profile_id
+JOIN agent_profile_revisions r ON r.id = p.current_revision_id
+WHERE t.status = 'OPEN' AND length(trim(r.command)) > 0
+  AND NOT EXISTS (
+      SELECT 1 FROM runs attempted
+      WHERE attempted.topic_id = t.id AND attempted.purpose = 'PLANNING'
+        AND attempted.subject_version = t.version
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM runs active
+      WHERE active.topic_id = t.id
+        AND active.status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')
+  )
+ORDER BY t.updated_at ASC, t.created_at ASC, t.id ASC LIMIT 1`).Scan(
+		&topicID, &selected.ProfileRevisionID, &selected.ContinuationOfRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runnableWork{}, ErrNoRunnableTask
+	}
+	if err != nil {
+		return runnableWork{}, fmt.Errorf("select planning topic: %w", err)
+	}
+	selected.Topic, err = getTopic(ctx, transaction, topicID)
+	if err != nil {
+		return runnableWork{}, err
+	}
+	selected.Purpose = domainrun.PurposePlanning
+	return selected, nil
+}
+
+func selectTriageTask(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	return selectTaskForPurpose(ctx, transaction, `
 SELECT t.id, r.id, 'TRIAGE', ''
 FROM tasks t
@@ -710,7 +1669,7 @@ WHERE t.status = 'READY' AND length(trim(r.command)) > 0
 ORDER BY t.priority ASC, t.created_at ASC, t.id ASC LIMIT 1`)
 }
 
-func selectImplementationTask(ctx context.Context, transaction *sql.Tx) (runnableTask, error) {
+func selectImplementationTask(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	return selectTaskForPurpose(ctx, transaction, `
 SELECT t.id, r.id, 'IMPLEMENTATION', COALESCE((
     SELECT c.source_run_id FROM clarifications c
@@ -750,28 +1709,28 @@ WHERE t.status = 'READY' AND length(trim(r.command)) > 0
 ORDER BY t.priority ASC, t.created_at ASC, t.id ASC LIMIT 1`)
 }
 
-func selectTaskForPurpose(ctx context.Context, transaction *sql.Tx, query string) (runnableTask, error) {
-	var selected runnableTask
+func selectTaskForPurpose(ctx context.Context, transaction *sql.Tx, query string) (runnableWork, error) {
+	var selected runnableWork
 	var taskID string
 	var purpose string
 	err := transaction.QueryRowContext(ctx, query).Scan(
 		&taskID, &selected.ProfileRevisionID, &purpose, &selected.ContinuationOfRunID,
 	)
 	if errors.Is(err, sql.ErrNoRows) {
-		return runnableTask{}, ErrNoRunnableTask
+		return runnableWork{}, ErrNoRunnableTask
 	}
 	if err != nil {
-		return runnableTask{}, fmt.Errorf("select runnable task: %w", err)
+		return runnableWork{}, fmt.Errorf("select runnable task: %w", err)
 	}
 	selected.Task, err = getTask(ctx, transaction, taskID)
 	if err != nil {
-		return runnableTask{}, err
+		return runnableWork{}, err
 	}
 	selected.Purpose = domainrun.Purpose(purpose)
 	return selected, nil
 }
 
-func createClaim(selected runnableTask, leaseDuration time.Duration) (domainrun.Claim, error) {
+func createClaim(selected runnableWork, leaseDuration time.Duration) (domainrun.Claim, error) {
 	runID, err := newID()
 	if err != nil {
 		return domainrun.Claim{}, err
@@ -788,7 +1747,7 @@ func createClaim(selected runnableTask, leaseDuration time.Duration) (domainrun.
 	return domainrun.Claim{
 		ClaimToken: token,
 		Run: domainrun.Run{
-			ID: runID, Purpose: selected.Purpose, TaskID: selected.Task.ID,
+			ID: runID, Purpose: selected.Purpose, TopicID: selected.Topic.ID, TaskID: selected.Task.ID,
 			Status: domainrun.StatusClaimed, ProfileRevisionID: selected.ProfileRevisionID,
 			ContinuationOfRunID: selected.ContinuationOfRunID,
 			SubjectVersion:      subjectVersion(selected),
@@ -799,7 +1758,10 @@ func createClaim(selected runnableTask, leaseDuration time.Duration) (domainrun.
 	}, nil
 }
 
-func subjectVersion(selected runnableTask) int64 {
+func subjectVersion(selected runnableWork) int64 {
+	if selected.Purpose == domainrun.PurposePlanning {
+		return selected.Topic.Version
+	}
 	if selected.Purpose == domainrun.PurposeTriage {
 		return selected.Task.AssessmentInputVersion
 	}
@@ -812,19 +1774,20 @@ func insertClaimedRun(ctx context.Context, transaction *sql.Tx, claim domainrun.
 INSERT INTO runs(
     id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
     continuation_of_run_id, claim_token_hash, lease_generation, lease_expires_at, run_nonce,
-    queued_at, claimed_at, created_at, updated_at, subject_version
-) VALUES (?, ?, NULL, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		claim.Run.ID, claim.Run.Purpose, claim.Run.TaskID, claim.Run.Status,
+    queued_at, claimed_at, created_at, updated_at, subject_version,
+    agent_session_id, session_resumed
+) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		claim.Run.ID, claim.Run.Purpose, nullableString(claim.Run.TopicID), nullableString(claim.Run.TaskID), claim.Run.Status,
 		claim.Run.ProfileRevisionID, nullableString(claim.Run.ContinuationOfRunID),
 		hex.EncodeToString(hash[:]), claim.Run.LeaseGeneration,
 		formatTime(claim.Run.LeaseExpiresAt), claim.Run.RunNonce, formatTime(claim.Run.QueuedAt),
 		formatTime(claim.Run.ClaimedAt), formatTime(claim.Run.CreatedAt), formatTime(claim.Run.UpdatedAt),
-		claim.Run.SubjectVersion,
+		claim.Run.SubjectVersion, nullableString(claim.Run.AgentSessionID), claim.Run.SessionResumed,
 	)
 	if err != nil {
 		return fmt.Errorf("insert claimed run: %w", err)
 	}
-	if claim.Run.ContinuationOfRunID != "" {
+	if claim.Run.TaskID != "" && claim.Run.ContinuationOfRunID != "" {
 		result, updateErr := transaction.ExecContext(ctx, `
 UPDATE clarifications SET continuation_run_id = ?, updated_at = ?
 WHERE source_run_id = ? AND status = 'ANSWERED' AND continuation_run_id IS NULL`,
@@ -921,7 +1884,7 @@ VALUES (?, ?, ?, ?)`, runID, string(encoded), hex.EncodeToString(hash[:]), forma
 	return nil
 }
 
-func claimTask(ctx context.Context, transaction *sql.Tx, selected runnableTask, claimed domainrun.Run) error {
+func claimTask(ctx context.Context, transaction *sql.Tx, selected runnableWork, claimed domainrun.Run) error {
 	updated, event, err := prepareTransition(selected.Task, task.StatusRunning, task.CommandClaimRun)
 	if err != nil {
 		return err
@@ -947,15 +1910,34 @@ WHERE id = ? AND version = ? AND status = ?`,
 
 func scanRun(scanner rowScanner) (domainrun.Run, error) {
 	var item domainrun.Run
-	var leaseExpiresAt, queuedAt, claimedAt, startedAt, finishedAt, createdAt, updatedAt string
+	var exitCode sql.NullInt64
+	var failureRetryable sql.NullBool
+	var leaseExpiresAt, queuedAt, claimedAt, startedAt, finishedAt, createdAt, updatedAt, cancelRequestedAt string
 	err := scanner.Scan(
 		&item.ID, &item.Purpose, &item.TopicID, &item.TaskID, &item.Status,
 		&item.ProfileRevisionID, &item.RetryOfRunID, &item.ContinuationOfRunID, &item.LeaseGeneration,
 		&leaseExpiresAt, &queuedAt, &claimedAt, &startedAt, &finishedAt, &createdAt, &updatedAt,
-		&item.SubjectVersion,
+		&item.SubjectVersion, &exitCode, &item.FailureKind, &item.FailureCode,
+		&item.FailureMessage, &failureRetryable, &cancelRequestedAt, &item.CancelReason,
+		&item.AgentSessionID, &item.SessionResumed, &item.RunNonce,
 	)
 	if err != nil {
 		return domainrun.Run{}, err
+	}
+	if exitCode.Valid {
+		value := int(exitCode.Int64)
+		item.ExitCode = &value
+	}
+	if failureRetryable.Valid {
+		value := failureRetryable.Bool
+		item.FailureRetryable = &value
+	}
+	if cancelRequestedAt != "" {
+		value, parseErr := parseTime(cancelRequestedAt)
+		if parseErr != nil {
+			return domainrun.Run{}, fmt.Errorf("parse run cancellation time: %w", parseErr)
+		}
+		item.CancelRequestedAt = &value
 	}
 	fields := []struct {
 		value  string

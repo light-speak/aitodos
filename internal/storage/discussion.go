@@ -3,11 +3,13 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/topic"
 )
 
 // DiscussionStore 使用 SQLite 持久化 Topic 与 Task 的讨论线程。
@@ -42,15 +44,15 @@ func (store *DiscussionStore) AppendTopicMessage(
 	if err != nil {
 		return discussion.Message{}, err
 	}
-	message, err := appendMessage(ctx, transaction, threadID, input)
+	message, err := appendMessage(ctx, transaction, threadID, discussion.AuthorHuman, input)
 	if err != nil {
 		return discussion.Message{}, err
 	}
 	if err := linkTopicMessageTasks(ctx, transaction, topicID, message); err != nil {
 		return discussion.Message{}, err
 	}
-	if _, err := transaction.ExecContext(ctx, "UPDATE topics SET updated_at = ? WHERE id = ?", formatTime(message.CreatedAt), topicID); err != nil {
-		return discussion.Message{}, fmt.Errorf("update topic activity: %w", err)
+	if err := recordHumanTopicMessage(ctx, transaction, topicID, message); err != nil {
+		return discussion.Message{}, err
 	}
 	if err := transaction.Commit(); err != nil {
 		return discussion.Message{}, fmt.Errorf("commit topic message append: %w", err)
@@ -80,7 +82,7 @@ func (store *DiscussionStore) AppendTaskMessage(
 	if err != nil {
 		return discussion.Message{}, err
 	}
-	message, err := appendMessage(ctx, transaction, threadID, input)
+	message, err := appendMessage(ctx, transaction, threadID, discussion.AuthorHuman, input)
 	if err != nil {
 		return discussion.Message{}, err
 	}
@@ -179,7 +181,13 @@ func findOrCreateThread(ctx context.Context, transaction *sql.Tx, subjectColumn,
 	return threadID, nil
 }
 
-func appendMessage(ctx context.Context, transaction *sql.Tx, threadID string, input discussion.CreateMessageInput) (discussion.Message, error) {
+func appendMessage(
+	ctx context.Context,
+	transaction *sql.Tx,
+	threadID string,
+	author discussion.AuthorKind,
+	input discussion.CreateMessageInput,
+) (discussion.Message, error) {
 	messageID, err := newID()
 	if err != nil {
 		return discussion.Message{}, err
@@ -190,7 +198,7 @@ func appendMessage(ctx context.Context, transaction *sql.Tx, threadID string, in
 	}
 	created := discussion.Message{
 		ID: messageID, ThreadID: threadID, Sequence: sequence,
-		AuthorKind: discussion.AuthorHuman, Content: input.Content,
+		AuthorKind: author, Content: input.Content,
 		LinkedTaskIDs: input.LinkedTaskIDs, CreatedAt: time.Now().UTC(),
 	}
 	if _, err := transaction.ExecContext(ctx, `
@@ -202,6 +210,67 @@ VALUES (?, ?, ?, ?, ?, ?)`, created.ID, created.ThreadID, created.Sequence, crea
 		return discussion.Message{}, fmt.Errorf("update thread activity: %w", err)
 	}
 	return created, nil
+}
+
+func recordHumanTopicMessage(
+	ctx context.Context,
+	transaction *sql.Tx,
+	topicID string,
+	message discussion.Message,
+) error {
+	current, err := getTopic(ctx, transaction, topicID)
+	if err != nil {
+		return err
+	}
+	current.Version++
+	current.UpdatedAt = message.CreatedAt
+	result, err := transaction.ExecContext(ctx, `
+UPDATE topics SET version = ?, updated_at = ? WHERE id = ? AND version = ?`,
+		current.Version, formatTime(current.UpdatedAt), current.ID, current.Version-1)
+	if err != nil {
+		return fmt.Errorf("advance topic discussion version: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return ErrTopicVersionConflict
+	}
+	eventID, err := newID()
+	if err != nil {
+		return err
+	}
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1, "message_id": message.ID, "author_kind": message.AuthorKind,
+	})
+	if err != nil {
+		return fmt.Errorf("encode topic message event: %w", err)
+	}
+	return insertTopicEvent(ctx, transaction, topic.Event{
+		ID: eventID, TopicID: topicID, Sequence: current.Version,
+		Type: topic.EventMessageAdded, Payload: payload, OccurredAt: message.CreatedAt,
+	})
+}
+
+func appendAgentTopicMessage(
+	ctx context.Context,
+	transaction *sql.Tx,
+	topicID string,
+	content string,
+) (discussion.Message, error) {
+	input := discussion.CreateMessageInput{Content: content}.Normalized()
+	if err := input.Validate(); err != nil {
+		return discussion.Message{}, err
+	}
+	threadID, err := findOrCreateThread(ctx, transaction, "topic_id", topicID)
+	if err != nil {
+		return discussion.Message{}, err
+	}
+	message, err := appendMessage(ctx, transaction, threadID, discussion.AuthorAgent, input)
+	if err != nil {
+		return discussion.Message{}, err
+	}
+	if _, err := transaction.ExecContext(ctx, "UPDATE topics SET updated_at = ? WHERE id = ?", formatTime(message.CreatedAt), topicID); err != nil {
+		return discussion.Message{}, fmt.Errorf("update topic agent activity: %w", err)
+	}
+	return message, nil
 }
 
 func linkTopicMessageTasks(ctx context.Context, transaction *sql.Tx, topicID string, message discussion.Message) error {

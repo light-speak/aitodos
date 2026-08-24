@@ -51,6 +51,17 @@ func TestCodexRevisionRequiresExecSubcommand(t *testing.T) {
 	}
 }
 
+func TestCodexAppServerRevisionDoesNotRequireExecArgs(t *testing.T) {
+	input := RevisionInput{
+		Instructions: "实现当前 Task", Adapter: "codex-app-server", Command: "codex",
+		MaxInputTokens: 32000, ReservedOutputTokens: 8000,
+		RecentMessageLimit: 20, RetrievalLimit: 8, TimeoutSeconds: 1800,
+	}
+	if err := input.Validate(); err != nil {
+		t.Fatalf("Validate() error = %v", err)
+	}
+}
+
 func TestCodexRevisionRejectsConflictingApprovalAndSandboxFlags(t *testing.T) {
 	input := RevisionInput{
 		Instructions: "实现当前 Task", Adapter: "codex", Command: "codex",

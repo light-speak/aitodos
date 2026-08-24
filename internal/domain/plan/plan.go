@@ -76,6 +76,35 @@ type RevisionInput struct {
 	Drafts      []TaskDraftInput `json:"drafts"`
 }
 
+// PlanningResult 是规划 Agent 一轮讨论后提交的结构化结果。
+// Reply 始终写回 Topic；Plan 仅在信息充分时提供，并继续等待人工批准。
+type PlanningResult struct {
+	Reply string         `json:"reply"`
+	Plan  *RevisionInput `json:"plan,omitempty"`
+}
+
+// Validate 校验 Agent 回复和可选方案草案。
+func (result PlanningResult) Validate() error {
+	result = result.Normalized()
+	if result.Reply == "" || utf8.RuneCountInString(result.Reply) > 20000 {
+		return errors.New("planning reply 不能为空且最长 20000 个字符")
+	}
+	if result.Plan != nil {
+		return result.Plan.Validate()
+	}
+	return nil
+}
+
+// Normalized 清理规划结果文本。
+func (result PlanningResult) Normalized() PlanningResult {
+	result.Reply = strings.TrimSpace(result.Reply)
+	if result.Plan != nil {
+		normalized := result.Plan.Normalized()
+		result.Plan = &normalized
+	}
+	return result
+}
+
 // TaskDraftInput 是待审核 Task 草案输入。
 type TaskDraftInput struct {
 	Title              string          `json:"title"`

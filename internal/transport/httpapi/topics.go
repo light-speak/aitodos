@@ -16,6 +16,10 @@ type topicHandler struct {
 	relations  *storage.RelationStore
 }
 
+type topicPlanningRequest struct {
+	ExpectedVersion int64 `json:"expected_version"`
+}
+
 // RegisterTopicRoutes 注册 Topic 查询端点。
 func RegisterTopicRoutes(
 	mux *http.ServeMux,
@@ -29,9 +33,24 @@ func RegisterTopicRoutes(
 	mux.HandleFunc("GET /api/topics/{topicID}", handler.get)
 	mux.HandleFunc("GET /api/topics/{topicID}/messages", handler.listMessages)
 	mux.HandleFunc("POST /api/topics/{topicID}/messages", handler.createMessage)
+	mux.HandleFunc("POST /api/topics/{topicID}/planning", handler.requestPlanning)
 	mux.HandleFunc("GET /api/topics/{topicID}/relations", handler.listRelations)
 	mux.HandleFunc("POST /api/topics/{topicID}/relations", handler.createRelation)
 	mux.HandleFunc("DELETE /api/topics/{topicID}/relations/{taskID}", handler.deleteRelation)
+}
+
+func (handler *topicHandler) requestPlanning(response http.ResponseWriter, request *http.Request) {
+	var input topicPlanningRequest
+	if err := decodeJSON(response, request, &input); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的规划请求")
+		return
+	}
+	updated, err := handler.store.RequestPlanning(request.Context(), request.PathValue("topicID"), input.ExpectedVersion)
+	if err != nil {
+		writeTopicError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
 }
 
 func (handler *topicHandler) listRelations(response http.ResponseWriter, request *http.Request) {
@@ -139,6 +158,10 @@ func writeTopicError(response http.ResponseWriter, err error) {
 	}
 	if errors.Is(err, storage.ErrTaskNotFound) {
 		writeError(response, http.StatusNotFound, "TASK_NOT_FOUND", "Task 不存在")
+		return
+	}
+	if errors.Is(err, storage.ErrTopicVersionConflict) {
+		writeError(response, http.StatusConflict, "TOPIC_VERSION_CONFLICT", "Topic 已被更新，请刷新后重试")
 		return
 	}
 	writeError(response, http.StatusInternalServerError, "TOPIC_COMMAND_FAILED", "执行 Topic 命令失败")

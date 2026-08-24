@@ -20,10 +20,10 @@ it('默认只展示文件摘要，点击后按需读取 Diff，并可提交人�
 		if (url === '/api/tasks/task-1/reviews') return Promise.resolve(Response.json([]))
 		if (url === '/api/tasks/task-1/changes') return Promise.resolve(Response.json({
 			base_commit_sha: 'base', head_sha: 'head', dirty: true, file_count: 1, additions: 2, deletions: 1,
-			files: [{ path: 'README.md', status: 'MODIFIED', additions: 2, deletions: 1, binary: false }],
+			files: [{ path: 'internal/authn/authn.go', status: 'MODIFIED', additions: 2, deletions: 1, binary: false }],
 		}))
-		if (url === '/api/tasks/task-1/changes/file?path=README.md') return Promise.resolve(Response.json({
-			path: 'README.md', patch: '-old\n+new', truncated: false, binary: false,
+		if (url === '/api/tasks/task-1/changes/file?path=internal%2Fauthn%2Fauthn.go') return Promise.resolve(Response.json({
+			path: 'internal/authn/authn.go', patch: 'diff --git a/internal/authn/authn.go b/internal/authn/authn.go\n--- a/internal/authn/authn.go\n+++ b/internal/authn/authn.go\n@@ -1,2 +1,2 @@\n-package old\n+package authn\n+var count = 34', truncated: false, binary: false,
 		}))
 		if (url === '/api/tasks/task-1/submit-review' && init?.method === 'POST') return Promise.resolve(Response.json(updated))
 		return Promise.resolve(Response.json({ error: { code: 'UNEXPECTED', message: url } }, { status: 500 }))
@@ -33,9 +33,18 @@ it('默认只展示文件摘要，点击后按需读取 Diff，并可提交人�
 	render(<TaskChangesPanel task={task} hasWorkspace onTaskUpdated={onTaskUpdated} onWorkspaceChanged={vi.fn()} />)
 
 	expect(await screen.findByText('1 个文件')).toBeInTheDocument()
-	expect(screen.queryByText('+new')).not.toBeInTheDocument()
-	await userEvent.click(screen.getByRole('button', { name: /README.md/ }))
-	expect(await screen.findByText(/\+new/)).toBeInTheDocument()
+	const fileButton = screen.getByRole('button', { name: /internal\/authn\/authn.go/ })
+	await userEvent.click(fileButton)
+	const addedLine = await screen.findByTestId('diff-addition-5')
+	expect(addedLine).toHaveTextContent('+package authn')
+	expect(addedLine).toHaveClass('bg-emerald-950/35')
+	expect(screen.getByText('Go · Unified diff')).toBeInTheDocument()
+	expect(screen.getAllByText('package')[0]).toHaveClass('text-violet-300')
+	expect(fileButton).toHaveAttribute('aria-expanded', 'true')
+
+	await userEvent.click(fileButton)
+	expect(screen.queryByText('Go · Unified diff')).not.toBeInTheDocument()
+	expect(fileButton).toHaveAttribute('aria-expanded', 'false')
 	await userEvent.click(screen.getByRole('button', { name: '提交人工验收' }))
 	expect(onTaskUpdated).toHaveBeenCalledWith(updated)
 })

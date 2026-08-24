@@ -6,6 +6,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -21,17 +22,26 @@ import (
 )
 
 var (
-	ErrTagConflict       = errors.New("git tag already points to another commit or is not annotated")
-	ErrWorkspaceIdentity = errors.New("workspace git identity mismatch")
-	ErrWorkspaceDirty    = errors.New("workspace has uncommitted changes")
-	ErrWorkspaceClean    = errors.New("workspace has no changes to commit")
-	ErrRepositoryUnborn  = errors.New("repository has no initial commit")
+	ErrTagConflict          = errors.New("git tag already points to another commit or is not annotated")
+	ErrWorkspaceIdentity    = errors.New("workspace git identity mismatch")
+	ErrWorkspaceDirty       = errors.New("workspace has uncommitted changes")
+	ErrWorkspaceClean       = errors.New("workspace has no changes to commit")
+	ErrRepositoryUnborn     = errors.New("repository has no initial commit")
+	ErrTargetBranchInvalid  = errors.New("target branch is invalid")
+	ErrTargetBranchNotFound = errors.New("target branch does not exist locally")
 )
 
 // Branch 保存本地 Branch 名称和当前 Commit。
 type Branch struct {
 	Name    string `json:"name"`
 	HeadSHA string `json:"head_sha"`
+}
+
+// Remote 保存脱敏后的 Git Remote 地址。
+type Remote struct {
+	Name     string `json:"name"`
+	FetchURL string `json:"fetch_url"`
+	PushURL  string `json:"push_url"`
 }
 
 // SubmitTaskReview 将可执行 Task 送入人工验收，不伪造 Agent Run。
@@ -123,12 +133,24 @@ func (manager *Manager) ListTaskReviews(ctx context.Context, taskID string) ([]t
 
 // RepositoryInfo 是 UI 创建 Release 前需要的当前 Git 事实。
 type RepositoryInfo struct {
-	CurrentBranch string   `json:"current_branch"`
-	HeadSHA       string   `json:"head_sha"`
-	HasHead       bool     `json:"has_head"`
-	Dirty         bool     `json:"dirty"`
-	ExactTag      string   `json:"exact_tag,omitempty"`
-	Branches      []Branch `json:"branches"`
+	Root                string   `json:"root"`
+	GitCommonDir        string   `json:"git_common_dir"`
+	GitVersion          string   `json:"git_version"`
+	DefaultBranch       string   `json:"default_branch"`
+	RemoteDefaultBranch string   `json:"remote_default_branch,omitempty"`
+	CurrentBranch       string   `json:"current_branch"`
+	HeadSHA             string   `json:"head_sha"`
+	HasHead             bool     `json:"has_head"`
+	Dirty               bool     `json:"dirty"`
+	ExactTag            string   `json:"exact_tag,omitempty"`
+	Upstream            string   `json:"upstream,omitempty"`
+	Ahead               *int     `json:"ahead,omitempty"`
+	Behind              *int     `json:"behind,omitempty"`
+	UserName            string   `json:"user_name,omitempty"`
+	UserEmail           string   `json:"user_email,omitempty"`
+	IdentityConfigured  bool     `json:"identity_configured"`
+	Branches            []Branch `json:"branches"`
+	Remotes             []Remote `json:"remotes"`
 }
 
 // Manager 串行执行当前仓库共享 Git 元数据操作。
@@ -149,15 +171,15 @@ func New(currentProject *project.Project, database *sql.DB) *Manager {
 
 // CreateTaskWorkspace 为 Task 创建或恢复一个长期 linked worktree。
 func (manager *Manager) CreateTaskWorkspace(ctx context.Context, taskID string) (workspace.Workspace, error) {
-	item, err := manager.tasks.Get(ctx, taskID)
-	if err != nil {
-		return workspace.Workspace{}, err
-	}
 	lock, err := acquireRepositoryLock(ctx, filepath.Join(manager.project.Paths.Runtime, "git.lock"))
 	if err != nil {
 		return workspace.Workspace{}, err
 	}
 	defer lock.Close()
+	item, err := manager.tasks.Get(ctx, taskID)
+	if err != nil {
+		return workspace.Workspace{}, err
+	}
 	if _, hasHead, headErr := manager.optionalHead(ctx); headErr != nil {
 		return workspace.Workspace{}, headErr
 	} else if !hasHead {
@@ -184,6 +206,34 @@ func (manager *Manager) CreateTaskWorkspace(ctx context.Context, taskID string) 
 		return manager.refreshWorkspace(ctx, reserved)
 	}
 	return manager.provisionWorkspace(ctx, reserved)
+}
+
+// ValidateTargetBranch 校验目标是当前仓库中已有 Commit 的本地 Branch。
+func (manager *Manager) ValidateTargetBranch(ctx context.Context, targetBranch string) error {
+	_, err := manager.resolveBranch(ctx, strings.TrimSpace(targetBranch))
+	return err
+}
+
+// UpdateTaskTargetBranch 在 Workspace 创建前更新并锁定下一次执行的基线分支。
+func (manager *Manager) UpdateTaskTargetBranch(
+	ctx context.Context,
+	taskID string,
+	expectedVersion int64,
+	targetBranch string,
+) (task.Task, error) {
+	input := task.UpdateTargetBranchInput{TargetBranch: targetBranch}.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, err
+	}
+	lock, err := acquireRepositoryLock(ctx, filepath.Join(manager.project.Paths.Runtime, "git.lock"))
+	if err != nil {
+		return task.Task{}, err
+	}
+	defer lock.Close()
+	if err := manager.ValidateTargetBranch(ctx, input.TargetBranch); err != nil {
+		return task.Task{}, err
+	}
+	return manager.tasks.UpdateTargetBranch(ctx, taskID, expectedVersion, input.TargetBranch)
 }
 
 // TaskWorkspace 返回并重新校验 Task 当前 Workspace；尚未创建时返回 nil。
@@ -231,11 +281,82 @@ func (manager *Manager) RepositoryInfo(ctx context.Context) (RepositoryInfo, err
 	if err != nil {
 		return RepositoryInfo{}, err
 	}
+	remotes, err := manager.listRemotes(ctx)
+	if err != nil {
+		return RepositoryInfo{}, err
+	}
+	upstream, ahead, behind := manager.trackingInfo(ctx)
 	exactTag, _ := manager.gitOutput(ctx, manager.project.Root, "describe", "--tags", "--exact-match", "HEAD")
+	gitVersion, _ := manager.gitOutput(ctx, manager.project.Root, "--version")
+	userName, _ := manager.gitOutput(ctx, manager.project.Root, "config", "--get", "user.name")
+	userEmail, _ := manager.gitOutput(ctx, manager.project.Root, "config", "--get", "user.email")
 	return RepositoryInfo{
+		Root: manager.project.Root, GitCommonDir: manager.project.GitCommonDir, GitVersion: gitVersion,
+		DefaultBranch: manager.project.Config.DefaultBranch, RemoteDefaultBranch: remoteDefaultBranch(ctx, manager, remotes),
 		CurrentBranch: currentBranch, HeadSHA: headSHA, HasHead: hasHead, Dirty: status != "",
-		ExactTag: exactTag, Branches: branches,
+		ExactTag: exactTag, Upstream: upstream, Ahead: ahead, Behind: behind,
+		UserName: userName, UserEmail: userEmail, IdentityConfigured: userName != "" && userEmail != "",
+		Branches: branches, Remotes: remotes,
 	}, nil
+}
+
+func (manager *Manager) trackingInfo(ctx context.Context) (string, *int, *int) {
+	upstream, err := manager.gitOutput(ctx, manager.project.Root, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{upstream}")
+	if err != nil {
+		return "", nil, nil
+	}
+	counts, err := manager.gitOutput(ctx, manager.project.Root, "rev-list", "--left-right", "--count", "HEAD...@{upstream}")
+	if err != nil {
+		return upstream, nil, nil
+	}
+	var ahead, behind int
+	if _, err := fmt.Sscan(counts, &ahead, &behind); err != nil {
+		return upstream, nil, nil
+	}
+	return upstream, &ahead, &behind
+}
+
+func (manager *Manager) listRemotes(ctx context.Context) ([]Remote, error) {
+	output, err := manager.gitOutput(ctx, manager.project.Root, "remote")
+	if err != nil {
+		return nil, err
+	}
+	remotes := make([]Remote, 0)
+	for _, name := range strings.Fields(output) {
+		fetchURL, fetchErr := manager.gitOutput(ctx, manager.project.Root, "remote", "get-url", name)
+		pushURL, pushErr := manager.gitOutput(ctx, manager.project.Root, "remote", "get-url", "--push", name)
+		if fetchErr != nil || pushErr != nil {
+			return nil, fmt.Errorf("read remote %q urls", name)
+		}
+		remotes = append(remotes, Remote{Name: name, FetchURL: sanitizeRemoteURL(fetchURL), PushURL: sanitizeRemoteURL(pushURL)})
+	}
+	return remotes, nil
+}
+
+func remoteDefaultBranch(ctx context.Context, manager *Manager, remotes []Remote) string {
+	names := make([]string, 0, len(remotes))
+	for _, remote := range remotes {
+		names = append(names, remote.Name)
+	}
+	sort.SliceStable(names, func(left, right int) bool { return names[left] == "origin" && names[right] != "origin" })
+	for _, name := range names {
+		ref, err := manager.gitOutput(ctx, manager.project.Root, "symbolic-ref", "--quiet", "--short", "refs/remotes/"+name+"/HEAD")
+		if err == nil {
+			return strings.TrimPrefix(ref, name+"/")
+		}
+	}
+	return ""
+}
+
+func sanitizeRemoteURL(value string) string {
+	parsed, err := url.Parse(value)
+	if err != nil || parsed.Scheme == "" {
+		return value
+	}
+	parsed.User = nil
+	parsed.RawQuery = ""
+	parsed.Fragment = ""
+	return parsed.String()
 }
 
 func (manager *Manager) optionalHead(ctx context.Context) (string, bool, error) {
@@ -422,14 +543,14 @@ func (manager *Manager) workspacePath(taskID string) (string, error) {
 
 func (manager *Manager) resolveBranch(ctx context.Context, branch string) (string, error) {
 	if branch == "" {
-		return "", errors.New("target branch is not configured")
+		return "", fmt.Errorf("%w: branch is not configured", ErrTargetBranchInvalid)
 	}
 	if _, err := manager.gitOutput(ctx, manager.project.Root, "check-ref-format", "--branch", branch); err != nil {
-		return "", fmt.Errorf("invalid branch %q: %w", branch, err)
+		return "", fmt.Errorf("%w: %q: %v", ErrTargetBranchInvalid, branch, err)
 	}
 	commit, err := manager.gitOutput(ctx, manager.project.Root, "rev-parse", "--verify", "refs/heads/"+branch+"^{commit}")
 	if err != nil {
-		return "", fmt.Errorf("resolve branch %q: %w", branch, err)
+		return "", fmt.Errorf("%w: %q: %v", ErrTargetBranchNotFound, branch, err)
 	}
 	return commit, nil
 }

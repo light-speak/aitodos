@@ -100,13 +100,64 @@ func TestManagerCreatesAnnotatedReleaseTagIdempotently(t *testing.T) {
 
 func TestManagerReportsRepositoryBranchesAndHead(t *testing.T) {
 	repository, database := initializeRepository(t)
+	runGit(t, repository.Root, "remote", "add", "origin", "https://secret-token@example.com/team/repo.git?token=hidden")
+	runGit(t, repository.Root, "update-ref", "refs/remotes/origin/main", "refs/heads/main")
+	runGit(t, repository.Root, "symbolic-ref", "refs/remotes/origin/HEAD", "refs/remotes/origin/main")
+	runGit(t, repository.Root, "branch", "--set-upstream-to=origin/main", "main")
+	if err := os.WriteFile(filepath.Join(repository.Root, "ahead.txt"), []byte("ahead\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository.Root, "add", "ahead.txt")
+	runGit(t, repository.Root, "commit", "--quiet", "-m", "ahead")
 	manager := New(repository, database)
 	info, err := manager.RepositoryInfo(context.Background())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.CurrentBranch != "main" || info.HeadSHA == "" || len(info.Branches) != 1 || info.Branches[0].Name != "main" {
+	if info.CurrentBranch != "main" || info.DefaultBranch != "main" || info.HeadSHA == "" || len(info.Branches) != 1 || info.Branches[0].Name != "main" {
 		t.Fatalf("repository info = %#v", info)
+	}
+	if info.RemoteDefaultBranch != "main" || info.Upstream != "origin/main" || info.Ahead == nil || *info.Ahead != 1 || info.Behind == nil || *info.Behind != 0 {
+		t.Fatalf("tracking info = %#v", info)
+	}
+	if info.Root != repository.Root || info.GitCommonDir != repository.GitCommonDir || info.GitVersion == "" {
+		t.Fatalf("repository identity = %#v", info)
+	}
+	if info.UserName != "AiTodos Test" || info.UserEmail != "aitodos@example.invalid" {
+		t.Fatalf("git identity = %#v", info)
+	}
+	if len(info.Remotes) != 1 || info.Remotes[0].FetchURL != "https://example.com/team/repo.git" || info.Remotes[0].PushURL != "https://example.com/team/repo.git" {
+		t.Fatalf("sanitized remotes = %#v", info.Remotes)
+	}
+}
+
+func TestManagerUpdatesTargetBranchBeforeWorkspace(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	runGit(t, repository.Root, "branch", "release/macos")
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(ctx, task.CreateInput{Title: "macOS 发布", TargetBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(repository, database)
+
+	updated, err := manager.UpdateTaskTargetBranch(ctx, created.ID, created.Version, "release/macos")
+	if err != nil || updated.TargetBranch != "release/macos" {
+		t.Fatalf("UpdateTaskTargetBranch() = %#v, %v", updated, err)
+	}
+	if _, err := manager.UpdateTaskTargetBranch(ctx, created.ID, updated.Version, "missing"); err == nil {
+		t.Fatal("missing target branch unexpectedly accepted")
+	}
+	if _, err := manager.CreateTaskWorkspace(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	updated, err = store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := manager.UpdateTaskTargetBranch(ctx, created.ID, updated.Version, "main"); !errors.Is(err, storage.ErrTaskWorkspaceExists) {
+		t.Fatalf("UpdateTaskTargetBranch() after workspace error = %v", err)
 	}
 }
 

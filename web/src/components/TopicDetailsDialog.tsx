@@ -1,5 +1,5 @@
 import type { ComponentProps } from 'react'
-import { TextIcon, XIcon } from 'lucide-react'
+import { LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
 
 import type { DiscussionMessage, Task, TaskAssociation, Topic, TopicStatus } from '../types'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
@@ -32,7 +32,13 @@ interface TopicDetailsDialogProps {
 	planLoading: boolean
 	planSubmitting: boolean
 	planError: unknown
+	planningRun: ComponentProps<typeof PlanPanel>['planningRun']
+	planningLoading: boolean
+	planningError: unknown
+	requestingPlanning: boolean
+	workersEnabled: boolean
 	onReloadPlan: () => void
+	onRequestPlanning: ComponentProps<typeof PlanPanel>['onRequestPlanning']
 	onSubmitPlan: ComponentProps<typeof PlanPanel>['onSubmit']
 	onRejectPlan: ComponentProps<typeof PlanPanel>['onReject']
 	onApprovePlan: ComponentProps<typeof PlanPanel>['onApprove']
@@ -51,7 +57,7 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
   return (
     <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
       <SheetContent
-        className="gap-0 data-[side=right]:w-full data-[side=right]:sm:w-[min(52rem,calc(100vw-3rem))] data-[side=right]:sm:max-w-none"
+        className="gap-0 data-[side=right]:w-full data-[side=right]:sm:w-[min(88rem,calc(100vw-3rem))] data-[side=right]:sm:max-w-none"
         showCloseButton={false}
       >
         <SheetHeader className="gap-3 border-b px-5 py-5 sm:px-6">
@@ -65,56 +71,81 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="secondary">{statusLabels[topic.status].phase}</Badge>
             {statusLabels[topic.status].detail ? <Badge variant="outline">{statusLabels[topic.status].detail}</Badge> : null}
+			{props.planningRun && ['CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING'].includes(props.planningRun.status) ? <Badge variant="outline" className="gap-1.5 border-violet-200 bg-violet-50 text-violet-700"><LoaderCircleIcon className="size-3.5 animate-spin" />Agent 分析中</Badge> : null}
           </div>
         </SheetHeader>
 
-        <div className="min-h-0 flex-1 overflow-y-auto px-5 sm:px-6">
-          <section className="py-5">
-            <h3 className="mb-3 flex items-center gap-2 text-xs font-medium text-muted-foreground">
-              <TextIcon className="size-4" />议题描述
-            </h3>
-            <MarkdownContent content={topic.description} emptyText="未填写描述" />
-          </section>
-          <Separator />
-			<PlanPanel
-				topic={topic}
-				plan={props.plan}
-				loading={props.planLoading}
-				submitting={props.planSubmitting}
-				error={props.planError}
-				onReload={props.onReloadPlan}
-				onSubmit={props.onSubmitPlan}
-				onReject={props.onRejectPlan}
-				onApprove={props.onApprovePlan}
-			/>
-			<Separator />
-          <RelatedTasks
-            tasks={tasks}
-            associations={associations}
-            loading={props.relationLoading}
-            error={props.relationError}
-            pendingTaskIDs={props.pendingRelationTaskIDs}
-            onAdd={props.onAddRelation}
-            onRemove={props.onRemoveRelation}
-            onOpenTask={onOpenTask}
-          />
-          <Separator />
-          <DiscussionMessages
-            messages={messages}
-            tasks={tasks}
-            loading={props.discussionLoading}
-            error={props.discussionError}
-            onReload={props.onReloadDiscussion}
-            onOpenTask={onOpenTask}
-          />
-        </div>
+		<div className="grid min-h-0 flex-1 grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
+			<section className="flex min-h-0 min-w-0 flex-col border-r" aria-label="讨论区">
+				<WorkspaceHeading title="讨论区" detail="补充背景、约束和结论，Agent 会自动跟进" />
+				<div className="min-h-0 flex-1 overflow-y-auto px-5 sm:px-6">
+					<section className="py-5">
+						<h3 className="mb-3 flex items-center gap-2 text-xs font-medium text-muted-foreground">
+							<TextIcon className="size-4" />议题描述
+						</h3>
+						<MarkdownContent content={topic.description} emptyText="未填写描述" />
+					</section>
+					<Separator />
+					<DiscussionMessages
+						messages={messages}
+						tasks={tasks}
+						loading={props.discussionLoading}
+						error={props.discussionError}
+						onReload={props.onReloadDiscussion}
+						onOpenTask={onOpenTask}
+					/>
+				</div>
+				<DiscussionComposer
+					tasks={tasks}
+					submitting={props.submitting}
+					onSendMessage={props.onSendMessage}
+				/>
+			</section>
 
-        <DiscussionComposer
-          tasks={tasks}
-          submitting={props.submitting}
-          onSendMessage={props.onSendMessage}
-        />
+			<section className="min-h-0 min-w-0 bg-muted/10" aria-label="执行区">
+				<div className="flex h-full min-h-0 flex-col">
+					<WorkspaceHeading title="执行区" detail="确认 Agent 方案，再创建可执行 Task" />
+					<div className="min-h-0 flex-1 overflow-y-auto px-5 sm:px-6">
+						<PlanPanel
+							topic={topic}
+							plan={props.plan}
+							loading={props.planLoading}
+							submitting={props.planSubmitting}
+							error={props.planError}
+							planningRun={props.planningRun}
+							planningLoading={props.planningLoading}
+							planningError={props.planningError}
+							requestingPlanning={props.requestingPlanning}
+							workersEnabled={props.workersEnabled}
+							onReload={props.onReloadPlan}
+							onRequestPlanning={props.onRequestPlanning}
+							onSubmit={props.onSubmitPlan}
+							onReject={props.onRejectPlan}
+							onApprove={props.onApprovePlan}
+						/>
+						<Separator />
+						<RelatedTasks
+							tasks={tasks}
+							associations={associations}
+							loading={props.relationLoading}
+							error={props.relationError}
+							pendingTaskIDs={props.pendingRelationTaskIDs}
+							onAdd={props.onAddRelation}
+							onRemove={props.onRemoveRelation}
+							onOpenTask={onOpenTask}
+						/>
+					</div>
+				</div>
+			</section>
+		</div>
       </SheetContent>
     </Sheet>
   )
+}
+
+function WorkspaceHeading({ title, detail }: { title: string; detail: string }) {
+	return <div className="flex items-baseline gap-3 border-b bg-background/80 px-5 py-3 sm:px-6">
+		<h3 className="font-medium">{title}</h3>
+		<p className="truncate text-xs text-muted-foreground">{detail}</p>
+	</div>
 }

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { CheckIcon, ChevronDownIcon, FileDiffIcon, RefreshCwIcon, XIcon } from 'lucide-react'
 
 import {
@@ -15,10 +15,17 @@ interface TaskChangesPanelProps {
 	onWorkspaceChanged: () => void
 }
 
+const DiffPreview = lazy(async () => {
+	const module = await import('./DiffPreview')
+	return { default: module.DiffPreview }
+})
+
 export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspaceChanged }: TaskChangesPanelProps) {
 	const [changes, setChanges] = useState<TaskChanges | null>(null)
 	const [reviews, setReviews] = useState<TaskReview[]>([])
 	const [selectedDiff, setSelectedDiff] = useState<FileDiff | null>(null)
+	const [loadingDiffPath, setLoadingDiffPath] = useState<string | null>(null)
+	const diffRequestID = useRef(0)
 	const [comment, setComment] = useState('')
 	const [loading, setLoading] = useState(hasWorkspace)
 	const [pending, setPending] = useState(false)
@@ -74,13 +81,32 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 		}
 	}
 
-	async function openDiff(path: string) {
-		setError('')
-		try {
-			setSelectedDiff(await getTaskFileDiff(task.id, path))
-		} catch (diffError: unknown) {
-			setError(errorMessage(diffError))
+	async function toggleDiff(path: string) {
+		if (selectedDiff?.path === path || loadingDiffPath === path) {
+			diffRequestID.current += 1
+			setSelectedDiff(null)
+			setLoadingDiffPath(null)
+			return
 		}
+		const requestID = diffRequestID.current + 1
+		diffRequestID.current = requestID
+		setError('')
+		setSelectedDiff(null)
+		setLoadingDiffPath(path)
+		try {
+			const loaded = await getTaskFileDiff(task.id, path)
+			if (diffRequestID.current === requestID) setSelectedDiff(loaded)
+		} catch (diffError: unknown) {
+			if (diffRequestID.current === requestID) setError(errorMessage(diffError))
+		} finally {
+			if (diffRequestID.current === requestID) setLoadingDiffPath(null)
+		}
+	}
+
+	function closeDiff() {
+		diffRequestID.current += 1
+		setSelectedDiff(null)
+		setLoadingDiffPath(null)
 	}
 
 	return (
@@ -105,11 +131,12 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 					{changes.files.length === 0 ? <p className="p-5 text-center text-sm text-muted-foreground">没有相对 Base Commit 的修改</p> : (
 						<ul>{changes.files.map((file) => (
 							<li className="border-b last:border-b-0" key={file.path}>
-								<button className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-muted/40" type="button" onClick={() => { void openDiff(file.path) }}>
+								<button className="flex w-full items-center gap-3 px-4 py-3 text-left text-sm hover:bg-muted/40" type="button" aria-expanded={selectedDiff?.path === file.path || loadingDiffPath === file.path} onClick={() => { void toggleDiff(file.path) }}>
 									<span className="w-16 text-xs text-muted-foreground">{file.status}</span><span className="min-w-0 flex-1 truncate font-mono text-xs">{file.path}</span>
-									<span className="font-mono text-xs text-emerald-700">+{file.additions}</span><span className="font-mono text-xs text-rose-700">−{file.deletions}</span><ChevronDownIcon className="size-4" />
+									<span className="font-mono text-xs text-emerald-700">+{file.additions}</span><span className="font-mono text-xs text-rose-700">−{file.deletions}</span><ChevronDownIcon className={`size-4 transition-transform ${selectedDiff?.path === file.path ? 'rotate-180' : ''}`} />
 								</button>
-								{selectedDiff?.path === file.path ? <DiffPreview diff={selectedDiff} onClose={() => setSelectedDiff(null)} /> : null}
+								{loadingDiffPath === file.path ? <p className="border-t bg-zinc-950 px-4 py-3 text-xs text-zinc-400">正在读取 Diff…</p> : null}
+								{selectedDiff?.path === file.path ? <Suspense fallback={<p className="border-t bg-zinc-950 px-4 py-3 text-xs text-zinc-400">正在准备高亮…</p>}><DiffPreview diff={selectedDiff} onClose={closeDiff} /></Suspense> : null}
 							</li>
 						))}</ul>
 					)}
@@ -125,8 +152,4 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 			{reviews.length > 0 ? <div><h4 className="mb-2 text-xs font-medium text-muted-foreground">验收历史</h4><ul className="space-y-2">{reviews.map((review) => <li className="rounded-lg border px-3 py-2 text-sm" key={review.id}><strong>{review.decision === 'ACCEPTED' ? '已通过' : '要求修改'}</strong>{review.comment ? ` · ${review.comment}` : ''}{review.commit_sha ? <span className="ml-2 font-mono text-xs text-muted-foreground">{review.commit_sha.slice(0, 8)}</span> : null}</li>)}</ul></div> : null}
 		</section>
 	)
-}
-
-function DiffPreview({ diff, onClose }: { diff: FileDiff; onClose: () => void }) {
-	return <div className="border-t bg-zinc-950 text-zinc-100"><div className="flex items-center justify-between px-4 py-2 text-xs"><span>{diff.binary ? '二进制文件' : diff.truncated ? 'Diff 已截断' : 'Unified diff'}</span><Button variant="ghost" size="icon-sm" type="button" aria-label="关闭 Diff" onClick={onClose}><XIcon /></Button></div><pre className="max-h-96 overflow-auto border-t border-white/10 p-4 font-mono text-xs leading-5">{diff.binary ? '不展示二进制内容' : diff.patch}</pre></div>
 }

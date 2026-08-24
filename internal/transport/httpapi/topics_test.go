@@ -93,6 +93,31 @@ func TestTopicRoutesCreateAndListMessages(t *testing.T) {
 	requestMessage(t, server.Client(), http.MethodGet, server.URL+"/api/topics/missing/messages", "", http.StatusNotFound)
 }
 
+func TestTopicRoutesRequestAnotherPlanningTurn(t *testing.T) {
+	server := newTopicTestServer(t)
+	created := requestTopic(t, server.Client(), http.MethodPost, server.URL+"/api/topics", `{"title":"重新整理方案"}`, http.StatusCreated)
+
+	updated := requestTopic(
+		t,
+		server.Client(),
+		http.MethodPost,
+		server.URL+"/api/topics/"+created.ID+"/planning",
+		`{"expected_version":1}`,
+		http.StatusOK,
+	)
+	if updated.Version != 2 || updated.Status != topic.StatusOpen {
+		t.Fatalf("updated topic = %#v", updated)
+	}
+	requestTopic(
+		t,
+		server.Client(),
+		http.MethodPost,
+		server.URL+"/api/topics/"+created.ID+"/planning",
+		`{"expected_version":1}`,
+		http.StatusConflict,
+	)
+}
+
 func TestTopicRoutesLinkTasksDirectlyAndFromMessages(t *testing.T) {
 	server := newTopicTestServer(t)
 	createdTopic := requestTopic(t, server.Client(), http.MethodPost, server.URL+"/api/topics", `{"title":"讨论搜索"}`, http.StatusCreated)
@@ -144,7 +169,7 @@ func newTopicTestServer(t *testing.T) *httptest.Server {
 	relationStore := storage.NewRelationStore(database)
 	RegisterTopicRoutes(mux, storage.NewTopicStore(database), discussionStore, relationStore)
 	taskStore := storage.NewTaskStore(database)
-	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database))
+	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), nil)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server

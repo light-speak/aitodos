@@ -103,10 +103,8 @@ func (input RevisionInput) Validate() error {
 	if len(input.Instructions) < 1 || len(input.Instructions) > 20000 {
 		return errors.New("instructions 长度必须为 1 到 20000")
 	}
-	if input.Adapter != "generic" {
-		if input.Adapter != "codex" {
-			return errors.New("当前只支持 generic 或 codex adapter")
-		}
+	if input.Adapter != "generic" && input.Adapter != "codex" && input.Adapter != "codex-app-server" {
+		return errors.New("当前只支持 generic、codex 或 codex-app-server adapter")
 	}
 	if input.Command == "" || len(input.Command) > 1000 {
 		return errors.New("command 不能为空且最长 1000 个字符")
@@ -139,8 +137,8 @@ func (input RevisionInput) Validate() error {
 	if err := input.ToolPolicy.Validate(); err != nil {
 		return err
 	}
-	if len(input.ToolPolicy.MCPServers) > 0 && input.Adapter != "codex" {
-		return errors.New("MCP Tool Policy 当前要求使用 codex adapter")
+	if len(input.ToolPolicy.MCPServers) > 0 && input.Adapter != "codex" && input.Adapter != "codex-app-server" {
+		return errors.New("MCP Tool Policy 当前要求使用 Codex adapter")
 	}
 	return nil
 }

@@ -15,6 +15,7 @@ import (
 	"github.com/light-speak/aitodos/internal/capabilitycatalog"
 	"github.com/light-speak/aitodos/internal/gitworkflow"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/recovery"
 	"github.com/light-speak/aitodos/internal/scheduler"
 	"github.com/light-speak/aitodos/internal/storage"
 	"github.com/light-speak/aitodos/internal/transport/httpapi"
@@ -40,6 +41,9 @@ func Serve(
 		return fmt.Errorf("open project database: %w", err)
 	}
 	defer database.Close()
+	if err := recovery.New(currentProject, database).Start(ctx); err != nil {
+		return fmt.Errorf("recover project runs: %w", err)
+	}
 	projectScheduler := scheduler.New(currentProject, database)
 	go projectScheduler.Run(ctx)
 
@@ -110,7 +114,7 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	httpapi.RegisterPlanRoutes(mux, storage.NewPlanStore(database))
 	taskStore := storage.NewTaskStore(database)
 	assessmentStore := storage.NewAssessmentStore(database)
-	httpapi.RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, assessmentStore)
+	httpapi.RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, assessmentStore, gitManager)
 	httpapi.RegisterAssessmentRoutes(mux, taskStore, assessmentStore)
 	httpapi.RegisterArtifactRoutes(mux, storage.NewArtifactStore(database, currentProject.Paths.Artifacts))
 	httpapi.RegisterGitWorkflowRoutes(mux, gitManager)
@@ -121,7 +125,9 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	))
 	httpapi.RegisterQualityRoutes(mux, storage.NewQualityStore(database))
 	httpapi.RegisterClarificationRoutes(mux, storage.NewClarificationStore(database))
-	httpapi.RegisterRunRoutes(mux, storage.NewRunStore(database))
+	runStore := storage.NewRunStore(database)
+	httpapi.RegisterRunRoutes(mux, runStore, currentProject.Paths.Artifacts)
+	httpapi.RegisterApprovalRoutes(mux, runStore)
 	mux.HandleFunc("GET /api/health", func(response http.ResponseWriter, _ *http.Request) {
 		response.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(response).Encode(Health{

@@ -1,14 +1,19 @@
 import { useState } from 'react'
-import { CircleHelpIcon, RefreshCwIcon } from 'lucide-react'
+import { ChevronLeftIcon, ChevronRightIcon, CircleHelpIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
-import type { Clarification, ClarificationAnswerInput, Task } from '../types'
+import type { ApprovalDecision, ApprovalRequest, Clarification, ClarificationAnswerInput, Task } from '../types'
+import { ApprovalInbox } from './ApprovalInbox'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog'
 import { Textarea } from './ui/textarea'
 
 type AnswerValue = Omit<ClarificationAnswerInput, 'expected_version'>
+
+type PendingEntry =
+	| { kind: 'approval'; item: ApprovalRequest }
+	| { kind: 'clarification'; item: Clarification }
 
 interface AnswerCardProps {
 	item: Clarification
@@ -121,31 +126,51 @@ export function TaskClarificationsPanel(props: {
 
 export function ClarificationInboxDialog(props: {
 	items: Clarification[]
+	approvals: ApprovalRequest[]
 	tasks: Task[]
 	answeringID: string | null
+	decidingApprovalID: string | null
 	onClose: () => void
 	onOpenTask: (taskID: string) => void
 	onAnswer: (item: Clarification, input: AnswerValue) => Promise<void>
+	onDecideApproval: (item: ApprovalRequest, decision: ApprovalDecision) => Promise<void>
 }) {
+	const [currentIndex, setCurrentIndex] = useState(0)
+	const entries: PendingEntry[] = [
+		...props.approvals.map((item): PendingEntry => ({ kind: 'approval', item })),
+		...props.items.map((item): PendingEntry => ({ kind: 'clarification', item })),
+	]
+	const safeIndex = Math.min(currentIndex, Math.max(entries.length - 1, 0))
+	const current = entries[safeIndex]
+
 	return (
 		<Dialog open onOpenChange={(open) => { if (!open) props.onClose() }}>
 			<DialogContent className="max-h-[calc(100svh-2rem)] overflow-y-auto sm:max-w-2xl">
 				<DialogHeader>
-					<DialogTitle>等待你的回答</DialogTitle>
-					<DialogDescription>回答后 Task 会自动回到队列，由新的 Run 携带这次答案继续执行。</DialogDescription>
+					<DialogTitle>需要你处理</DialogTitle>
+					<DialogDescription>一次处理一项；正在等待 Agent 的权限请求优先展示。</DialogDescription>
 				</DialogHeader>
-				{props.items.length === 0 ? <p className="rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">当前没有待回答问题。</p> : (
-					<div className="grid gap-4">
-						{props.items.map((item) => (
-							<div className="grid gap-2" key={item.id}>
-								<Button variant="ghost" className="h-auto justify-start px-1 text-sm" onClick={() => props.onOpenTask(item.task_id)}>
-									{taskLabel(props.tasks, item.task_id)}
-								</Button>
-								<ClarificationAnswerCard item={item} compact answering={props.answeringID === item.id} onAnswer={(input) => props.onAnswer(item, input)} />
-							</div>
-						))}
+				{current ? (
+					<div className="flex items-center justify-between gap-3 border-y py-3" aria-label="待处理翻页">
+						<p className="text-sm text-muted-foreground"><span className="font-medium text-foreground">{safeIndex + 1} / {entries.length}</span> · {current.kind === 'approval' ? '权限请求' : 'Agent 问题'}</p>
+						<div className="flex gap-2">
+							<Button variant="outline" size="sm" type="button" aria-label="上一条" disabled={safeIndex === 0} onClick={() => setCurrentIndex(Math.max(0, safeIndex - 1))}><ChevronLeftIcon />上一条</Button>
+							<Button variant="outline" size="sm" type="button" aria-label="下一条" disabled={safeIndex >= entries.length - 1} onClick={() => setCurrentIndex(Math.min(entries.length - 1, safeIndex + 1))}>下一条<ChevronRightIcon /></Button>
+						</div>
 					</div>
-				)}
+				) : null}
+				{current?.kind === 'approval' ? (
+					<ApprovalInbox items={[current.item]} tasks={props.tasks} decidingID={props.decidingApprovalID} onOpenTask={props.onOpenTask} onDecide={props.onDecideApproval} />
+				) : current?.kind === 'clarification' ? (
+					<div className="grid gap-4">
+						<div className="grid gap-2" key={current.item.id}>
+							<Button variant="ghost" className="h-auto justify-start px-1 text-sm" onClick={() => props.onOpenTask(current.item.task_id)}>
+								{taskLabel(props.tasks, current.item.task_id)}
+							</Button>
+							<ClarificationAnswerCard item={current.item} compact answering={props.answeringID === current.item.id} onAnswer={(input) => props.onAnswer(current.item, input)} />
+						</div>
+					</div>
+				) : <p className="rounded-lg bg-muted/50 p-4 text-sm text-muted-foreground">当前没有待处理事项。</p>}
 			</DialogContent>
 		</Dialog>
 	)

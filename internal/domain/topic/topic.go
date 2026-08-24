@@ -77,6 +77,8 @@ type EventType string
 const (
 	EventCreated       EventType = "TOPIC_CREATED"
 	EventStatusChanged EventType = "TOPIC_STATUS_CHANGED"
+	EventMessageAdded  EventType = "TOPIC_MESSAGE_ADDED"
+	EventPlanningAsked EventType = "TOPIC_PLANNING_REQUESTED"
 )
 
 // Event 是 Topic 聚合内按序追加的审计记录。

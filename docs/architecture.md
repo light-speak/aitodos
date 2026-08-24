@@ -1,6 +1,6 @@
 # AiTodos 架构设计基线
 
-- 状态：Draft，ADR-0001 至 ADR-0013 已接受；Topic/Task 讨论、Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Agent Profile Revision、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage 和持久 Clarification/Continuation Run 已实现；MCP 调用审计与资源回收、Planning Run、Search/MCP Read Server、SSE、取消与完整 Crash Recovery 正在推进
+- 状态：Draft，ADR-0001 至 ADR-0019 已接受；Topic/Task 讨论、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
@@ -128,7 +128,7 @@ Run 业务主体没有其他活跃 Run
 Run 状态为 QUEUED
 ```
 
-PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；TRIAGE Run 作用于 Task 但不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。Worker 开关只控制当前项目的新 Claim；正式 Task 自动进入内部 READY，缺少有效评估时先执行 Triage，Revision 优先于 Implementation，随后按 P0–P3 和排队时间排序。Triage 失败或 Profile 未配置不得永久阻塞 Implementation。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
+PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；每个 OPEN Topic 的新输入版本最多自动尝试一次，失败不会无限重试。TRIAGE Run 作用于 Task 但不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。Worker 开关只控制当前项目的新 Claim；正式 Task 自动进入内部 READY，缺少有效评估时先执行 Triage，Revision 优先于 Implementation，随后按 P0–P3 和排队时间排序。Triage 失败或 Profile 未配置不得永久阻塞 Implementation。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
 
 ### Workspace Manager
 
@@ -174,6 +174,8 @@ AgentProfile
 
 一个执行过 `ats init` 的本地 Git 仓库，保存默认分支、各 Run purpose 的默认 Agent Profile、默认模型、并发限制、环境变量引用、项目说明和文件策略。每个 Project 自己持有 `.ats/state.db`，不存在全局业务数据库或项目注册表。
 
+初始化默认分支优先使用本地已知的 Remote HEAD，其次使用已有的 `main/master/trunk/develop`，最后才使用当前分支。该判断不访问网络；用户需要自行保证本地 Remote refs 已按需 fetch。
+
 Project 的仓库身份不能只依赖用户输入路径。初始化和启动时解析：
 
 - `repoPath`：用户看到的路径。
@@ -183,7 +185,7 @@ Project 的仓库身份不能只依赖用户输入路径。初始化和启动时
 
 ### Topic
 
-代表需要持续讨论、澄清和规划的问题。Topic 可以经历多轮 Planning Run 和多个 Plan Revision，不获得 Git Workspace。Topic 的 Message 是历史事实，当前约束由有效 Decision、开放 Clarification 和批准 Plan 表达。
+代表需要持续讨论、澄清和规划的问题。创建 Topic、追加人类消息或显式请求重试都会形成新的规划输入版本；Scheduler 自动为尚未尝试的 OPEN 版本创建 Planning Run。Topic 可以经历多轮 Planning Run 和多个 Plan Revision，不获得 Git Workspace。Topic 的 Message 是历史事实，当前约束由有效 Decision、开放 Clarification 和批准 Plan 表达。
 
 ### Plan
 
@@ -227,11 +229,15 @@ Progress Projection 是从 Task、Estimate、Test、Run 和 Review 重建的项�
 
 ### Run
 
-一次独立 AI CLI 执行。Run purpose 为 `PLANNING`、`TRIAGE`、`IMPLEMENTATION`、`REVISION` 或 `REVIEW`，并通过受外键和 CHECK 约束的字段绑定恰好一个 Topic 或 Task。Run 从排队开始形成完整审计记录。Run 创建后，其 Agent Profile Revision、Model、Prompt、Context、环境配置、Workspace 和执行策略快照不可变。Agent 提出阻塞问题时 Run 以 `NEEDS_INPUT` 结束并释放 Worker；人工回答后由新的 `continuation_of_run_id` Run 继续。
+一次独立 AI CLI 执行。Run purpose 为 `PLANNING`、`TRIAGE`、`IMPLEMENTATION`、`REVISION` 或 `REVIEW`，并通过受外键和 CHECK 约束的字段绑定恰好一个 Topic 或 Task。Run 从排队开始形成完整审计记录。Run 创建后，其 Agent Profile Revision、Model、Prompt、Context、环境配置、Workspace 和执行策略快照不可变。Agent 提出阻塞问题时 Run 以 `NEEDS_INPUT` 结束并释放 Worker；人工回答后由新的 `continuation_of_run_id` Run 继续。Agent 进程退出后，Run 先进入 `FINALIZING`；使用 Workspace 的 Run 保存不可变的 HEAD/dirty 前后快照，随后才能写入终态。Task Run 历史默认只读取摘要，失败详情、Artifact 元数据和 Workspace 快照按 Run 读取，stdout/stderr 正文只在人类点击后读取，详见 [ADR-0015](adr/0015-run-finalization-workspace-snapshots-and-lazy-logs.md)。
 
 ### AgentSession
 
-AgentSession 可以在同一 Topic 或 Task 的多个 Run 之间复用，但不是事实来源。Profile Prompt、Model 或关键 Project Instructions 不兼容变化时默认创建新 Session；Resume 不可用时从持久数据重建 Context。
+Schema v25 的 AgentSession 可以在同一 Topic 或 Task 的多个 Run 之间复用，但不是事实来源。当前要求精确匹配 Profile Revision、Adapter 和 Model；`codex` 使用 CLI Resume，`codex-app-server` 使用 `thread/resume`。Resume 不可用或失败时使 Session 失效，并从持久数据重建 Context，详见 [ADR-0017](adr/0017-codex-app-server-sessions-approvals-and-notifications.md)。
+
+### ApprovalRequest
+
+Schema v26 的 ApprovalRequest 保存同一次 Agent Turn 发出的命令、文件、网络或额外权限请求。开放请求进入全局待处理列表；人类决定通过乐观锁回传 App Server。它与需要新 Continuation Run 的 Clarification 分离，不解析不稳定的终端自然语言。
 
 ### ReviewDecision
 
@@ -376,6 +382,8 @@ created_at, updated_at, version
 
 Task 更新使用 `version` 乐观锁，避免 UI 重复提交覆盖较新的状态。
 
+`target_branch` 必须是带 Commit 的本地 Branch。创建 Task 时由 UI 默认选择 Project 默认分支；Workspace 创建前可以通过领域命令调整并产生审计事件，绑定 Workspace 后锁定。Remote-only Branch 必须先由用户在 Git 中取得对应本地 Branch，AiTodos 不隐式 fetch 或 checkout。
+
 正式 Task 的优先级为 `P0`、`P1`、`P2` 或 `P3`，默认 `P2`。Task 草稿仍属于 Plan Revision；只有正式 Task 自动进入 Worker 候选集。
 
 ### task_estimate_revisions / task_test_cases / task_test_results
@@ -429,7 +437,7 @@ PROVISIONING, READY, LEASED, DIRTY, QUARANTINED,
 CLEANING, REMOVED, ERROR
 ```
 
-Schema v7 当前落地 `PROVISIONING`、`READY`、`DIRTY`、`QUARANTINED` 和 `ERROR`；Lease、清理和移除状态随 Run 生命周期实现增加，不能用临时字符串绕过 migration。
+Schema v7 当前落地 `PROVISIONING`、`READY`、`DIRTY`、`QUARANTINED` 和 `ERROR`；Schema v22 记录每次使用 Workspace 的 Run 在 Finalization 后的不可变 HEAD/dirty 快照。Lease、清理和移除状态随 Run 生命周期实现增加，不能用临时字符串绕过 migration。
 
 ### releases / release_tasks
 
@@ -531,6 +539,8 @@ created_at
 
 每个聚合内使用递增 `sequence`，并建立 `(aggregate_id, sequence)` 唯一索引。事件 payload 使用版本化 JSON，便于以后增加字段。
 
+Schema v23 已落地 `run_events`。Run Claim 和状态迁移在更新当前状态的同一事务内追加事件；`GET /api/runs/{runID}/events` 使用 sequence 作为 SSE `id`，支持 `Last-Event-ID` 和 `after` 断点。前端按 Run 记录最大已消费 sequence 并忽略重复事件。原始日志不进入 SSE，详见 [ADR-0016](adr/0016-run-events-and-resumable-sse.md)。
+
 ### artifacts / run_artifacts
 
 图片 Artifact Index 保存：
@@ -553,6 +563,8 @@ created_at
 ```
 
 Artifact 路径必须是数据目录下的相对路径，读取时再次校验解析结果没有逃逸 Artifact Root。
+
+Task 页面只默认读取 Run 摘要。Run Detail 读取 Artifact 元数据，不直接内联大内容；stdout/stderr 必须通过独立只读端点按需加载，并再次校验声明大小和 SHA-256。原始日志和完整 Diff 不进入默认搜索投影或 Agent Context。
 
 ### summaries / search_documents
 
@@ -583,19 +595,17 @@ Summary 保存主体、来源序号范围、内容哈希、生成 Run 和人工�
 
 ```text
 Topic OPEN
-  ├── Planning Run 需要输入 → NEEDS_CLARIFICATION
-  │                              ↓ answer / start new Run
-  │                            OPEN
-  ├── 提交 Plan Revision ─────→ PLAN_REVIEW
+  ├── Planning Run 回复问题 ─→ OPEN（下一条人类消息形成新版本）
+  ├── Planning Run 提交草案 ─→ PLAN_REVIEW
   │                              ├── approve → PLANNED
-  │                              └── revise ─→ OPEN
+  │                              └── revise ─→ OPEN（自动开始新一轮）
   └── close ──────────────────→ CLOSED
 
 Plan DRAFT → IN_REVIEW → APPROVED → SUPERSEDED
                        └──────────→ CANCELLED
 ```
 
-Topic 的活跃 Planning Run 作为派生执行信息展示，不额外维护 `agent_running` 布尔值。批准 Plan Revision 和批量创建 Task 必须经过领域命令；Planner Run 只能提交草案。
+Topic 的活跃 Planning Run 作为派生执行信息展示，不额外维护 `agent_running` 布尔值。Planning 结果包含必须写回讨论的 Agent Reply 和可选 Plan Revision；如果 Run 执行期间 Topic 已出现更新版本，旧 Run 的 Reply 仍保留，但旧 Plan 草案不会覆盖新输入。批准 Plan Revision 和批量创建 Task 必须经过领域命令；Planner Run 只能提交草案。详细并发与恢复语义见 [ADR-0019](adr/0019-automatic-topic-planning-turns.md)。
 
 ### Task 状态
 
@@ -725,7 +735,7 @@ Agent 通过 MCP 调用外部工具时，结构化 Adapter 或受管 MCP Gateway
 7. 更新 Topic 或 Task 的派生状态。
 8. 释放 Workspace Lease。
 
-Finalization 在写入终态前回收当前 Run 所有的 MCP 资源。成功、失败、取消、超时和恢复对账共用幂等 Cleanup；清理失败必须保存诊断并在 Run Detail 显示，不能静默结束。
+Schema v27 在进入 `FINALIZING` 时先冻结不可变终态意图。当前 Runner 已在 Agent 成功、失败、超时、取消和 Clarification 路径中刷新 Workspace、写入前后快照并幂等提交终态；Daemon/Runner 崩溃后可以重放。Finalization 在写入终态前仍必须回收已登记的 MCP 资源；ADR-0012 的 MCP 资源租约尚未实现，因此当前不能保证关闭未知外部浏览器。清理失败必须保存诊断并在 Run Detail 显示，不能静默结束。
 
 Finalization 必须幂等。重复执行不得重复创建 Review、Run 或状态迁移。
 
@@ -883,10 +893,17 @@ Run 快照只保存变量名、来源、是否存在和脱敏哈希，不保存�
 
 ## 13. Git Workspace 生命周期
 
+### 仓库事实
+
+Repository API 只读取当前本地仓库，返回仓库根目录、规范化 `gitCommonDir`、Git 版本、项目默认分支、Remote HEAD、当前 Branch/HEAD/dirty、Upstream、ahead/behind、本地分支、Git 用户身份和 Remote 列表。Remote URL 在传输前移除 URL UserInfo、Query 与 Fragment，避免把常见凭据形式带入 UI、日志或 Agent Context。
+
+这些信息不触发 fetch，因此 Remote HEAD 和 ahead/behind 只表达本地已知状态。系统不把“刷新仓库信息”解释为网络授权，也不自动 push。
+
 ### 创建
 
 ```text
 验证 Git 仓库
+→ 校验 Task 目标是已有 Commit 的本地 Branch
 → 解析目标分支为固定 Base SHA
 → 获取 gitCommonDir 仓库锁
 → 创建唯一 Task Branch
@@ -942,7 +959,7 @@ sequence, timestamp, stream, event_type, payload
 
 建议每个日志 segment 上限 10 MiB，每个 Run 配置总日志上限。达到上限后记录 `truncated=true`，保留头部摘要和末尾诊断信息，不能让无限输出耗尽磁盘。
 
-Artifact 使用临时文件写入，完成后 flush、校验并原子 rename。SSE 从 RunEvent 和日志 offset 增量读取，使用 SSE `id` 支持浏览器断线续传。
+Artifact 使用临时文件写入，完成后 flush、校验并原子 rename。当前 SSE 从持久 Run Event 增量读取，使用 SSE `id` 支持浏览器断线续传；日志正文仍通过 Artifact API 按需读取，不通过 SSE 逐行广播。
 
 ## 15. Cancel、Timeout 与资源限制
 
@@ -1001,6 +1018,8 @@ contextSafetyMarginTokens
 | Agent/测试业务失败 | 默认不自动重试 |
 
 每次真正重新调用 AI 都创建新 Run，并通过 `retry_of_run_id` 建立关系。只有能证明 CLI 从未启动时，原 Run 才能重新排队。
+
+Schema v27 已实现 Runner 15 秒心跳/45 秒 Lease、PID + 内核启动身份 + Run nonce 校验、旧 Runner 继续观察、冻结 Finalization 重放和保守 `LOST`。恢复不会自动调用 Agent；MCP 外部资源的恢复边界仍以 ADR-0012 为准。
 
 ## 17. API
 
@@ -1061,13 +1080,23 @@ GET    /api/clarifications
 GET    /api/tasks/{taskId}/clarifications
 POST   /api/clarifications/{clarificationId}/answer
 
+GET    /api/runs
+GET    /api/runs/{runId}
+GET    /api/runs/{runId}/logs
+GET    /api/runs/{runId}/events
+POST   /api/runs/{runId}/cancel
+POST   /api/tasks/{taskId}/retry
+GET    /api/approvals
+GET    /api/runs/{runId}/approvals
+POST   /api/approvals/{approvalId}/decision
+
 GET    /api/git
 GET    /api/releases
 POST   /api/releases
 POST   /api/artifacts/images
 ```
 
-Topic Planning Run、Topic Clarification、Run 查询/取消/重试/SSE、Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Plan Revision/人工审核/批准建 Task、Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
+Topic Planning Run、Topic Clarification、Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Run 查询、详情、按需日志、SSE、取消、人工 Retry 和结构化 Approval 已提供有界接口。Plan Revision/人工审核/批准建 Task、Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
 
 写命令携带目标聚合的 `version` 或 `If-Match`，冲突返回 409。批准 Plan、批量生成 Task、回答 Clarification 和状态迁移必须使用领域命令，不提供通用状态 PATCH。
 

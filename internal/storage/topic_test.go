@@ -68,3 +68,22 @@ func TestTopicStoreRejectsStaleVersionAndReturnsNotFound(t *testing.T) {
 		t.Fatalf("Get() error = %v, want ErrTopicNotFound", err)
 	}
 }
+
+func TestTopicStoreRequestsAnotherPlanningTurn(t *testing.T) {
+	ctx := context.Background()
+	store := NewTopicStore(openTaskTestDatabase(t))
+	created, err := store.Create(ctx, topic.CreateInput{Title: "重新整理方案"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.RequestPlanning(ctx, created.ID, created.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Version != created.Version+1 || updated.Status != topic.StatusOpen {
+		t.Fatalf("updated topic = %#v", updated)
+	}
+	if _, err := store.RequestPlanning(ctx, created.ID, created.Version); !errors.Is(err, ErrTopicVersionConflict) {
+		t.Fatalf("stale request error = %v", err)
+	}
+}

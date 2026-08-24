@@ -120,6 +120,48 @@ func (store *TopicStore) ApplyCommand(ctx context.Context, id string, expectedVe
 	return updated, nil
 }
 
+// RequestPlanning 将当前 OPEN Topic 的最新内容标记为需要新的规划轮次。
+func (store *TopicStore) RequestPlanning(ctx context.Context, id string, expectedVersion int64) (topic.Topic, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return topic.Topic{}, fmt.Errorf("begin planning request: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTopic(ctx, transaction, id)
+	if err != nil {
+		return topic.Topic{}, err
+	}
+	if current.Version != expectedVersion {
+		return topic.Topic{}, ErrTopicVersionConflict
+	}
+	if current.Status != topic.StatusOpen {
+		return topic.Topic{}, errors.New("only open topic can request planning")
+	}
+	updated := current
+	updated.Version++
+	updated.UpdatedAt = time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `
+UPDATE topics SET version = ?, updated_at = ? WHERE id = ? AND status = 'OPEN' AND version = ?`,
+		updated.Version, formatTime(updated.UpdatedAt), current.ID, current.Version)
+	if err != nil {
+		return topic.Topic{}, fmt.Errorf("request topic planning: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return topic.Topic{}, ErrTopicVersionConflict
+	}
+	event, err := newTopicActivityEvent(updated, topic.EventPlanningAsked, map[string]any{"schema_version": 1})
+	if err != nil {
+		return topic.Topic{}, err
+	}
+	if err := insertTopicEvent(ctx, transaction, event); err != nil {
+		return topic.Topic{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return topic.Topic{}, fmt.Errorf("commit planning request: %w", err)
+	}
+	return updated, nil
+}
+
 // ListEvents 返回 Topic 的完整审计记录。
 func (store *TopicStore) ListEvents(ctx context.Context, topicID string) ([]topic.Event, error) {
 	rows, err := store.database.QueryContext(ctx, `
@@ -186,6 +228,21 @@ func prepareTopicTransition(current topic.Topic, next topic.Status, command topi
 		Type: topic.EventStatusChanged, Payload: payload, OccurredAt: now,
 	}
 	return updated, event, nil
+}
+
+func newTopicActivityEvent(current topic.Topic, eventType topic.EventType, payloadValue map[string]any) (topic.Event, error) {
+	eventID, err := newID()
+	if err != nil {
+		return topic.Event{}, err
+	}
+	payload, err := json.Marshal(payloadValue)
+	if err != nil {
+		return topic.Event{}, fmt.Errorf("encode topic activity event: %w", err)
+	}
+	return topic.Event{
+		ID: eventID, TopicID: current.ID, Sequence: current.Version,
+		Type: eventType, Payload: payload, OccurredAt: current.UpdatedAt,
+	}, nil
 }
 
 func insertTopic(ctx context.Context, transaction *sql.Tx, item topic.Topic) error {

@@ -117,17 +117,47 @@ func TestTaskRoutesDiscussAndRelateTasks(t *testing.T) {
 	requestStatus(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+owner.ID+"/relations", `{"task_id":"`+owner.ID+`"}`, http.StatusBadRequest)
 }
 
+func TestTaskRoutesRetryCancelledRunWithoutCancellingTask(t *testing.T) {
+	database, server := newTaskTestServerWithDatabase(t)
+	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"保留后重新排队"}`, http.StatusCreated)
+	now := "2026-08-21T00:00:00Z"
+	if _, err := database.ExecContext(t.Context(), `
+INSERT INTO runs(
+    id, purpose, task_id, status, profile_revision_id, claim_token_hash,
+    lease_generation, lease_expires_at, run_nonce, queued_at, claimed_at,
+    finished_at, exit_code, created_at, updated_at, subject_version
+) VALUES ('run-cancelled', 'IMPLEMENTATION', ?, 'CANCELLED', 'profile-implementer-r1',
+          'hash', 1, ?, 'nonce', ?, ?, ?, -1, ?, ?, 1)`,
+		created.ID, now, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(t.Context(), `
+UPDATE tasks SET status = 'BLOCKED', version = 2, latest_run_id = 'run-cancelled' WHERE id = ?`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	retried := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/retry", `{"expected_version":2}`, http.StatusOK)
+	if retried.Status != task.StatusReady || retried.Version != 3 {
+		t.Fatalf("retried task = %#v", retried)
+	}
+}
+
 func newTaskTestServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	_, server := newTaskTestServerWithDatabase(t)
+	return server
+}
+
+func newTaskTestServerWithDatabase(t *testing.T) (*sql.DB, *httptest.Server) {
 	t.Helper()
 	database := openHTTPTestDatabase(t)
 	mux := http.NewServeMux()
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
 	taskStore := storage.NewTaskStore(database)
-	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database))
+	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), nil)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
-	return server
+	return database, server
 }
 
 func requestStatus(

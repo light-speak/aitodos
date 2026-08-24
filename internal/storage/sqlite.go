@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 20
+const currentSchemaVersion = 28
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -121,7 +121,7 @@ func applyMigration(ctx context.Context, database *sql.DB, version int) error {
 	if !ok {
 		return fmt.Errorf("unsupported schema migration: %d", version)
 	}
-	if version == 16 || version == 17 {
+	if version == 16 || version == 17 || version == 21 {
 		return applyRebuildMigration(ctx, database, version, statement)
 	}
 
@@ -990,6 +990,148 @@ CREATE TABLE run_tool_policy_snapshots (
 );
 
 CREATE INDEX run_usage_captured_idx ON run_usage(captured_at DESC);`, true
+	case 21:
+		return `ALTER TABLE task_events RENAME TO task_events_v20;
+CREATE TABLE task_events (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'TASK_CREATED', 'TASK_STATUS_CHANGED', 'TASK_TITLE_CHANGED',
+        'TASK_TARGET_BRANCH_CHANGED'
+    )),
+    payload_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(task_id, sequence)
+);
+INSERT INTO task_events SELECT * FROM task_events_v20;
+DROP TABLE task_events_v20;
+CREATE INDEX task_events_timeline_idx ON task_events(task_id, sequence);`, true
+	case 22:
+		return `CREATE TABLE run_workspace_snapshots (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    workspace_id TEXT NOT NULL REFERENCES workspaces(id) ON DELETE RESTRICT,
+    branch_name TEXT NOT NULL,
+    target_branch TEXT NOT NULL,
+    base_commit_sha TEXT NOT NULL,
+    head_before TEXT NOT NULL,
+    head_after TEXT NOT NULL,
+    dirty_before INTEGER NOT NULL CHECK (dirty_before IN (0, 1)),
+    dirty_after INTEGER NOT NULL CHECK (dirty_after IN (0, 1)),
+    state_after TEXT NOT NULL CHECK (state_after IN ('READY', 'DIRTY', 'QUARANTINED', 'ERROR')),
+    captured_at TEXT NOT NULL
+);`, true
+	case 23:
+		return `CREATE TABLE run_events (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL CHECK (length(trim(event_type)) BETWEEN 1 AND 100),
+    payload_json TEXT NOT NULL CHECK (json_valid(payload_json)),
+    occurred_at TEXT NOT NULL,
+    UNIQUE(run_id, sequence)
+);
+CREATE INDEX run_events_timeline_idx ON run_events(run_id, sequence);
+
+INSERT INTO run_events(id, run_id, sequence, event_type, payload_json, occurred_at)
+SELECT lower(hex(randomblob(16))), id, 1, 'RUN_IMPORTED',
+       json_object('schema_version', 1, 'status', status), updated_at
+FROM runs;`, true
+	case 24:
+		return `ALTER TABLE runs ADD COLUMN cancel_requested_at TEXT;
+ALTER TABLE runs ADD COLUMN cancel_reason TEXT NOT NULL DEFAULT ''
+    CHECK (length(cancel_reason) <= 1000);`, true
+	case 25:
+		return `CREATE TABLE agent_sessions (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT REFERENCES topics(id) ON DELETE RESTRICT,
+    task_id TEXT REFERENCES tasks(id) ON DELETE RESTRICT,
+    profile_revision_id TEXT NOT NULL REFERENCES agent_profile_revisions(id) ON DELETE RESTRICT,
+    model TEXT NOT NULL DEFAULT '',
+    adapter TEXT NOT NULL,
+    external_session_id TEXT NOT NULL CHECK (length(trim(external_session_id)) BETWEEN 1 AND 255),
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'INVALID')),
+    last_run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (topic_id IS NOT NULL AND task_id IS NULL) OR
+        (topic_id IS NULL AND task_id IS NOT NULL)
+    )
+);
+CREATE UNIQUE INDEX agent_sessions_active_task_idx
+ON agent_sessions(task_id, profile_revision_id)
+WHERE task_id IS NOT NULL AND status = 'ACTIVE';
+CREATE UNIQUE INDEX agent_sessions_active_topic_idx
+ON agent_sessions(topic_id, profile_revision_id)
+WHERE topic_id IS NOT NULL AND status = 'ACTIVE';
+CREATE UNIQUE INDEX agent_sessions_external_idx
+ON agent_sessions(adapter, external_session_id);
+ALTER TABLE runs ADD COLUMN agent_session_id TEXT REFERENCES agent_sessions(id) ON DELETE RESTRICT;
+ALTER TABLE runs ADD COLUMN session_resumed INTEGER NOT NULL DEFAULT 0
+    CHECK (session_resumed IN (0, 1));`, true
+	case 26:
+		return `CREATE TABLE approval_requests (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    external_request_id TEXT NOT NULL,
+    item_id TEXT NOT NULL DEFAULT '',
+    kind TEXT NOT NULL CHECK (kind IN ('COMMAND', 'FILE_CHANGE', 'NETWORK', 'PERMISSIONS')),
+    reason TEXT NOT NULL DEFAULT '' CHECK (length(reason) <= 4000),
+    command_text TEXT NOT NULL DEFAULT '' CHECK (length(command_text) <= 16000),
+    cwd TEXT NOT NULL DEFAULT '' CHECK (length(cwd) <= 4000),
+    host TEXT NOT NULL DEFAULT '' CHECK (length(host) <= 1000),
+    protocol TEXT NOT NULL DEFAULT '' CHECK (length(protocol) <= 100),
+    grant_root TEXT NOT NULL DEFAULT '' CHECK (length(grant_root) <= 4000),
+    available_decisions_json TEXT NOT NULL CHECK (json_valid(available_decisions_json)),
+    status TEXT NOT NULL CHECK (status IN ('OPEN', 'RESOLVED', 'CLEARED')),
+    decision TEXT NOT NULL DEFAULT '' CHECK (decision IN ('', 'ACCEPT_ONCE', 'ACCEPT_SESSION', 'DECLINE', 'CANCEL_RUN')),
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    resolved_at TEXT,
+    UNIQUE(run_id, external_request_id)
+);
+CREATE UNIQUE INDEX approval_requests_one_open_run_idx
+ON approval_requests(run_id) WHERE status = 'OPEN';
+CREATE INDEX approval_requests_open_idx
+ON approval_requests(status, created_at);`, true
+	case 27:
+		return `ALTER TABLE runs ADD COLUMN runner_identity TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN lease_heartbeat_at TEXT;
+CREATE TABLE run_finalization_intents (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    terminal_status TEXT NOT NULL CHECK (terminal_status IN (
+        'NEEDS_INPUT', 'SUCCEEDED', 'FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'
+    )),
+    exit_code INTEGER NOT NULL,
+    failure_kind TEXT NOT NULL DEFAULT '',
+    failure_code TEXT NOT NULL DEFAULT '',
+    failure_message TEXT NOT NULL DEFAULT '',
+    failure_retryable INTEGER CHECK (failure_retryable IS NULL OR failure_retryable IN (0, 1)),
+    clarification_json TEXT CHECK (clarification_json IS NULL OR json_valid(clarification_json)),
+    created_at TEXT NOT NULL,
+    completed_at TEXT
+);`, true
+	case 28:
+		return `ALTER TABLE topic_events RENAME TO topic_events_v27;
+CREATE TABLE topic_events (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'TOPIC_CREATED', 'TOPIC_STATUS_CHANGED', 'TOPIC_MESSAGE_ADDED', 'TOPIC_PLANNING_REQUESTED'
+    )),
+    payload_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(topic_id, sequence)
+);
+INSERT INTO topic_events SELECT * FROM topic_events_v27;
+DROP TABLE topic_events_v27;
+CREATE INDEX topic_events_timeline_idx ON topic_events(topic_id, sequence);
+
+ALTER TABLE run_finalization_intents ADD COLUMN planning_result_json TEXT
+    CHECK (planning_result_json IS NULL OR json_valid(planning_result_json));`, true
 	default:
 		return "", false
 	}

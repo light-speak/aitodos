@@ -161,7 +161,7 @@ READY → RUNNING
 - UI 不再只有 Kanban，需要 Topic、Plan Review、Search 和关系视图。
 - 现有 Task 中心 API、Schema 和实施顺序需要调整。
 
-当前仓库的 Schema v18 已实现 Topic/Task 创建与查询、双主体持久讨论、评论引用 Task、Topic–Task 与对称 Task–Task 关系、不可变 Plan Revision、人工审核、批准后原子创建 Task/关系/测试项、Task Workspace、本地 Release、Task Run、Task Triage、Task Clarification/Continuation Run 与对应 UI。评论归属与关系引用保持分离，评论引用会在同一事务中建立可追溯主体关系。Topic Clarification、Decision、Label 和 Topic Planning Run 尚未实现；当前 Plan Revision 由人类编辑，Planner Run 后续只能提交同一审核流程的草案。Task Agent 等待回答时复用既有 `BLOCKED` Task 状态，具体终态与续跑语义由 ADR-0011 取代本 ADR 早期提出的 Task `NEEDS_CLARIFICATION` 状态。后续必须继续使用版本化 migration 和回归测试迁移，不得直接修改已有 migration 或静默保留冲突语义。
+当前仓库的 Schema v28 已实现 Topic/Task 创建与查询、双主体持久讨论、评论引用 Task、Topic–Task 与对称 Task–Task 关系、自动 Topic Planning Run、AI Plan Revision、人工审核、批准后原子创建 Task/关系/测试项、Task Workspace、本地 Release、Task Run、Task Triage、Task Clarification/Continuation Run 与对应 UI。评论归属与关系引用保持分离，评论引用会在同一事务中建立可追溯主体关系。Topic 的自动规划轮次、过期结果保护和显式重试由 ADR-0019 补充；Topic Clarification、Decision 和 Label 尚未实现。Task Agent 等待回答时复用既有 `BLOCKED` Task 状态，具体终态与续跑语义由 ADR-0011 取代本 ADR 早期提出的 Task `NEEDS_CLARIFICATION` 状态。后续必须继续使用版本化 migration 和回归测试迁移，不得直接修改已有 migration 或静默保留冲突语义。
 
 ## 被否决的方案
 

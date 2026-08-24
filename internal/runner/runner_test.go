@@ -3,6 +3,7 @@ package runner
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"io"
 	"os"
@@ -15,8 +16,11 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
+	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
+	"github.com/light-speak/aitodos/internal/domain/workspace"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/storage"
 )
@@ -128,7 +132,7 @@ func TestValidateAgentResultRejectsAllDataBeforePersistence(t *testing.T) {
 
 func TestInvocationArgsExpandsManagedResultFile(t *testing.T) {
 	revision := agentprofile.Revision{Args: []string{"--output-last-message", "{result_file}", "-"}}
-	args, usesPromptFile := invocationArgs(revision, "/runtime/run-1", "run-1", "/artifacts/prompt.md")
+	args, usesPromptFile := invocationArgs(revision, run.PurposeImplementation, "/runtime/run-1", "run-1", "/artifacts/prompt.md", "")
 	if usesPromptFile || len(args) != 3 || args[1] != "/runtime/run-1/.ats-run-result.json" {
 		t.Fatalf("invocation args = %#v, prompt file = %v", args, usesPromptFile)
 	}
@@ -136,9 +140,42 @@ func TestInvocationArgsExpandsManagedResultFile(t *testing.T) {
 
 func TestInvocationArgsOmitsEmptyOptionalModel(t *testing.T) {
 	revision := agentprofile.Revision{Args: []string{"exec", "--model", "{model}", "-"}}
-	args, _ := invocationArgs(revision, "/runtime/run-1", "run-1", "/artifacts/prompt.md")
+	args, _ := invocationArgs(revision, run.PurposeImplementation, "/runtime/run-1", "run-1", "/artifacts/prompt.md", "")
 	if strings.Join(args, " ") != "exec -" {
 		t.Fatalf("invocation args = %#v", args)
+	}
+}
+
+func TestInvocationArgsInjectsCodexResumeBeforePrompt(t *testing.T) {
+	revision := agentprofile.Revision{
+		Adapter: "codex", Model: "gpt-5.3-codex",
+		Args: []string{"exec", "--json", "--model", "{model}", "--sandbox", "workspace-write", "-"},
+	}
+	args, usesPromptFile := invocationArgs(
+		revision, run.PurposeImplementation, "/runtime/run-2", "run-2", "/artifacts/prompt.md",
+		"019c8b9f-c6d5-7020-a5ed-e3a92c861e5d",
+	)
+	if usesPromptFile || strings.Join(args, " ") != "exec --json --model gpt-5.3-codex --sandbox workspace-write resume 019c8b9f-c6d5-7020-a5ed-e3a92c861e5d -" {
+		t.Fatalf("invocation args = %#v", args)
+	}
+}
+
+func TestInvocationArgsAddsManagedPlanningResultForLegacyCodexProfile(t *testing.T) {
+	revision := agentprofile.Revision{
+		Adapter: "codex", Args: []string{"exec", "--json", "--sandbox", "read-only", "-"},
+	}
+	args, _ := invocationArgs(revision, run.PurposePlanning, "/runtime/run-3", "run-3", "/artifacts/prompt.md", "")
+	want := "exec --json --sandbox read-only --output-last-message /runtime/run-3/.ats-run-result.json -"
+	if strings.Join(args, " ") != want {
+		t.Fatalf("invocation args = %#v, want %q", args, want)
+	}
+}
+
+func TestParseCodexSessionIDUsesThreadStartedEvent(t *testing.T) {
+	stdout := []byte("{\"type\":\"thread.started\",\"thread_id\":\"019c8b9f-c6d5-7020-a5ed-e3a92c861e5d\"}\n" +
+		"{\"type\":\"future.event\",\"thread_id\":\"must-not-replace\"}\n")
+	if sessionID := parseCodexSessionID(stdout); sessionID != "019c8b9f-c6d5-7020-a5ed-e3a92c861e5d" {
+		t.Fatalf("session id = %q", sessionID)
 	}
 }
 
@@ -278,6 +315,9 @@ func TestExecuteRunsAgentInTaskWorkspaceAndFinalizesReview(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if !workspace.Dirty || workspace.LastVerifiedAt == nil {
+		t.Fatalf("workspace was not finalized after agent exit: %#v", workspace)
+	}
 	if content, err := os.ReadFile(filepath.Join(workspace.Path, "runner-output.txt")); err != nil || string(content) != "agent wrote this\n" {
 		t.Fatalf("workspace output = %q, %v", content, err)
 	}
@@ -292,6 +332,230 @@ func TestExecuteRunsAgentInTaskWorkspaceAndFinalizesReview(t *testing.T) {
 	runs, err := storage.NewRunStore(database).ListTaskRuns(context.Background(), created.ID)
 	if err != nil || len(runs) != 1 || runs[0].Status != run.StatusSucceeded {
 		t.Fatalf("runs = %#v, %v", runs, err)
+	}
+	snapshot, err := storage.NewRunStore(database).GetWorkspaceSnapshot(context.Background(), claim.Run.ID)
+	if err != nil || snapshot.HeadBefore == "" || snapshot.HeadAfter != workspace.HeadSHA || !snapshot.DirtyAfter {
+		t.Fatalf("workspace snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func TestExecutePlanningUsesTopicDiscussionAndCreatesReviewDraft(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RolePlanner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		Args: []string{"-test.run=TestRunnerFakeAgentProcess"}, MaxInputTokens: revision.MaxInputTokens,
+		ReservedOutputTokens: revision.ReservedOutputTokens, RecentMessageLimit: revision.RecentMessageLimit,
+		RetrievalLimit: revision.RetrievalLimit, TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTopicStore(database).Create(context.Background(), topic.CreateInput{
+		Title: "设计简单社区", Description: "用户可以发布帖子",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.NewDiscussionStore(database).AppendTopicMessage(context.Background(), created.ID, discussion.CreateMessageInput{
+		Content: "第一版只需要文本帖子，不需要关注和点赞",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := storage.NewRunStore(database).ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Run.Purpose != run.PurposePlanning {
+		t.Fatalf("purpose = %q", claim.Run.Purpose)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(context.Background(), currentProject, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+
+	database, err = storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	view, err := storage.NewPlanStore(database).GetByTopic(context.Background(), created.ID)
+	if err != nil || view.Revision.SourceRunID != claim.Run.ID || len(view.Revision.Drafts) != 1 {
+		t.Fatalf("plan = %#v, %v", view, err)
+	}
+	messages, err := storage.NewDiscussionStore(database).ListTopicMessages(context.Background(), created.ID)
+	if err != nil || len(messages) != 2 || messages[1].AuthorKind != discussion.AuthorAgent {
+		t.Fatalf("messages = %#v, %v", messages, err)
+	}
+	prompt, err := os.ReadFile(filepath.Join(currentProject.Paths.Artifacts, "runs", claim.Run.ID, "prompt.md"))
+	if err != nil || !strings.Contains(string(prompt), "Current Topic") ||
+		!strings.Contains(string(prompt), "第一版只需要文本帖子") {
+		t.Fatalf("prompt = %q, %v", prompt, err)
+	}
+	if _, err := storage.NewWorkspaceStore(database).GetByTask(context.Background(), ""); !errors.Is(err, storage.ErrWorkspaceNotFound) {
+		t.Fatalf("planning workspace error = %v", err)
+	}
+}
+
+func TestExecuteFinalizesWorkspaceWhenAgentResultIsInvalid(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RoleImplementer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		Args: []string{"-test.run=TestRunnerFakeAgentProcess"}, MaxInputTokens: revision.MaxInputTokens,
+		ReservedOutputTokens: revision.ReservedOutputTokens, RecentMessageLimit: revision.RecentMessageLimit,
+		RetrievalLimit: revision.RetrievalLimit, TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTaskStore(database).Create(context.Background(), task.CreateInput{
+		Title: "无效结果仍需收尾", AcceptanceCriteria: "保留 Agent 产生的修改并记录失败",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := storage.NewRunStore(database).ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := Execute(context.Background(), currentProject, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err == nil {
+		t.Fatal("Execute() error = nil, want invalid result error")
+	}
+	database, err = storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	currentRun, err := storage.NewRunStore(database).Get(context.Background(), claim.Run.ID)
+	if err != nil || currentRun.Status != run.StatusFailed || currentRun.FailureCode != "RESULT" {
+		t.Fatalf("run = %#v, %v", currentRun, err)
+	}
+	workspace, err := storage.NewWorkspaceStore(database).GetByTask(context.Background(), created.ID)
+	if err != nil || !workspace.Dirty || workspace.LastVerifiedAt == nil {
+		t.Fatalf("workspace = %#v, %v", workspace, err)
+	}
+	snapshot, err := storage.NewRunStore(database).GetWorkspaceSnapshot(context.Background(), claim.Run.ID)
+	if err != nil || !snapshot.DirtyAfter || snapshot.HeadAfter != workspace.HeadSHA {
+		t.Fatalf("workspace snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func TestExecuteStopsAgentAfterCancellationRequestAndPreservesWorkspace(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RoleImplementer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		Args: []string{"-test.run=TestRunnerFakeAgentProcess"}, MaxInputTokens: revision.MaxInputTokens,
+		ReservedOutputTokens: revision.ReservedOutputTokens, RecentMessageLimit: revision.RecentMessageLimit,
+		RetrievalLimit: revision.RetrievalLimit, TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTaskStore(database).Create(context.Background(), task.CreateInput{
+		Title: "等待取消", AcceptanceCriteria: "停止 Agent 并保留 Workspace",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := storage.NewRunStore(database)
+	claim, err := store.ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		done <- Execute(context.Background(), currentProject, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration)
+	}()
+
+	workspace := waitForAgentMarker(t, database, created.ID)
+	if _, err := store.RequestCancel(context.Background(), claim.Run.ID, "人工停止当前方向"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case executeErr := <-done:
+		if executeErr != nil {
+			t.Fatal(executeErr)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("Runner did not stop after cancellation request")
+	}
+	currentRun, err := store.Get(context.Background(), claim.Run.ID)
+	if err != nil || currentRun.Status != run.StatusCancelled || currentRun.CancelReason != "人工停止当前方向" {
+		t.Fatalf("cancelled run = %#v, %v", currentRun, err)
+	}
+	updated, err := storage.NewTaskStore(database).Get(context.Background(), created.ID)
+	if err != nil || updated.Status != task.StatusBlocked {
+		t.Fatalf("task after cancel = %#v, %v", updated, err)
+	}
+	snapshot, err := store.GetWorkspaceSnapshot(context.Background(), claim.Run.ID)
+	if err != nil || !snapshot.DirtyAfter || snapshot.WorkspaceID != workspace.ID {
+		t.Fatalf("workspace snapshot = %#v, %v", snapshot, err)
+	}
+}
+
+func waitForAgentMarker(t *testing.T, database *sql.DB, taskID string) workspace.Workspace {
+	t.Helper()
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
+	timeout := time.NewTimer(5 * time.Second)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			current, err := storage.NewWorkspaceStore(database).GetByTask(context.Background(), taskID)
+			if err == nil {
+				if _, statErr := os.Stat(filepath.Join(current.Path, "agent-started")); statErr == nil {
+					return current
+				}
+			}
+		case <-timeout.C:
+			t.Fatal("Agent process did not create its start marker")
+		}
 	}
 }
 
@@ -367,6 +631,13 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 	if os.Getenv("ATS_CLAIM_TOKEN") != "" {
 		t.Fatal("claim token leaked to agent")
 	}
+	if os.Getenv("ATS_RUN_PURPOSE") == "PLANNING" {
+		result := `{"reply":"需求已经足够明确，我整理了一版可审核方案。","plan":{"summary":"实现最小文本社区","rationale":"先完成发布和列表闭环","risks":"暂不包含账户体系","drafts":[{"title":"实现帖子发布与列表","description":"支持发布并查看文本帖子","acceptance_criteria":"发布后帖子出现在列表中","priority":1,"test_cases":[{"title":"发布文本帖子","description":"提交后列表展示内容","required":true}]}]}}`
+		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
 	if os.Getenv("ATS_RUN_PURPOSE") == "TRIAGE" {
 		result := `{"triage":{"suggested_title":"实现搜索组合筛选","scores":{"technical_complexity":2,"requirement_uncertainty":1,"change_scope":2,"validation_burden":2,"human_dependency":1,"risk_and_reversibility":1},"confidence":0.8,"rationale":"涉及查询参数、持久化和前端筛选状态","assumptions":["现有搜索接口可以扩展"],"split_recommended":false,"split_rationale":""}}`
 		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
@@ -382,6 +653,23 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 			t.Fatal(err)
 		}
 		return
+	}
+	if strings.Contains(string(prompt), "无效结果仍需收尾") {
+		if err := os.WriteFile("runner-output.txt", []byte("must be preserved\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(".ats-run-result.json", []byte(`{"estimate":`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if strings.Contains(string(prompt), "等待取消") {
+		if err := os.WriteFile("agent-started", []byte("started\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		for {
+			time.Sleep(time.Hour)
+		}
 	}
 	if err := os.WriteFile("runner-output.txt", []byte("agent wrote this\n"), 0o644); err != nil {
 		t.Fatal(err)

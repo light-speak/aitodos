@@ -1,7 +1,36 @@
 // Package run 定义一次不可变 Agent 执行及其生命周期。
 package run
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+
+	"github.com/light-speak/aitodos/internal/domain/workspace"
+)
+
+// EventType 标识 Run 生命周期内可按序订阅的审计事件。
+type EventType string
+
+const (
+	EventClaimed         EventType = "RUN_CLAIMED"
+	EventStatusChanged   EventType = "RUN_STATUS_CHANGED"
+	EventCancelRequested EventType = "RUN_CANCEL_REQUESTED"
+	EventSessionAttached EventType = "RUN_SESSION_ATTACHED"
+	EventSessionInvalid  EventType = "RUN_SESSION_INVALIDATED"
+	EventApprovalRequest EventType = "RUN_APPROVAL_REQUESTED"
+	EventApprovalResolve EventType = "RUN_APPROVAL_RESOLVED"
+	EventImported        EventType = "RUN_IMPORTED"
+)
+
+// Event 是单个 Run 内只追加、按 sequence 排序的结构化事实。
+type Event struct {
+	ID         string          `json:"id"`
+	RunID      string          `json:"run_id"`
+	Sequence   int64           `json:"sequence"`
+	Type       EventType       `json:"type"`
+	Payload    json.RawMessage `json:"payload"`
+	OccurredAt time.Time       `json:"occurred_at"`
+}
 
 // Purpose 表示 Run 在 Agent Workflow 中承担的职责。
 type Purpose string
@@ -32,24 +61,48 @@ const (
 
 // Run 保存一次执行的身份、绑定主体和调度快照。
 type Run struct {
-	ID                  string    `json:"id"`
-	Purpose             Purpose   `json:"purpose"`
-	TopicID             string    `json:"topic_id,omitempty"`
-	TaskID              string    `json:"task_id,omitempty"`
-	Status              Status    `json:"status"`
-	ProfileRevisionID   string    `json:"profile_revision_id"`
-	SubjectVersion      int64     `json:"subject_version"`
-	RetryOfRunID        string    `json:"retry_of_run_id,omitempty"`
-	ContinuationOfRunID string    `json:"continuation_of_run_id,omitempty"`
-	LeaseGeneration     int64     `json:"lease_generation"`
-	LeaseExpiresAt      time.Time `json:"lease_expires_at"`
-	RunNonce            string    `json:"-"`
-	QueuedAt            time.Time `json:"queued_at"`
-	ClaimedAt           time.Time `json:"claimed_at"`
-	StartedAt           time.Time `json:"started_at,omitempty"`
-	FinishedAt          time.Time `json:"finished_at,omitempty"`
-	CreatedAt           time.Time `json:"created_at"`
-	UpdatedAt           time.Time `json:"updated_at"`
+	ID                  string     `json:"id"`
+	Purpose             Purpose    `json:"purpose"`
+	TopicID             string     `json:"topic_id,omitempty"`
+	TaskID              string     `json:"task_id,omitempty"`
+	Status              Status     `json:"status"`
+	ProfileRevisionID   string     `json:"profile_revision_id"`
+	SubjectVersion      int64      `json:"subject_version"`
+	RetryOfRunID        string     `json:"retry_of_run_id,omitempty"`
+	ContinuationOfRunID string     `json:"continuation_of_run_id,omitempty"`
+	AgentSessionID      string     `json:"agent_session_id,omitempty"`
+	SessionResumed      bool       `json:"session_resumed"`
+	LeaseGeneration     int64      `json:"lease_generation"`
+	LeaseExpiresAt      time.Time  `json:"lease_expires_at"`
+	RunNonce            string     `json:"-"`
+	QueuedAt            time.Time  `json:"queued_at"`
+	ClaimedAt           time.Time  `json:"claimed_at"`
+	StartedAt           time.Time  `json:"started_at,omitempty"`
+	FinishedAt          time.Time  `json:"finished_at,omitempty"`
+	ExitCode            *int       `json:"exit_code"`
+	FailureKind         string     `json:"failure_kind,omitempty"`
+	FailureCode         string     `json:"failure_code,omitempty"`
+	FailureMessage      string     `json:"failure_message,omitempty"`
+	FailureRetryable    *bool      `json:"failure_retryable"`
+	CancelRequestedAt   *time.Time `json:"cancel_requested_at,omitempty"`
+	CancelReason        string     `json:"cancel_reason,omitempty"`
+	CreatedAt           time.Time  `json:"created_at"`
+	UpdatedAt           time.Time  `json:"updated_at"`
+}
+
+// WorkspaceSnapshot 保存一次 Run 前后可审计的 Git Workspace 状态。
+type WorkspaceSnapshot struct {
+	RunID         string          `json:"run_id"`
+	WorkspaceID   string          `json:"workspace_id"`
+	BranchName    string          `json:"branch_name"`
+	TargetBranch  string          `json:"target_branch"`
+	BaseCommitSHA string          `json:"base_commit_sha"`
+	HeadBefore    string          `json:"head_before"`
+	HeadAfter     string          `json:"head_after"`
+	DirtyBefore   bool            `json:"dirty_before"`
+	DirtyAfter    bool            `json:"dirty_after"`
+	StateAfter    workspace.State `json:"state_after"`
+	CapturedAt    time.Time       `json:"captured_at"`
 }
 
 // Claim 是只向领取方返回一次的明文 Claim Token。
