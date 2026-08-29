@@ -56,6 +56,7 @@ type FinalizationIntent struct {
 	Finish        RunFinish
 	Clarification *clarification.Request
 	Planning      *plan.PlanningResult
+	TaskReply     string
 }
 
 // RecoveryRun 是 Recovery Manager 校验旧 Runner 所需的最小进程身份快照。
@@ -263,6 +264,11 @@ func (store *RunStore) ClaimNextTask(ctx context.Context, maxWorkers int, leaseD
 	if err := insertClaimedRun(ctx, transaction, claim); err != nil {
 		return domainrun.Claim{}, err
 	}
+	if selected.FeedbackID != "" {
+		if err := claimTaskFeedback(ctx, transaction, selected.FeedbackID, claim.Run.ID); err != nil {
+			return domainrun.Claim{}, err
+		}
+	}
 	if _, err := appendRunEvent(ctx, transaction, claim.Run.ID, domainrun.EventClaimed, map[string]any{
 		"schema_version": 1, "status": claim.Run.Status, "purpose": claim.Run.Purpose,
 	}); err != nil {
@@ -271,7 +277,7 @@ func (store *RunStore) ClaimNextTask(ctx context.Context, maxWorkers int, leaseD
 	if err := createRunToolPolicySnapshot(ctx, transaction, claim.Run.ID, claim.Run.ProfileRevisionID); err != nil {
 		return domainrun.Claim{}, err
 	}
-	if claim.Run.TaskID != "" && selected.Purpose != domainrun.PurposeTriage {
+	if claim.Run.TaskID != "" && selected.Purpose != domainrun.PurposeTriage && selected.Purpose != domainrun.PurposeReview {
 		if err := claimTask(ctx, transaction, selected, claim.Run); err != nil {
 			return domainrun.Claim{}, err
 		}
@@ -461,7 +467,12 @@ func (store *RunStore) RecoverLost(
 		current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusFinalizing {
 		return current, nil
 	}
-	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+	if current.Purpose == domainrun.PurposeReview {
+		if err := failTaskFeedback(ctx, transaction, current.ID, message); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage && current.Purpose != domainrun.PurposeReview {
 		if err := finishTaskRun(ctx, transaction, current, domainrun.StatusLost); err != nil {
 			return domainrun.Run{}, err
 		}
@@ -989,11 +1000,11 @@ func (store *RunStore) BeginFinalization(
 	_, err = transaction.ExecContext(ctx, `
 INSERT INTO run_finalization_intents(
     run_id, terminal_status, exit_code, failure_kind, failure_code,
-    failure_message, failure_retryable, clarification_json, planning_result_json, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    failure_message, failure_retryable, clarification_json, planning_result_json, task_reply, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, intent.Finish.Status, intent.Finish.ExitCode, intent.Finish.FailureKind,
 		intent.Finish.FailureCode, intent.Finish.FailureMessage, nullableBool(intent.Finish.FailureRetryable),
-		payload.ClarificationJSON, payload.PlanningJSON, formatTime(now))
+		payload.ClarificationJSON, payload.PlanningJSON, payload.TaskReply, formatTime(now))
 	if err != nil {
 		return domainrun.Run{}, fmt.Errorf("record finalization intent: %w", err)
 	}
@@ -1054,7 +1065,7 @@ func (store *RunStore) completeFinalization(
 	} else if _, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration); err != nil {
 		return domainrun.Run{}, err
 	}
-	intent, request, planning, completedAt, err := loadFinalizationIntent(ctx, transaction, runID)
+	intent, request, planning, taskReply, completedAt, err := loadFinalizationIntent(ctx, transaction, runID)
 	if err != nil {
 		return domainrun.Run{}, err
 	}
@@ -1078,7 +1089,12 @@ func (store *RunStore) completeFinalization(
 			return domainrun.Run{}, err
 		}
 	}
-	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+	if current.Purpose == domainrun.PurposeReview {
+		if err := finalizeTaskFeedback(ctx, transaction, current, intent, taskReply); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage && current.Purpose != domainrun.PurposeReview {
 		if err := finishTaskRun(ctx, transaction, current, intent.Status); err != nil {
 			return domainrun.Run{}, err
 		}
@@ -1117,6 +1133,7 @@ WHERE id = ? AND status = 'FINALIZING' AND lease_generation = ?`,
 type finalizationPayload struct {
 	ClarificationJSON any
 	PlanningJSON      any
+	TaskReply         any
 }
 
 func validateFinalizationIntent(intent FinalizationIntent) (finalizationPayload, error) {
@@ -1124,6 +1141,13 @@ func validateFinalizationIntent(intent FinalizationIntent) (finalizationPayload,
 		return finalizationPayload{}, err
 	}
 	payload := finalizationPayload{}
+	taskReply := strings.TrimSpace(intent.TaskReply)
+	if len([]rune(taskReply)) > 20000 {
+		return finalizationPayload{}, errors.New("task reply must not exceed 20000 characters")
+	}
+	if taskReply != "" {
+		payload.TaskReply = taskReply
+	}
 	if intent.Finish.Status == domainrun.StatusNeedsInput {
 		if intent.Clarification == nil {
 			return finalizationPayload{}, errors.New("needs-input finalization requires clarification")
@@ -1163,10 +1187,25 @@ func validateFinalizationSubject(current domainrun.Run, intent FinalizationInten
 		if intent.Clarification != nil {
 			return errors.New("planning run writes questions as topic replies")
 		}
+		if strings.TrimSpace(intent.TaskReply) != "" {
+			return errors.New("planning run cannot write task reply")
+		}
+		return nil
+	}
+	if current.Purpose == domainrun.PurposeReview {
+		if intent.Finish.Status == domainrun.StatusSucceeded && strings.TrimSpace(intent.TaskReply) == "" {
+			return errors.New("successful review finalization requires task reply")
+		}
+		if intent.Clarification != nil || intent.Planning != nil {
+			return errors.New("review run can only write task reply")
+		}
 		return nil
 	}
 	if intent.Planning != nil {
 		return errors.New("non-planning run cannot write planning result")
+	}
+	if strings.TrimSpace(intent.TaskReply) != "" {
+		return errors.New("non-review run cannot write task reply")
 	}
 	return nil
 }
@@ -1175,35 +1214,35 @@ func loadFinalizationIntent(
 	ctx context.Context,
 	transaction *sql.Tx,
 	runID string,
-) (RunFinish, *clarification.Request, *plan.PlanningResult, string, error) {
+) (RunFinish, *clarification.Request, *plan.PlanningResult, string, string, error) {
 	var finish RunFinish
 	var retryable sql.NullBool
-	var clarificationJSON, planningJSON, completedAt sql.NullString
+	var clarificationJSON, planningJSON, taskReply, completedAt sql.NullString
 	err := transaction.QueryRowContext(ctx, `
 SELECT terminal_status, exit_code, failure_kind, failure_code, failure_message,
-       failure_retryable, clarification_json, planning_result_json, completed_at
+       failure_retryable, clarification_json, planning_result_json, task_reply, completed_at
 FROM run_finalization_intents WHERE run_id = ?`, runID).Scan(
 		&finish.Status, &finish.ExitCode, &finish.FailureKind, &finish.FailureCode,
-		&finish.FailureMessage, &retryable, &clarificationJSON, &planningJSON, &completedAt)
+		&finish.FailureMessage, &retryable, &clarificationJSON, &planningJSON, &taskReply, &completedAt)
 	if err != nil {
-		return RunFinish{}, nil, nil, "", err
+		return RunFinish{}, nil, nil, "", "", err
 	}
 	finish.FailureRetryable = optionalBool(retryable)
 	var request *clarification.Request
 	if clarificationJSON.Valid {
 		request = &clarification.Request{}
 		if err := json.Unmarshal([]byte(clarificationJSON.String), request); err != nil {
-			return RunFinish{}, nil, nil, "", err
+			return RunFinish{}, nil, nil, "", "", err
 		}
 	}
 	var planning *plan.PlanningResult
 	if planningJSON.Valid {
 		planning = &plan.PlanningResult{}
 		if err := json.Unmarshal([]byte(planningJSON.String), planning); err != nil {
-			return RunFinish{}, nil, nil, "", err
+			return RunFinish{}, nil, nil, "", "", err
 		}
 	}
-	return finish, request, planning, completedAt.String, nil
+	return finish, request, planning, taskReply.String, completedAt.String, nil
 }
 
 func applyPlanningResult(
@@ -1292,7 +1331,12 @@ func (store *RunStore) Finish(
 	if current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusClaimed && current.Status != domainrun.StatusFinalizing {
 		return domainrun.Run{}, ErrRunStateConflict
 	}
-	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+	if current.Purpose == domainrun.PurposeReview {
+		if err := failTaskFeedback(ctx, transaction, current.ID, finish.FailureMessage); err != nil {
+			return domainrun.Run{}, err
+		}
+	}
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage && current.Purpose != domainrun.PurposeReview {
 		if err := finishTaskRun(ctx, transaction, current, finish.Status); err != nil {
 			return domainrun.Run{}, err
 		}
@@ -1563,7 +1607,9 @@ type runnableWork struct {
 	Task                task.Task
 	ProfileRevisionID   string
 	Purpose             domainrun.Purpose
+	RetryOfRunID        string
 	ContinuationOfRunID string
+	FeedbackID          string
 }
 
 func ensureRunCapacity(ctx context.Context, transaction *sql.Tx, maxWorkers int) error {
@@ -1582,6 +1628,9 @@ WHERE status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')`).Scan(&active)
 
 func selectRunnableWork(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	if selected, err := selectRevisionTask(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
+		return selected, err
+	}
+	if selected, err := selectReviewFeedback(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
 		return selected, err
 	}
 	if selected, err := selectPlanningTopic(ctx, transaction); !errors.Is(err, ErrNoRunnableTask) {
@@ -1607,6 +1656,39 @@ JOIN agent_profiles p ON p.id = d.profile_id
 JOIN agent_profile_revisions r ON r.id = p.current_revision_id
 WHERE t.status = 'CHANGES_REQUESTED' AND length(trim(r.command)) > 0
 ORDER BY t.priority ASC, t.created_at ASC, t.id ASC LIMIT 1`)
+}
+
+func selectReviewFeedback(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
+	var selected runnableWork
+	var taskID string
+	err := transaction.QueryRowContext(ctx, `
+SELECT f.id, f.task_id, r.id, COALESCE(previous.run_id, '')
+FROM task_feedback_turns f
+LEFT JOIN task_feedback_turns previous ON previous.id = f.retry_of_feedback_id
+JOIN tasks t ON t.id = f.task_id
+JOIN project_agent_defaults d ON d.purpose = 'REVIEW'
+JOIN agent_profiles p ON p.id = d.profile_id
+JOIN agent_profile_revisions r ON r.id = p.current_revision_id
+WHERE f.intent = 'DISCUSS' AND f.status = 'QUEUED' AND length(trim(r.command)) > 0
+  AND NOT EXISTS (
+      SELECT 1 FROM runs active
+      WHERE active.task_id = t.id
+        AND active.status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')
+  )
+	ORDER BY f.created_at ASC, f.id ASC LIMIT 1`).Scan(
+		&selected.FeedbackID, &taskID, &selected.ProfileRevisionID, &selected.RetryOfRunID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return runnableWork{}, ErrNoRunnableTask
+	}
+	if err != nil {
+		return runnableWork{}, fmt.Errorf("select task review feedback: %w", err)
+	}
+	selected.Task, err = getTask(ctx, transaction, taskID)
+	if err != nil {
+		return runnableWork{}, err
+	}
+	selected.Purpose = domainrun.PurposeReview
+	return selected, nil
 }
 
 func selectPlanningTopic(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
@@ -1749,6 +1831,7 @@ func createClaim(selected runnableWork, leaseDuration time.Duration) (domainrun.
 		Run: domainrun.Run{
 			ID: runID, Purpose: selected.Purpose, TopicID: selected.Topic.ID, TaskID: selected.Task.ID,
 			Status: domainrun.StatusClaimed, ProfileRevisionID: selected.ProfileRevisionID,
+			RetryOfRunID:        selected.RetryOfRunID,
 			ContinuationOfRunID: selected.ContinuationOfRunID,
 			SubjectVersion:      subjectVersion(selected),
 			LeaseGeneration:     1, LeaseExpiresAt: now.Add(leaseDuration),
@@ -1776,9 +1859,9 @@ INSERT INTO runs(
     continuation_of_run_id, claim_token_hash, lease_generation, lease_expires_at, run_nonce,
     queued_at, claimed_at, created_at, updated_at, subject_version,
     agent_session_id, session_resumed
-) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		claim.Run.ID, claim.Run.Purpose, nullableString(claim.Run.TopicID), nullableString(claim.Run.TaskID), claim.Run.Status,
-		claim.Run.ProfileRevisionID, nullableString(claim.Run.ContinuationOfRunID),
+		claim.Run.ProfileRevisionID, nullableString(claim.Run.RetryOfRunID), nullableString(claim.Run.ContinuationOfRunID),
 		hex.EncodeToString(hash[:]), claim.Run.LeaseGeneration,
 		formatTime(claim.Run.LeaseExpiresAt), claim.Run.RunNonce, formatTime(claim.Run.QueuedAt),
 		formatTime(claim.Run.ClaimedAt), formatTime(claim.Run.CreatedAt), formatTime(claim.Run.UpdatedAt),

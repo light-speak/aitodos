@@ -187,7 +187,7 @@ func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	manager := gitworkflow.New(currentProject, database)
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
-	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore, storage.NewAssessmentStore(database), manager)
+	RegisterTaskRoutes(mux, storage.NewTaskStore(database), discussionStore, relationStore, storage.NewAssessmentStore(database), storage.NewTaskFeedbackStore(database), manager)
 	RegisterGitWorkflowRoutes(mux, manager)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)

@@ -558,7 +558,7 @@ func persistAppServerFinalResult(purpose domainrun.Purpose, workspacePath, final
 	}
 	content := []byte(strings.TrimSpace(finalMessage))
 	if !json.Valid(content) {
-		if purpose == domainrun.PurposeTriage || purpose == domainrun.PurposePlanning {
+		if purpose == domainrun.PurposeTriage || purpose == domainrun.PurposePlanning || purpose == domainrun.PurposeReview {
 			return errors.New("structured final response is not valid JSON")
 		}
 		return nil

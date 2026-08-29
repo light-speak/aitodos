@@ -171,6 +171,24 @@ func TestInvocationArgsAddsManagedPlanningResultForLegacyCodexProfile(t *testing
 	}
 }
 
+func TestInvocationArgsAddsManagedReviewResultForLegacyCodexProfile(t *testing.T) {
+	revision := agentprofile.Revision{
+		Adapter: "codex", Args: []string{"exec", "--json", "--sandbox", "read-only", "-"},
+	}
+	args, _ := invocationArgs(revision, run.PurposeReview, "/runtime/run-review", "run-review", "/artifacts/prompt.md", "")
+	want := "exec --json --sandbox read-only --output-last-message /runtime/run-review/.ats-run-result.json -"
+	if strings.Join(args, " ") != want {
+		t.Fatalf("invocation args = %#v, want %q", args, want)
+	}
+}
+
+func TestPersistAppServerReviewRejectsUnstructuredFinalMessage(t *testing.T) {
+	err := persistAppServerFinalResult(run.PurposeReview, t.TempDir(), "普通文本回答")
+	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("persist review result error = %v", err)
+	}
+}
+
 func TestParseCodexSessionIDUsesThreadStartedEvent(t *testing.T) {
 	stdout := []byte("{\"type\":\"thread.started\",\"thread_id\":\"019c8b9f-c6d5-7020-a5ed-e3a92c861e5d\"}\n" +
 		"{\"type\":\"future.event\",\"thread_id\":\"must-not-replace\"}\n")
@@ -411,6 +429,74 @@ func TestExecutePlanningUsesTopicDiscussionAndCreatesReviewDraft(t *testing.T) {
 	}
 }
 
+func TestExecuteReviewAnswersTaskDiscussionWithoutWorkspaceOrStateChange(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RoleReviewer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		Args: []string{"-test.run=TestRunnerFakeAgentProcess"}, MaxInputTokens: revision.MaxInputTokens,
+		ReservedOutputTokens: revision.ReservedOutputTokens, RecentMessageLimit: revision.RecentMessageLimit,
+		RetrievalLimit: revision.RetrievalLimit, TimeoutSeconds: 60,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTaskStore(database).Create(context.Background(), task.CreateInput{Title: "讨论当前实现"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := storage.NewTaskFeedbackStore(database).Discuss(context.Background(), created.ID, discussion.CreateMessageInput{
+		Content: "这个实现目前还有什么缺陷？",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := storage.NewRunStore(database).ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if claim.Run.Purpose != run.PurposeReview {
+		t.Fatalf("purpose = %q", claim.Run.Purpose)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := Execute(context.Background(), currentProject, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	database, err = storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	loaded, err := storage.NewTaskStore(database).Get(context.Background(), created.ID)
+	if err != nil || loaded.Status != task.StatusReady {
+		t.Fatalf("task after review = %#v, %v", loaded, err)
+	}
+	messages, err := storage.NewDiscussionStore(database).ListTaskMessages(context.Background(), created.ID)
+	if err != nil || len(messages) != 2 || messages[1].AuthorKind != discussion.AuthorAgent {
+		t.Fatalf("messages = %#v, %v", messages, err)
+	}
+	if _, err := storage.NewWorkspaceStore(database).GetByTask(context.Background(), created.ID); !errors.Is(err, storage.ErrWorkspaceNotFound) {
+		t.Fatalf("review workspace error = %v", err)
+	}
+	prompt, err := os.ReadFile(filepath.Join(currentProject.Paths.Artifacts, "runs", claim.Run.ID, "prompt.md"))
+	if err != nil || !strings.Contains(string(prompt), "Current Task Question") || !strings.Contains(string(prompt), "这个实现目前还有什么缺陷？") {
+		t.Fatalf("review prompt = %q, %v", prompt, err)
+	}
+}
+
 func TestExecuteFinalizesWorkspaceWhenAgentResultIsInvalid(t *testing.T) {
 	repoRoot := initializeRunnerRepository(t)
 	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
@@ -640,6 +726,13 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 	}
 	if os.Getenv("ATS_RUN_PURPOSE") == "TRIAGE" {
 		result := `{"triage":{"suggested_title":"实现搜索组合筛选","scores":{"technical_complexity":2,"requirement_uncertainty":1,"change_scope":2,"validation_burden":2,"human_dependency":1,"risk_and_reversibility":1},"confidence":0.8,"rationale":"涉及查询参数、持久化和前端筛选状态","assumptions":["现有搜索接口可以扩展"],"split_recommended":false,"split_rationale":""}}`
+		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	if os.Getenv("ATS_RUN_PURPOSE") == "REVIEW" {
+		result := `{"reply":"当前实现仍需补充错误路径和并发边界测试。"}`
 		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 			t.Fatal(err)
 		}

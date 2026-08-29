@@ -114,7 +114,7 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	httpapi.RegisterPlanRoutes(mux, storage.NewPlanStore(database))
 	taskStore := storage.NewTaskStore(database)
 	assessmentStore := storage.NewAssessmentStore(database)
-	httpapi.RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, assessmentStore, gitManager)
+	httpapi.RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, assessmentStore, storage.NewTaskFeedbackStore(database), gitManager)
 	httpapi.RegisterAssessmentRoutes(mux, taskStore, assessmentStore)
 	httpapi.RegisterArtifactRoutes(mux, storage.NewArtifactStore(database, currentProject.Paths.Artifacts))
 	httpapi.RegisterGitWorkflowRoutes(mux, gitManager)

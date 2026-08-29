@@ -1,7 +1,7 @@
 import type { ComponentProps } from 'react'
 import { LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
 
-import type { DiscussionMessage, Task, TaskAssociation, Topic, TopicStatus } from '../types'
+import type { DiscussionMessage, Task, TaskAssociation, TaskFeedbackIntent, Topic, TopicStatus } from '../types'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
 import { PlanPanel } from './PlanPanel'
@@ -24,7 +24,7 @@ interface TopicDetailsDialogProps {
   pendingRelationTaskIDs: Set<string>
   onClose: () => void
   onReloadDiscussion: () => void
-  onSendMessage: (content: string, linkedTaskIDs: string[]) => Promise<void>
+  onSendMessage: (content: string, linkedTaskIDs: string[], intent?: TaskFeedbackIntent) => Promise<void>
   onAddRelation: (taskID: string) => Promise<void>
   onRemoveRelation: (taskID: string) => Promise<void>
   onOpenTask: (taskID: string) => void

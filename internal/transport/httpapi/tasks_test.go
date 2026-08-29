@@ -5,14 +5,19 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/relation"
+	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/taskfeedback"
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
@@ -117,6 +122,91 @@ func TestTaskRoutesDiscussAndRelateTasks(t *testing.T) {
 	requestStatus(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+owner.ID+"/relations", `{"task_id":"`+owner.ID+`"}`, http.StatusBadRequest)
 }
 
+func TestTaskFeedbackRouteDistinguishesAgentQuestionAndChangeRequest(t *testing.T) {
+	server := newTaskTestServer(t)
+	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"完善错误处理"}`, http.StatusCreated)
+
+	discuss := requestTaskFeedback(t, server.Client(), server.URL+"/api/tasks/"+created.ID+"/feedback", `{
+		"intent":"DISCUSS","content":"目前还有哪些错误路径没有覆盖？","expected_task_version":1
+	}`, http.StatusCreated)
+	if discuss.Feedback == nil || discuss.Feedback.Intent != taskfeedback.IntentDiscuss || discuss.Feedback.Status != taskfeedback.StatusQueued {
+		t.Fatalf("discussion feedback = %#v", discuss)
+	}
+
+	changes := requestTaskFeedback(t, server.Client(), server.URL+"/api/tasks/"+created.ID+"/feedback", `{
+		"intent":"REQUEST_CHANGES","content":"补充超时错误的回归测试。","expected_task_version":1
+	}`, http.StatusCreated)
+	if changes.Task == nil || changes.Task.Status != task.StatusChangesRequested || changes.Feedback == nil || changes.Feedback.Status != taskfeedback.StatusApplied {
+		t.Fatalf("change feedback = %#v", changes)
+	}
+}
+
+func TestTaskFeedbackRoutesListStreamFailureAndRetry(t *testing.T) {
+	database, server := newTaskTestServerWithDatabase(t)
+	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"检查退出错误"}`, http.StatusCreated)
+	discuss := requestTaskFeedback(t, server.Client(), server.URL+"/api/tasks/"+created.ID+"/feedback", `{
+		"intent":"DISCUSS","content":"退出时会不会丢日志？","expected_task_version":1
+	}`, http.StatusCreated)
+	if _, err := database.ExecContext(t.Context(), `
+UPDATE agent_profile_revisions SET command = 'fake-reviewer'
+WHERE id = 'profile-reviewer-r1'`); err != nil {
+		t.Fatal(err)
+	}
+	runs := storage.NewRunStore(database)
+	claim, err := runs.ClaimNextTask(t.Context(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.Finish(t.Context(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, storage.RunFinish{
+		Status: domainrun.StatusFailed, ExitCode: 1, FailureMessage: "Reviewer 退出",
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	response, err := server.Client().Get(server.URL + "/api/tasks/" + created.ID + "/feedback")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var feedback []taskfeedback.Feedback
+	if err := json.NewDecoder(response.Body).Decode(&feedback); err != nil {
+		t.Fatal(err)
+	}
+	if response.StatusCode != http.StatusOK || len(feedback) != 1 || feedback[0].Status != taskfeedback.StatusFailed {
+		t.Fatalf("feedback response = %d, %#v", response.StatusCode, feedback)
+	}
+
+	eventsResponse, err := server.Client().Get(server.URL + "/api/tasks/" + created.ID + "/feedback/events?after=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer eventsResponse.Body.Close()
+	stream, err := io.ReadAll(eventsResponse.Body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventsResponse.StatusCode != http.StatusOK || !strings.Contains(string(stream), "id: 2\n") ||
+		!strings.Contains(string(stream), "id: 3\n") || strings.Contains(string(stream), "id: 1\n") {
+		t.Fatalf("feedback SSE = %d: %s", eventsResponse.StatusCode, stream)
+	}
+
+	retryResponse, err := server.Client().Post(
+		server.URL+"/api/task-feedback/"+discuss.Feedback.ID+"/retry", "application/json", strings.NewReader("{}"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer retryResponse.Body.Close()
+	var retry taskfeedback.Feedback
+	if err := json.NewDecoder(retryResponse.Body).Decode(&retry); err != nil {
+		t.Fatal(err)
+	}
+	if retryResponse.StatusCode != http.StatusCreated || retry.Status != taskfeedback.StatusQueued ||
+		retry.RetryOfFeedbackID != discuss.Feedback.ID {
+		t.Fatalf("retry response = %d, %#v", retryResponse.StatusCode, retry)
+	}
+}
+
 func TestTaskRoutesRetryCancelledRunWithoutCancellingTask(t *testing.T) {
 	database, server := newTaskTestServerWithDatabase(t)
 	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"保留后重新排队"}`, http.StatusCreated)
@@ -154,10 +244,32 @@ func newTaskTestServerWithDatabase(t *testing.T) (*sql.DB, *httptest.Server) {
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
 	taskStore := storage.NewTaskStore(database)
-	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), nil)
+	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), storage.NewTaskFeedbackStore(database), nil)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return database, server
+}
+
+func requestTaskFeedback(t *testing.T, client *http.Client, url string, body string, wantStatus int) taskFeedbackResponse {
+	t.Helper()
+	request, err := http.NewRequest(http.MethodPost, url, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != wantStatus {
+		t.Fatalf("POST %s status = %d, want %d", url, response.StatusCode, wantStatus)
+	}
+	var result taskFeedbackResponse
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	return result
 }
 
 func requestStatus(

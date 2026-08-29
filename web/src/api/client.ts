@@ -5,6 +5,9 @@ import type {
   CreateMessageInput,
   DiscussionMessage,
   DiscussionSubjectKind,
+	TaskFeedback,
+  TaskFeedbackIntent,
+  TaskFeedbackResponse,
   ProjectInfo,
   Task,
   TaskAssociation,
@@ -308,6 +311,54 @@ export async function createMessage(
     method: 'POST',
     body: input,
   }))
+}
+
+export async function createTaskFeedback(
+	taskID: string,
+	input: { content: string; linked_task_ids: string[]; intent: TaskFeedbackIntent; expected_task_version: number },
+): Promise<TaskFeedbackResponse> {
+	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/feedback`, { method: 'POST', body: input })
+	if (!isRecord(value)) throw new ApiError('Task 反馈结果格式无效', 502, 'INVALID_RESPONSE')
+	const result: TaskFeedbackResponse = { message: parseDiscussionMessage(value.message) }
+	if (value.task !== undefined) result.task = parseTask(value.task)
+	if (value.follow_up_task !== undefined) result.follow_up_task = parseTask(value.follow_up_task)
+	if (value.feedback !== undefined) result.feedback = parseTaskFeedback(value.feedback)
+	return result
+}
+
+export async function getTaskFeedback(taskID: string, signal?: AbortSignal): Promise<TaskFeedback[]> {
+	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/feedback`, { signal })
+	if (!Array.isArray(value)) throw new ApiError('Task 反馈列表格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseTaskFeedback)
+}
+
+export async function retryTaskFeedback(feedbackID: string): Promise<TaskFeedback> {
+	return parseTaskFeedback(await requestJSON(`/api/task-feedback/${encodeURIComponent(feedbackID)}/retry`, {
+		method: 'POST', body: {},
+	}))
+}
+
+function parseTaskFeedback(value: unknown): TaskFeedback {
+	if (!isRecord(value) || !hasStringFields(value, [
+		'id', 'task_id', 'source_message_id', 'intent', 'status', 'failure_message', 'created_at', 'updated_at',
+	])) throw new ApiError('Task 反馈状态格式无效', 502, 'INVALID_RESPONSE')
+	const intent = value.intent
+	const status = value.status
+	if ((intent !== 'DISCUSS' && intent !== 'REQUEST_CHANGES') || !isTaskFeedbackStatus(status)) {
+		throw new ApiError('Task 反馈状态格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id as string, task_id: value.task_id as string, source_message_id: value.source_message_id as string,
+		intent, status, failure_message: value.failure_message as string,
+		created_at: value.created_at as string, updated_at: value.updated_at as string,
+		...(typeof value.retry_of_feedback_id === 'string' ? { retry_of_feedback_id: value.retry_of_feedback_id } : {}),
+		...(typeof value.run_id === 'string' ? { run_id: value.run_id } : {}),
+		...(typeof value.response_message_id === 'string' ? { response_message_id: value.response_message_id } : {}),
+	}
+}
+
+function isTaskFeedbackStatus(value: unknown): value is NonNullable<TaskFeedbackResponse['feedback']>['status'] {
+	return value === 'QUEUED' || value === 'RUNNING' || value === 'ANSWERED' || value === 'APPLIED' || value === 'FAILED'
 }
 
 export async function getTaskAssociations(

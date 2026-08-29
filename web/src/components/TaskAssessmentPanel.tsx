@@ -47,8 +47,25 @@ const dimensions: ReadonlyArray<{ key: keyof AssessmentScores; label: string }> 
 ]
 
 function DimensionGrid({ scores }: { scores: AssessmentScores }) {
-	return <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{dimensions.map((item) => <div className="rounded-lg border px-3 py-2" key={item.key}><p className="text-xs text-muted-foreground">{item.label}</p><p className="mt-1 font-mono text-sm font-semibold">{scores[item.key]} / 4</p></div>)}</div>
+	return <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">{dimensions.map((item) => {
+		const score = scores[item.key]
+		return <div className="rounded-lg border px-3 py-2.5" key={item.key}>
+			<div className="flex items-baseline justify-between gap-2"><p className="text-xs text-muted-foreground">{item.label}</p><p className="font-mono text-sm font-semibold">{score} / 4</p></div>
+			<div
+				className="mt-2 h-2 overflow-hidden rounded-full bg-muted"
+				role="progressbar"
+				aria-label={item.label}
+				aria-valuemin={0}
+				aria-valuemax={4}
+				aria-valuenow={score}
+			>
+				<div className={`h-full rounded-full transition-[width] ${scoreColors[score]}`} style={{ width: `${(score + 1) * 20}%` }} />
+			</div>
+		</div>
+	})}</div>
 }
+
+const scoreColors = ['bg-emerald-500', 'bg-green-500', 'bg-amber-400', 'bg-orange-500', 'bg-rose-600'] as const
 
 function TitleDialog(props: { task: Task; busy: boolean; onClose: () => void; onSave: (title: string) => Promise<void> }) {
 	const [title, setTitle] = useState(props.task.title)
