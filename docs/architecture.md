@@ -849,9 +849,9 @@ MCP 第一阶段只提供当前项目的有界只读搜索和读取能力，不�
 
 ## 11.1 整体进度与测试证据
 
-整体进度页区分按非取消 Task 数计算的严格已验收进度和按 Points 计算的 AI 预测进度。未估算 Task 不进入 Points 分母，但必须展示估算覆盖率。MVP 尚未实现 Estimate stale 检测。测试通过率只根据结构化 Test Result 计算，并明确区分 Runner 命令、人工确认和 Agent 自报。
+整体进度页区分按非取消 Task 数计算的严格已验收进度和按 Points 计算的 AI 预测进度。未估算 Task 不进入 Points 分母，但必须展示估算覆盖率。MVP 尚未实现 Estimate stale 检测。测试通过率只根据结构化 Test Result 计算，并明确区分 Runner 命令、人工确认和 Agent 自报。Task 详情默认只展开仍需处理的 required Test Case，已验证项和 optional 项折叠展示。
 
-正常验收要求 required Test Case 的最新结果全部为 `PASSED`；人工 Override 必须保存原因和审计事件。详细决策见 [ADR-0009](adr/0009-ai-estimates-progress-and-test-evidence.md)。
+Runner 只把可信 Adapter 提供的结构化命令完成事件作为候选证据；Agent Result 报告的命令必须精确匹配本 Run 观察到的命令，且结果与退出码一致，才保存为 `COMMAND`，否则保存为 `AGENT_REPORT`。正常验收要求 required Test Case 的最新结果全部为 `PASSED` 且证据为 `COMMAND` 或 `HUMAN`；MVP 不提供 Override。详细决策见 [ADR-0009](adr/0009-ai-estimates-progress-and-test-evidence.md)。
 
 整体进度页同时展示真实 Run Usage：累计输入、其中缓存、非缓存输入、缓存命中率、输出、采集覆盖率和按 Purpose 汇总。Schema v20 使用独立 `run_usage` 表保存 Codex 结构化事件提供的可空指标。累计输入不得标注为“上下文大小”；单次峰值、模型请求次数和 Cost 无可靠来源时保持未知。详细决策见 [ADR-0014](adr/0014-actual-usage-and-quality-first-soft-context-budget.md)。
 

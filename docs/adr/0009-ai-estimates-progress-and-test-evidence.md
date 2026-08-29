@@ -61,6 +61,8 @@ command, artifact_ref, summary, created_at
 - `HUMAN`：人工确认并记录说明。
 - `AGENT_REPORT`：仅有 Agent 结构化报告，不能伪装成已验证命令。
 
+Runner 只从已声明结构化能力的 Adapter 读取命令完成事件。Agent Result 中的 `command` 必须与本 Run 观察到的完整命令或安全解包后的 shell 命令精确匹配，且 `PASSED`/`FAILED` 必须与退出码一致，才能升级为 `COMMAND`；否则保留为 `AGENT_REPORT`。命令证据引用本 Run 的 stdout Artifact，Generic Process Adapter 的普通文本输出不参与升级。
+
 ### 4. 验收门槛
 
 存在 required Test Case 时，正常 `AcceptTask` 要求每项最新结果为 `PASSED`，且证据为 `COMMAND` 或 `HUMAN`。MVP 不提供 Override；`AGENT_REPORT` 固定不满足门槛。
@@ -77,6 +79,7 @@ MVP 已包含：
 - 按 Points 计算的 AI 预测、剩余点数和估算覆盖率。
 - required Test Case 的已验证通过数与仅 Agent 自报数。
 - Task 详情中的估算依据、置信度、来源和测试证据。
+- Task 详情默认只展开未验证的 required Test Case；命令或人工已验证项、未验证 optional 项分别折叠，避免把全部测试都交给人类逐项确认。
 
 状态分布、并发占用、最近 Run、逐 Task 进度表和阻塞聚合属于后续增强，未实现前不得写入当前能力清单。
 

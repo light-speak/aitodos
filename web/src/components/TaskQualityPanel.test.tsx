@@ -54,7 +54,30 @@ describe('TaskQualityPanel', () => {
 		}
 		render(<TaskQualityPanel quality={verifiedQuality} loading={false} error={null} busy={false} onReload={() => undefined} onCreateEstimate={vi.fn()} onCreateTestCase={vi.fn()} onRecordResult={vi.fn()} />)
 
-		expect(screen.getByText('人工确认通过 · 已验证')).toBeInTheDocument()
+		expect(screen.getByText('人工确认通过 · 人工已验证')).toBeInTheDocument()
+		expect(screen.queryByRole('button', { name: '人工确认浏览器创建流程通过' })).not.toBeInTheDocument()
+	})
+
+	it('默认只展开待处理必测项，并折叠 Runner 命令验证通过的项目', () => {
+		const testCase = taskQuality.test_cases[0]!
+		const commandQuality: TaskQuality = {
+			...taskQuality,
+			test_cases: [
+				{
+					...testCase,
+					latest_result: {
+						...testCase.latest_result!, evidence_kind: 'COMMAND', summary: 'vitest 通过',
+						command: 'pnpm test', artifact_ref: 'runs/run-1/stdout.log',
+					},
+				},
+				{ ...testCase, id: 'test-2', title: '浏览器人工检查', latest_result: undefined },
+			],
+		}
+		render(<TaskQualityPanel quality={commandQuality} loading={false} error={null} busy={false} onReload={() => undefined} onCreateEstimate={vi.fn()} onCreateTestCase={vi.fn()} onRecordResult={vi.fn()} />)
+
+		expect(screen.getByText('需要你处理 1 项')).toBeInTheDocument()
+		expect(screen.getByText('已验证 1 项')).toBeInTheDocument()
+		expect(screen.getByText('vitest 通过 · 命令已验证')).toBeInTheDocument()
 		expect(screen.queryByRole('button', { name: '人工确认浏览器创建流程通过' })).not.toBeInTheDocument()
 	})
 })
