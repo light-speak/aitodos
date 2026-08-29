@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 28
+const currentSchemaVersion = 30
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -121,7 +121,7 @@ func applyMigration(ctx context.Context, database *sql.DB, version int) error {
 	if !ok {
 		return fmt.Errorf("unsupported schema migration: %d", version)
 	}
-	if version == 16 || version == 17 || version == 21 {
+	if version == 16 || version == 17 || version == 21 || version == 30 {
 		return applyRebuildMigration(ctx, database, version, statement)
 	}
 
@@ -1132,6 +1132,91 @@ CREATE INDEX topic_events_timeline_idx ON topic_events(topic_id, sequence);
 
 ALTER TABLE run_finalization_intents ADD COLUMN planning_result_json TEXT
     CHECK (planning_result_json IS NULL OR json_valid(planning_result_json));`, true
+	case 29:
+		return `CREATE TABLE task_feedback_turns (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL UNIQUE REFERENCES messages(id) ON DELETE CASCADE,
+    intent TEXT NOT NULL CHECK (intent IN ('DISCUSS', 'REQUEST_CHANGES')),
+    status TEXT NOT NULL CHECK (status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'APPLIED', 'FAILED')),
+    run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    response_message_id TEXT UNIQUE REFERENCES messages(id) ON DELETE RESTRICT,
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (
+        (intent = 'DISCUSS' AND status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'FAILED')) OR
+        (intent = 'REQUEST_CHANGES' AND status = 'APPLIED')
+    ),
+    CHECK ((status = 'QUEUED' AND run_id IS NULL) OR status != 'QUEUED'),
+    CHECK ((status IN ('RUNNING', 'ANSWERED', 'FAILED') AND run_id IS NOT NULL) OR
+           status NOT IN ('RUNNING', 'ANSWERED', 'FAILED')),
+    CHECK ((status = 'ANSWERED' AND response_message_id IS NOT NULL) OR
+           (status != 'ANSWERED' AND response_message_id IS NULL))
+);
+CREATE INDEX task_feedback_queue_idx ON task_feedback_turns(status, created_at);
+CREATE INDEX task_feedback_task_idx ON task_feedback_turns(task_id, created_at DESC);
+
+ALTER TABLE run_finalization_intents ADD COLUMN task_reply TEXT
+    CHECK (task_reply IS NULL OR length(trim(task_reply)) BETWEEN 1 AND 20000);`, true
+	case 30:
+		return `ALTER TABLE task_feedback_turns RENAME TO task_feedback_turns_v29;
+CREATE TABLE task_feedback_turns (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_message_id TEXT NOT NULL REFERENCES messages(id) ON DELETE CASCADE,
+    retry_of_feedback_id TEXT UNIQUE REFERENCES task_feedback_turns(id) ON DELETE RESTRICT,
+    intent TEXT NOT NULL CHECK (intent IN ('DISCUSS', 'REQUEST_CHANGES')),
+    status TEXT NOT NULL CHECK (status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'APPLIED', 'FAILED')),
+    run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    response_message_id TEXT UNIQUE REFERENCES messages(id) ON DELETE RESTRICT,
+    failure_message TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    CHECK (retry_of_feedback_id IS NULL OR retry_of_feedback_id != id),
+    CHECK (
+        (intent = 'DISCUSS' AND status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'FAILED')) OR
+        (intent = 'REQUEST_CHANGES' AND status = 'APPLIED')
+    ),
+    CHECK ((status = 'QUEUED' AND run_id IS NULL) OR status != 'QUEUED'),
+    CHECK ((status IN ('RUNNING', 'ANSWERED', 'FAILED') AND run_id IS NOT NULL) OR
+           status NOT IN ('RUNNING', 'ANSWERED', 'FAILED')),
+    CHECK ((status = 'ANSWERED' AND response_message_id IS NOT NULL) OR
+           (status != 'ANSWERED' AND response_message_id IS NULL))
+);
+INSERT INTO task_feedback_turns(
+    id, task_id, source_message_id, retry_of_feedback_id, intent, status, run_id,
+    response_message_id, failure_message, created_at, updated_at
+)
+SELECT id, task_id, source_message_id, NULL, intent, status, run_id,
+       response_message_id, failure_message, created_at, updated_at
+FROM task_feedback_turns_v29;
+DROP TABLE task_feedback_turns_v29;
+CREATE INDEX task_feedback_queue_idx ON task_feedback_turns(status, created_at);
+CREATE INDEX task_feedback_task_idx ON task_feedback_turns(task_id, created_at DESC);
+
+CREATE TABLE task_feedback_events (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    feedback_id TEXT NOT NULL REFERENCES task_feedback_turns(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    status TEXT NOT NULL CHECK (status IN ('QUEUED', 'RUNNING', 'ANSWERED', 'APPLIED', 'FAILED')),
+    run_id TEXT REFERENCES runs(id) ON DELETE RESTRICT,
+    response_message_id TEXT REFERENCES messages(id) ON DELETE RESTRICT,
+    failure_message TEXT NOT NULL DEFAULT '',
+    occurred_at TEXT NOT NULL,
+    UNIQUE(task_id, sequence)
+);
+INSERT INTO task_feedback_events(
+    id, task_id, feedback_id, sequence, status, run_id,
+    response_message_id, failure_message, occurred_at
+)
+SELECT lower(hex(randomblob(16))), task_id, id,
+       ROW_NUMBER() OVER (PARTITION BY task_id ORDER BY created_at, id),
+       status, run_id, response_message_id, failure_message, updated_at
+FROM task_feedback_turns;
+CREATE INDEX task_feedback_events_timeline_idx
+ON task_feedback_events(task_id, sequence);`, true
 	default:
 		return "", false
 	}

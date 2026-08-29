@@ -35,6 +35,8 @@ it('展示可解释复杂度并允许人工编辑后锁定标题', async () => {
 	expect(screen.getByText('需要跨模块修改并进行人工环境验证')).toBeInTheDocument()
 	expect(screen.getByText('建议拆分实现与环境验证')).toBeInTheDocument()
 	expect(screen.getByText('人工依赖')).toBeInTheDocument()
+	expect(screen.getByRole('progressbar', { name: '技术复杂度' })).toHaveAttribute('aria-valuenow', '4')
+	expect(screen.getByRole('progressbar', { name: '需求不确定性' })).toHaveAttribute('aria-valuenow', '2')
 
 	await user.click(screen.getByRole('button', { name: '编辑并锁定标题' }))
 	const input = screen.getByLabelText('Task 标题')

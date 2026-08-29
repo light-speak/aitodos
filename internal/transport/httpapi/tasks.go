@@ -5,13 +5,16 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
+	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/assessment"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/relation"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/taskfeedback"
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
@@ -22,6 +25,7 @@ type taskHandler struct {
 	discussion  *storage.DiscussionStore
 	relations   *storage.RelationStore
 	assessments *storage.AssessmentStore
+	feedback    *storage.TaskFeedbackStore
 	branches    TargetBranchValidator
 }
 
@@ -47,6 +51,20 @@ type retryTaskRequest struct {
 	ExpectedVersion int64 `json:"expected_version"`
 }
 
+type taskFeedbackRequest struct {
+	Intent              string   `json:"intent"`
+	Content             string   `json:"content"`
+	LinkedTaskIDs       []string `json:"linked_task_ids,omitempty"`
+	ExpectedTaskVersion int64    `json:"expected_task_version"`
+}
+
+type taskFeedbackResponse struct {
+	Message      discussion.Message     `json:"message"`
+	Feedback     *taskfeedback.Feedback `json:"feedback,omitempty"`
+	Task         *task.Task             `json:"task,omitempty"`
+	FollowUpTask *task.Task             `json:"follow_up_task,omitempty"`
+}
+
 type taskListItem struct {
 	task.Task
 	Assessment      *assessment.Assessment `json:"assessment,omitempty"`
@@ -69,11 +87,12 @@ func RegisterTaskRoutes(
 	discussionStore *storage.DiscussionStore,
 	relationStore *storage.RelationStore,
 	assessmentStore *storage.AssessmentStore,
+	feedbackStore *storage.TaskFeedbackStore,
 	branchValidator TargetBranchValidator,
 ) {
 	handler := &taskHandler{
 		store: store, discussion: discussionStore, relations: relationStore,
-		assessments: assessmentStore, branches: branchValidator,
+		assessments: assessmentStore, feedback: feedbackStore, branches: branchValidator,
 	}
 	mux.HandleFunc("POST /api/tasks", handler.create)
 	mux.HandleFunc("GET /api/tasks", handler.list)
@@ -82,12 +101,158 @@ func RegisterTaskRoutes(
 	mux.HandleFunc("POST /api/tasks/{taskID}/retry", handler.retry)
 	mux.HandleFunc("GET /api/tasks/{taskID}/messages", handler.listMessages)
 	mux.HandleFunc("POST /api/tasks/{taskID}/messages", handler.createMessage)
+	mux.HandleFunc("POST /api/tasks/{taskID}/feedback", handler.createFeedback)
+	mux.HandleFunc("GET /api/tasks/{taskID}/feedback", handler.listFeedback)
+	mux.HandleFunc("GET /api/tasks/{taskID}/feedback/events", handler.feedbackEvents)
+	mux.HandleFunc("POST /api/task-feedback/{feedbackID}/retry", handler.retryFeedback)
 	mux.HandleFunc("GET /api/tasks/{taskID}/relations", handler.listRelations)
 	mux.HandleFunc("POST /api/tasks/{taskID}/relations", handler.createRelation)
 	mux.HandleFunc("DELETE /api/tasks/{taskID}/relations/{relatedTaskID}", handler.deleteRelation)
 	mux.HandleFunc("GET /api/tasks/{taskID}/topics", handler.listTopics)
 	mux.HandleFunc("POST /api/tasks/{taskID}/topics", handler.createTopicRelation)
 	mux.HandleFunc("DELETE /api/tasks/{taskID}/topics/{topicID}", handler.deleteTopicRelation)
+}
+
+func (handler *taskHandler) listFeedback(response http.ResponseWriter, request *http.Request) {
+	items, err := handler.feedback.ListTask(request.Context(), request.PathValue("taskID"))
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, items)
+}
+
+func (handler *taskHandler) retryFeedback(response http.ResponseWriter, request *http.Request) {
+	created, err := handler.feedback.Retry(request.Context(), request.PathValue("feedbackID"))
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusCreated, created)
+}
+
+func (handler *taskHandler) feedbackEvents(response http.ResponseWriter, request *http.Request) {
+	after, err := runEventCursor(request)
+	if err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_EVENT_CURSOR", err.Error())
+		return
+	}
+	taskID := request.PathValue("taskID")
+	if _, err := handler.store.Get(request.Context(), taskID); err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	flusher, ok := response.(http.Flusher)
+	if !ok {
+		writeError(response, http.StatusInternalServerError, "SSE_UNSUPPORTED", "当前 HTTP Writer 不支持 SSE")
+		return
+	}
+	response.Header().Set("Content-Type", "text/event-stream")
+	response.Header().Set("Cache-Control", "no-cache")
+	response.Header().Set("X-Accel-Buffering", "no")
+	_, _ = io.WriteString(response, "retry: 1000\n\n")
+	flusher.Flush()
+	handler.streamFeedbackEvents(response, request, flusher, taskID, after)
+}
+
+func (handler *taskHandler) streamFeedbackEvents(
+	response http.ResponseWriter,
+	request *http.Request,
+	flusher http.Flusher,
+	taskID string,
+	after int64,
+) {
+	poll := time.NewTicker(250 * time.Millisecond)
+	heartbeat := time.NewTicker(15 * time.Second)
+	defer poll.Stop()
+	defer heartbeat.Stop()
+	for {
+		if err := handler.emitFeedbackEvents(request, response, flusher, taskID, &after); err != nil {
+			return
+		}
+		pending, err := handler.feedback.HasPendingTask(request.Context(), taskID)
+		if err != nil || !pending {
+			return
+		}
+		select {
+		case <-request.Context().Done():
+			return
+		case <-poll.C:
+		case <-heartbeat.C:
+			_, _ = io.WriteString(response, ": keepalive\n\n")
+			flusher.Flush()
+		}
+	}
+}
+
+func (handler *taskHandler) emitFeedbackEvents(
+	request *http.Request,
+	response http.ResponseWriter,
+	flusher http.Flusher,
+	taskID string,
+	after *int64,
+) error {
+	events, err := handler.feedback.ListEvents(request.Context(), taskID, *after, 100)
+	if err != nil {
+		return err
+	}
+	for _, event := range events {
+		encoded, marshalErr := json.Marshal(event)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		if _, writeErr := fmt.Fprintf(response, "id: %d\nevent: task-feedback\ndata: %s\n\n", event.Sequence, encoded); writeErr != nil {
+			return writeErr
+		}
+		*after = event.Sequence
+	}
+	if len(events) > 0 {
+		flusher.Flush()
+	}
+	return nil
+}
+
+func (handler *taskHandler) createFeedback(response http.ResponseWriter, request *http.Request) {
+	var body taskFeedbackRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的 Task 反馈")
+		return
+	}
+	input := discussion.CreateMessageInput{Content: body.Content, LinkedTaskIDs: body.LinkedTaskIDs}.Normalized()
+	if err := input.Validate(); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_MESSAGE", "反馈内容不能为空，且最多关联 20 个 Task")
+		return
+	}
+	taskID := request.PathValue("taskID")
+	switch body.Intent {
+	case "NOTE":
+		message, err := handler.discussion.AppendTaskMessage(request.Context(), taskID, input)
+		if err != nil {
+			writeTaskError(response, err)
+			return
+		}
+		writeJSON(response, http.StatusCreated, taskFeedbackResponse{Message: message})
+	case string(taskfeedback.IntentDiscuss):
+		message, feedback, err := handler.feedback.Discuss(request.Context(), taskID, input)
+		if err != nil {
+			writeTaskError(response, err)
+			return
+		}
+		writeJSON(response, http.StatusCreated, taskFeedbackResponse{Message: message, Feedback: &feedback})
+	case string(taskfeedback.IntentRequestChanges):
+		message, feedback, updated, followUp, err := handler.feedback.RequestChanges(
+			request.Context(), taskID, body.ExpectedTaskVersion, input,
+		)
+		if err != nil {
+			writeTaskError(response, err)
+			return
+		}
+		writeJSON(response, http.StatusCreated, taskFeedbackResponse{
+			Message: message, Feedback: &feedback, Task: &updated, FollowUpTask: followUp,
+		})
+	default:
+		writeError(response, http.StatusBadRequest, "INVALID_FEEDBACK_INTENT", "请选择询问 Agent、要求修改或仅记录")
+	}
 }
 
 func (handler *taskHandler) retry(response http.ResponseWriter, request *http.Request) {
@@ -291,6 +456,8 @@ func writeTaskError(response http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, storage.ErrTaskNotFound):
 		writeError(response, http.StatusNotFound, "TASK_NOT_FOUND", "Task 不存在")
+	case errors.Is(err, storage.ErrTaskFeedbackNotFound):
+		writeError(response, http.StatusNotFound, "TASK_FEEDBACK_NOT_FOUND", "Task 反馈不存在")
 	case errors.Is(err, storage.ErrTopicNotFound):
 		writeError(response, http.StatusNotFound, "TOPIC_NOT_FOUND", "Topic 不存在")
 	case errors.Is(err, storage.ErrTaskVersionConflict):
@@ -299,6 +466,8 @@ func writeTaskError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusConflict, "CLARIFICATION_ANSWER_REQUIRED", "请先回答 Agent 的结构化问题，再继续执行")
 	case errors.Is(err, storage.ErrSelfTaskLink):
 		writeError(response, http.StatusBadRequest, "INVALID_RELATION", "Task 不能关联自身")
+	case errors.Is(err, storage.ErrTaskFeedbackConflict):
+		writeError(response, http.StatusConflict, "TASK_FEEDBACK_CONFLICT", "当前反馈状态不允许该操作，请刷新后重试")
 	default:
 		var transitionErr *task.TransitionError
 		if errors.As(err, &transitionErr) {

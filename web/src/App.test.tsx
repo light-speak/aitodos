@@ -294,6 +294,9 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
   if (url === '/api/tasks/task-1/messages' && method === 'GET') {
     return Promise.resolve(Response.json([]))
   }
+	if (url === '/api/tasks/task-1/feedback' && method === 'GET') {
+		return Promise.resolve(Response.json([]))
+	}
   if (url === '/api/tasks/task-1/workspace' && method === 'GET') {
     return Promise.resolve(Response.json(null))
   }
@@ -355,6 +358,17 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
         linked_task_ids: ['task-related'],
     }, { status: 201 }))
   }
+	if (url === '/api/tasks/task-1/feedback' && method === 'POST') {
+		return Promise.resolve(Response.json({
+			message: {
+				...topicMessage, id: 'task-message-1', content: '请同步检查接口返回值', linked_task_ids: ['task-related'],
+			},
+			feedback: {
+				id: 'feedback-1', task_id: 'task-1', source_message_id: 'task-message-1', intent: 'DISCUSS', status: 'QUEUED',
+				failure_message: '', created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-20T00:00:00Z',
+			},
+		}, { status: 201 }))
+	}
   if (url === '/api/tasks/task-1/relations' && method === 'GET') {
     return Promise.resolve(Response.json([]))
   }
@@ -826,13 +840,14 @@ describe('App', () => {
     await user.keyboard('{Control>}{Enter}{/Control}')
 
     expect(fetchMock).toHaveBeenCalledWith(
-      '/api/tasks/task-1/messages',
+	  '/api/tasks/task-1/feedback',
       expect.objectContaining({
         method: 'POST',
-        body: '{"content":"请同步检查接口返回值","linked_task_ids":["task-related"]}',
+		body: '{"content":"请同步检查接口返回值","linked_task_ids":["task-related"],"intent":"DISCUSS","expected_task_version":1}',
       }),
     )
     expect(await within(dialog).findByText('请同步检查接口返回值')).toBeInTheDocument()
+	expect(within(dialog).getByText('等待 Agent')).toBeInTheDocument()
     expect(within(dialog).getByRole('button', { name: '打开 ATS-099' })).toBeInTheDocument()
   })
 

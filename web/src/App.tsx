@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIcon, AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from './api/client'
@@ -35,6 +35,7 @@ import { useApprovals } from './features/approvals/useApprovals'
 import { useBrowserNotifications } from './features/notifications/useBrowserNotifications'
 import { useTopicPlanning } from './features/runs/useTopicPlanning'
 import { useAgentActivity } from './features/runs/useAgentActivity'
+import type { TaskFeedbackIntent } from './types'
 
 type AppView = 'topics' | 'tasks' | 'runs' | 'progress' | 'agents'
 
@@ -78,6 +79,7 @@ export default function App() {
 		() => agentActivity.runs.find((run) => run.task_id === selectedTaskID) ?? null,
 		[agentActivity.runs, selectedTaskID],
 	)
+	const observedTaskRun = useRef<{ taskID: string; runID: string } | null>(null)
 	const reloadBoard = board.reload
 	const reloadDiscussion = discussion.reload
 	const reloadTopicPlan = topicPlan.reload
@@ -92,6 +94,23 @@ export default function App() {
 		reloadBoard()
 	}, [planningCompletionKey, reloadBoard, reloadDiscussion, reloadTopicPlan])
 
+	useEffect(() => {
+		if (selectedTaskID === null) {
+			observedTaskRun.current = null
+			return
+		}
+		if (observedTaskRun.current?.taskID !== selectedTaskID) observedTaskRun.current = null
+		if (selectedTaskActiveRun !== null) {
+			observedTaskRun.current = { taskID: selectedTaskID, runID: selectedTaskActiveRun.id }
+			return
+		}
+		if (observedTaskRun.current !== null) {
+			observedTaskRun.current = null
+			reloadDiscussion()
+			reloadBoard()
+		}
+	}, [reloadBoard, reloadDiscussion, selectedTaskActiveRun, selectedTaskID])
+
   function openTask(taskID: string) {
     setSelectedTopicID(null)
     setSelectedTaskID(taskID)
@@ -104,12 +123,17 @@ export default function App() {
     setView('topics')
   }
 
-  async function sendMessage(content: string, linkedTaskIDs: string[]) {
-    await discussion.sendMessage(content, linkedTaskIDs)
+  async function sendMessage(content: string, linkedTaskIDs: string[], intent?: TaskFeedbackIntent) {
+    const result = await discussion.sendMessage(content, linkedTaskIDs, intent, selectedTask?.version)
     associations.includeTaskIDs(linkedTaskIDs)
 		if (selectedTopicID !== null) {
 			board.reload()
 			topicPlanning.reload()
+		}
+		if (selectedTaskID !== null) {
+			if (result?.task) board.updateTask(result.task)
+			if (result?.follow_up_task) board.reload()
+			agentActivity.reload()
 		}
   }
 
@@ -227,11 +251,13 @@ export default function App() {
           tasks={board.tasks}
           topics={board.topics}
           messages={discussion.messages}
+		  feedback={discussion.feedback}
           associations={associations.associations}
           topicAssociations={topicAssociations.associations}
           discussionLoading={discussion.loading}
           relationLoading={associations.loading}
           submitting={discussion.submitting}
+		  retryingFeedbackID={discussion.retryingFeedbackID}
           discussionError={discussion.error}
           relationError={associations.error}
           pendingRelationTaskIDs={associations.pendingTaskIDs}
@@ -255,6 +281,7 @@ export default function App() {
 			repository={git.repository}
           onClose={() => setSelectedTaskID(null)}
           onReloadDiscussion={discussion.reload}
+		  onRetryFeedback={discussion.retryFeedback}
           onSendMessage={sendMessage}
           onAddRelation={associations.add}
           onRemoveRelation={associations.remove}

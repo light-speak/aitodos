@@ -169,7 +169,7 @@ func newTopicTestServer(t *testing.T) *httptest.Server {
 	relationStore := storage.NewRelationStore(database)
 	RegisterTopicRoutes(mux, storage.NewTopicStore(database), discussionStore, relationStore)
 	taskStore := storage.NewTaskStore(database)
-	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), nil)
+	RegisterTaskRoutes(mux, taskStore, discussionStore, relationStore, storage.NewAssessmentStore(database), storage.NewTaskFeedbackStore(database), nil)
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	return server

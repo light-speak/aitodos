@@ -158,6 +158,41 @@ export interface DiscussionMessage {
   created_at: string
 }
 
+export type TaskFeedbackIntent = 'NOTE' | 'DISCUSS' | 'REQUEST_CHANGES'
+
+export interface TaskFeedback {
+	id: string
+	task_id: string
+	source_message_id: string
+	retry_of_feedback_id?: string
+	intent: Exclude<TaskFeedbackIntent, 'NOTE'>
+	status: 'QUEUED' | 'RUNNING' | 'ANSWERED' | 'APPLIED' | 'FAILED'
+	run_id?: string
+	response_message_id?: string
+	failure_message: string
+	created_at: string
+	updated_at: string
+}
+
+export interface TaskFeedbackEvent {
+	id: string
+	task_id: string
+	feedback_id: string
+	sequence: number
+	status: TaskFeedback['status']
+	run_id?: string
+	response_message_id?: string
+	failure_message: string
+	occurred_at: string
+}
+
+export interface TaskFeedbackResponse {
+	message: DiscussionMessage
+	feedback?: TaskFeedback
+	task?: Task
+	follow_up_task?: Task
+}
+
 export interface TaskAssociation {
   task: Task
   source_message_id?: string

@@ -31,12 +31,14 @@ const (
 	CommandRetry                Command = "RETRY"
 	CommandResumeImplementation Command = "RESUME_IMPLEMENTATION"
 	CommandResumeRevision       Command = "RESUME_REVISION"
+	CommandRequestChanges       Command = "REQUEST_CHANGES"
 )
 
 var transitions = map[Status]map[Command]Status{
 	StatusReady: {
-		CommandClaimRun:     StatusRunning,
-		CommandSubmitReview: StatusReview,
+		CommandClaimRun:       StatusRunning,
+		CommandSubmitReview:   StatusReview,
+		CommandRequestChanges: StatusChangesRequested,
 	},
 	StatusRunning: {
 		CommandRunSucceeded: StatusReview,
@@ -45,16 +47,19 @@ var transitions = map[Status]map[Command]Status{
 		CommandCancelRun:    StatusBlocked,
 	},
 	StatusReview: {
-		CommandAccept: StatusAccepted,
-		CommandReject: StatusChangesRequested,
+		CommandAccept:         StatusAccepted,
+		CommandReject:         StatusChangesRequested,
+		CommandRequestChanges: StatusChangesRequested,
 	},
 	StatusChangesRequested: {
-		CommandClaimRun: StatusRunning,
+		CommandClaimRun:       StatusRunning,
+		CommandRequestChanges: StatusChangesRequested,
 	},
 	StatusBlocked: {
 		CommandRetry:                StatusReady,
 		CommandResumeImplementation: StatusReady,
 		CommandResumeRevision:       StatusChangesRequested,
+		CommandRequestChanges:       StatusChangesRequested,
 	},
 }
 
@@ -105,5 +110,6 @@ func AllCommands() []Command {
 		CommandRetry,
 		CommandResumeImplementation,
 		CommandResumeRevision,
+		CommandRequestChanges,
 	}
 }

@@ -273,6 +273,30 @@ func appendAgentTopicMessage(
 	return message, nil
 }
 
+func appendAgentTaskMessage(
+	ctx context.Context,
+	transaction *sql.Tx,
+	taskID string,
+	content string,
+) (discussion.Message, error) {
+	input := discussion.CreateMessageInput{Content: content}.Normalized()
+	if err := input.Validate(); err != nil {
+		return discussion.Message{}, err
+	}
+	threadID, err := findOrCreateThread(ctx, transaction, "task_id", taskID)
+	if err != nil {
+		return discussion.Message{}, err
+	}
+	message, err := appendMessage(ctx, transaction, threadID, discussion.AuthorAgent, input)
+	if err != nil {
+		return discussion.Message{}, err
+	}
+	if _, err := transaction.ExecContext(ctx, "UPDATE tasks SET updated_at = ? WHERE id = ?", formatTime(message.CreatedAt), taskID); err != nil {
+		return discussion.Message{}, fmt.Errorf("update task agent activity: %w", err)
+	}
+	return message, nil
+}
+
 func linkTopicMessageTasks(ctx context.Context, transaction *sql.Tx, topicID string, message discussion.Message) error {
 	for _, taskID := range message.LinkedTaskIDs {
 		if err := requireTask(ctx, transaction, taskID); err != nil {

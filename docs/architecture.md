@@ -1,6 +1,6 @@
 # AiTodos 架构设计基线
 
-- 状态：Draft，ADR-0001 至 ADR-0019 已接受；Topic/Task 讨论、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
+- 状态：Draft，ADR-0001 至 ADR-0020 已接受；Topic/Task 讨论、显式 Task 反馈意图与只读 Agent 问答、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
@@ -128,7 +128,7 @@ Run 业务主体没有其他活跃 Run
 Run 状态为 QUEUED
 ```
 
-PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；每个 OPEN Topic 的新输入版本最多自动尝试一次，失败不会无限重试。TRIAGE Run 作用于 Task 但不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。Worker 开关只控制当前项目的新 Claim；正式 Task 自动进入内部 READY，缺少有效评估时先执行 Triage，Revision 优先于 Implementation，随后按 P0–P3 和排队时间排序。Triage 失败或 Profile 未配置不得永久阻塞 Implementation。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
+PLANNING Run 可以作用于 Topic 且不获取 Git Workspace；每个 OPEN Topic 的新输入版本最多自动尝试一次，失败不会无限重试。TRIAGE 和 Task 问答使用的只读 REVIEW Run 作用于 Task 但不获取 Git Workspace；IMPLEMENTATION、REVISION 和需要写代码的 Run 必须作用于 Task 并获取 Workspace。Worker 开关只控制当前项目的新 Claim；正式 Task 自动进入内部 READY，缺少有效评估时先执行 Triage。调度顺序为 Revision、人工发起的 Task 问答、Planning、Triage、Implementation，再在同类工作内按 P0–P3 和排队时间排序。Triage 失败或 Profile 未配置不得永久阻塞 Implementation。系统不提供跨项目统一 Scheduler；机器总并发是所有已启动项目 Worker 配额之和。
 
 ### Workspace Manager
 
@@ -194,6 +194,8 @@ Project 的仓库身份不能只依赖用户输入路径。初始化和启动时
 ### Task
 
 代表边界明确、可执行和可验收的工作。Task 可以直接创建，也可以从批准的 Plan 或其他 Task 派生。Task 不保存独立的“Agent 是否运行中”布尔值，该信息从活跃 Run 派生，避免双写不一致。
+
+Task 编辑器要求人类显式选择反馈意图：`NOTE` 只保留历史，`DISCUSS` 排队只读 REVIEW Run 并把 Agent 回答追加到同一 Thread，`REQUEST_CHANGES` 进入可审计修订流程。REVIEW 问答不改变 Task 状态，当前问题作为不可裁剪的必选 Context；已验收 Task 的修改请求创建关联后续 Task，不覆盖已经验收的历史。详见 [ADR-0020](adr/0020-task-feedback-turns-and-read-only-agent-discussion.md)。
 
 ### Thread、Clarification 与 Decision
 
@@ -308,11 +310,21 @@ topic_id, task_id, source_message_id, created_at
 
 task_links:
 task_a_id, task_b_id, source_message_id, created_at
+
+task_feedback_turns:
+id, task_id, source_message_id, retry_of_feedback_id
+intent, status
+run_id, response_message_id, failure_message
+created_at, updated_at
+
+task_feedback_events:
+id, task_id, feedback_id, sequence, status
+run_id, response_message_id, failure_message, occurred_at
 ```
 
 Thread 使用 Topic/Task 外键和 CHECK 约束表达恰好一个主体。评论归属和内容引用分开：每条 Message 恰好属于一个 Topic 或 Task Thread，但可以引用零到多个 Task。Topic–Task 和 Task–Task 关系使用显式外键表；Task–Task 当前为对称的“相关”关系，不隐式改变依赖调度。由 Message 引用产生的主体关系在同一短事务中幂等建立，并保留 `source_message_id`；解除主体关系不删除历史消息引用。
 
-Schema v8 已开放 Topic 与 Task 讨论、评论引用 Task、双向可见的 Topic–Task 关联、Task–Task 关联、Task Workspace 和本地 Release。当前 Message 不支持编辑；后续若开放编辑，必须增加 Revision 或审计事件，不静默改写已经进入 Run Context 的历史内容。Agent 消息的来源 Run 外键在 Run Schema 落地后通过新 migration 增加。
+Schema v8 已开放 Topic 与 Task 讨论、评论引用 Task、双向可见的 Topic–Task 关联、Task–Task 关联、Task Workspace 和本地 Release；Schema v29 增加 Task 反馈意图、来源消息、Reviewer Run 和回复消息的真实外键；Schema v30 增加不可变反馈重试链和 Task 内稳定递增的反馈事件。当前 Message 不支持编辑；后续若开放编辑，必须增加 Revision 或审计事件，不静默改写已经进入 Run Context 的历史内容。
 
 ### plans / plan_revisions / plan_task_drafts
 
@@ -539,7 +551,7 @@ created_at
 
 每个聚合内使用递增 `sequence`，并建立 `(aggregate_id, sequence)` 唯一索引。事件 payload 使用版本化 JSON，便于以后增加字段。
 
-Schema v23 已落地 `run_events`。Run Claim 和状态迁移在更新当前状态的同一事务内追加事件；`GET /api/runs/{runID}/events` 使用 sequence 作为 SSE `id`，支持 `Last-Event-ID` 和 `after` 断点。前端按 Run 记录最大已消费 sequence 并忽略重复事件。原始日志不进入 SSE，详见 [ADR-0016](adr/0016-run-events-and-resumable-sse.md)。
+Schema v23 已落地 `run_events`。Run Claim 和状态迁移在更新当前状态的同一事务内追加事件；`GET /api/runs/{runID}/events` 使用 sequence 作为 SSE `id`，支持 `Last-Event-ID` 和 `after` 断点。Schema v30 的 `task_feedback_events` 使用相同原则解决 Task 问答快速完成时的前端观察竞态；`GET /api/tasks/{taskID}/feedback/events` 在排队或运行期间保持连接，终态事件发出后关闭。前端依靠浏览器 EventSource 续传并按持久状态刷新，不从瞬时活跃 Run 反推反馈结果。原始日志不进入 SSE，详见 [ADR-0016](adr/0016-run-events-and-resumable-sse.md)。
 
 ### artifacts / run_artifacts
 
@@ -1047,6 +1059,10 @@ GET    /api/tasks/{taskId}
 PUT    /api/tasks/{taskId}/title
 GET    /api/tasks/{taskId}/messages
 POST   /api/tasks/{taskId}/messages
+POST   /api/tasks/{taskId}/feedback
+GET    /api/tasks/{taskId}/feedback
+GET    /api/tasks/{taskId}/feedback/events
+POST   /api/task-feedback/{feedbackId}/retry
 GET    /api/tasks/{taskId}/topics
 POST   /api/tasks/{taskId}/topics
 DELETE /api/tasks/{taskId}/topics/{topicId}
@@ -1096,7 +1112,7 @@ POST   /api/releases
 POST   /api/artifacts/images
 ```
 
-Topic Planning Run、Topic Clarification、Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Run 查询、详情、按需日志、SSE、取消、人工 Retry 和结构化 Approval 已提供有界接口。Plan Revision/人工审核/批准建 Task、Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
+Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Topic Planning Run、Run 查询、详情、按需日志、SSE、取消、人工 Retry、Task 反馈查询/续传/失败重试和结构化 Approval 已提供有界接口。Plan Revision/人工审核/批准建 Task、Topic/Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
 
 写命令携带目标聚合的 `version` 或 `If-Match`，冲突返回 409。批准 Plan、批量生成 Task、回答 Clarification 和状态迁移必须使用领域命令，不提供通用状态 PATCH。
 

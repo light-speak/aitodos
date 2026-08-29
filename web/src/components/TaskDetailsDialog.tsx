@@ -1,7 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { Clock3Icon, ListChecksIcon, LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
 
-import type { AgentRun, Clarification, ClarificationAnswerInput, CreateTaskEstimateInput, CreateTaskTestCaseInput, CreateTaskTestResultInput, DiscussionMessage, RepositoryInfo, RunPurpose, Task, TaskAssessmentState, TaskAssociation, TaskQuality, TaskStatus, Topic, TopicAssociation, Workspace } from '../types'
+import type { AgentRun, Clarification, ClarificationAnswerInput, CreateTaskEstimateInput, CreateTaskTestCaseInput, CreateTaskTestResultInput, DiscussionMessage, RepositoryInfo, RunPurpose, Task, TaskAssessmentState, TaskAssociation, TaskFeedback, TaskFeedbackIntent, TaskQuality, TaskStatus, Topic, TopicAssociation, Workspace } from '../types'
 import { TaskClarificationsPanel } from './ClarificationsPanel'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
@@ -26,12 +26,14 @@ interface TaskDetailsDialogProps {
 	activeRun: AgentRun | null
   tasks: Task[]
   messages: DiscussionMessage[]
+	feedback: TaskFeedback[]
   associations: TaskAssociation[]
   topics: Topic[]
   topicAssociations: TopicAssociation[]
   discussionLoading: boolean
   relationLoading: boolean
   submitting: boolean
+	retryingFeedbackID: string | null
   discussionError: unknown
   relationError: unknown
   pendingRelationTaskIDs: Set<string>
@@ -55,7 +57,8 @@ interface TaskDetailsDialogProps {
 	answeringClarificationID: string | null
   onClose: () => void
   onReloadDiscussion: () => void
-  onSendMessage: (content: string, linkedTaskIDs: string[]) => Promise<void>
+	onRetryFeedback: (feedbackID: string) => Promise<void>
+  onSendMessage: (content: string, linkedTaskIDs: string[], intent?: TaskFeedbackIntent) => Promise<void>
   onAddRelation: (taskID: string) => Promise<void>
   onRemoveRelation: (taskID: string) => Promise<void>
   onOpenTask: (taskID: string) => void
@@ -169,17 +172,21 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
 					<Separator />
 					<DiscussionMessages
 						messages={messages}
+						feedback={props.feedback}
 						tasks={tasks}
 						excludedTaskID={task.id}
 						loading={props.discussionLoading}
 						error={props.discussionError}
 						onReload={props.onReloadDiscussion}
+						retryingFeedbackID={props.retryingFeedbackID}
+						onRetryFeedback={props.onRetryFeedback}
 						onOpenTask={onOpenTask}
 					/>
 				</div>
 				<DiscussionComposer
 					tasks={tasks}
 					excludedTaskID={task.id}
+					task={task}
 					submitting={props.submitting}
 					onSendMessage={props.onSendMessage}
 				/>
