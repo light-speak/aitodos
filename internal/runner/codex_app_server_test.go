@@ -13,6 +13,7 @@ import (
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
 	"github.com/light-speak/aitodos/internal/domain/approvalrequest"
+	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/project"
@@ -86,6 +87,12 @@ func TestExecuteCodexAppServerBridgesApprovalAndPersistsSession(t *testing.T) {
 	if err != nil || updated.Status != task.StatusReview {
 		t.Fatalf("task = %#v, %v", updated, err)
 	}
+	qualityData, err := storage.NewQualityStore(database).GetTaskQuality(context.Background(), created.ID)
+	if err != nil || len(qualityData.TestCases) != 1 || qualityData.TestCases[0].LatestResult == nil ||
+		qualityData.TestCases[0].LatestResult.EvidenceKind != quality.EvidenceCommand ||
+		qualityData.TestCases[0].LatestResult.Command != "git status --short" {
+		t.Fatalf("command evidence = %#v, %v", qualityData, err)
+	}
 }
 
 func TestMapCodexApprovalRequestPreservesPermissionGrant(t *testing.T) {
@@ -154,10 +161,11 @@ func TestRunnerFakeCodexAppServer(t *testing.T) {
 			if string(message.ID) != `"approval-1"` || !strings.Contains(string(message.Result), `"decision":"accept"`) {
 				t.Fatalf("approval response = %s", scanner.Bytes())
 			}
-			result := `{"estimate":{"points":1,"remaining_points":0,"confidence":1,"rationale":"完成"}}`
+			result := `{"estimate":{"points":1,"remaining_points":0,"confidence":1,"rationale":"完成"},"new_test_cases":[{"title":"工作区状态检查","description":"命令可以执行","required":true,"outcome":"PASSED","summary":"命令退出码为零","command":"git status --short"}]}`
 			if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			writeFakeRPC(t, `{"method":"item/completed","params":{"threadId":"thread-aitodos-1","turnId":"turn-aitodos-1","completedAtMs":2,"item":{"id":"item-1","type":"commandExecution","command":"git status --short","commandActions":[],"cwd":"/workspace","status":"completed","aggregatedOutput":"","exitCode":0}}}`)
 			writeFakeRPC(t, `{"method":"turn/completed","params":{"threadId":"thread-aitodos-1","turn":{"id":"turn-aitodos-1","status":"completed","items":[]}}}`)
 			return
 		}

@@ -17,6 +17,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/topic"
@@ -127,6 +128,48 @@ func TestValidateAgentResultRejectsAllDataBeforePersistence(t *testing.T) {
 	}
 	if err := validateAgentResult("run-1", result); err == nil {
 		t.Fatal("validateAgentResult() error = nil")
+	}
+}
+
+func TestCommandEvidenceParsesCodexAndAppServerEvents(t *testing.T) {
+	stdout := []byte(strings.Join([]string{
+		`{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'go test ./...'","exit_code":0,"status":"completed"}}`,
+		`{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","completedAtMs":1,"item":{"id":"item-1","type":"commandExecution","command":"pnpm test","commandActions":[],"cwd":"/workspace","status":"completed","aggregatedOutput":"failed","exitCode":1}}}`,
+		`{"type":"item.completed","item":{"type":"command_execution","command":"go vet ./...","exit_code":null,"status":"in_progress"}}`,
+	}, "\n"))
+
+	executions := parseCommandExecutions(stdout)
+	passed, ok := executions.match("go test ./...", quality.OutcomePassed)
+	if !ok || passed.Command != "/bin/zsh -lc 'go test ./...'" || passed.ExitCode != 0 {
+		t.Fatalf("passed command evidence = %#v, %v", passed, ok)
+	}
+	failed, ok := executions.match("pnpm test", quality.OutcomeFailed)
+	if !ok || failed.Command != "pnpm test" || failed.ExitCode != 1 {
+		t.Fatalf("failed command evidence = %#v, %v", failed, ok)
+	}
+	if _, ok := executions.match("go vet ./...", quality.OutcomePassed); ok {
+		t.Fatal("incomplete command must not become evidence")
+	}
+	if len(observedCommandExecutions("generic", stdout)) != 0 {
+		t.Fatal("generic adapter output must not be trusted as structured command evidence")
+	}
+}
+
+func TestAgentTestResultUsesCommandOnlyWhenOutcomeMatchesObservedExit(t *testing.T) {
+	executions := commandExecutions{
+		"go test ./...": {{Command: "/bin/zsh -lc 'go test ./...'", ExitCode: 0}},
+	}
+	verified := agentTestResultInput("run-1", agentTestResult{
+		Outcome: quality.OutcomePassed, Summary: "测试通过", Command: "go test ./...",
+	}, executions)
+	if verified.EvidenceKind != quality.EvidenceCommand || verified.Command == "" || verified.ArtifactRef != "runs/run-1/stdout.log" {
+		t.Fatalf("verified input = %#v", verified)
+	}
+	unmatched := agentTestResultInput("run-1", agentTestResult{
+		Outcome: quality.OutcomeFailed, Summary: "声称失败", Command: "go test ./...",
+	}, executions)
+	if unmatched.EvidenceKind != quality.EvidenceAgentReport || unmatched.Command != "" {
+		t.Fatalf("unmatched input = %#v", unmatched)
 	}
 }
 

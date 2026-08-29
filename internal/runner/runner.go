@@ -2,6 +2,7 @@
 package runner
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/sha256"
@@ -146,7 +147,10 @@ func Execute(
 	}
 	collected := collectedAgentResult{}
 	if result.Status == domainrun.StatusSucceeded {
-		collected, err = collectAgentResult(context.Background(), currentProject, database, runs, claimedRuns, workingDirectory)
+		collected, err = collectAgentResult(
+			context.Background(), currentProject, database, runs, claimedRuns, workingDirectory,
+			observedCommandExecutions(revision.Adapter, result.Stdout),
+		)
 		if err != nil {
 			return finishPostAgentFailure(context.Background(), currentProject, database, runs, claimedRuns, claimToken, leaseGeneration, workspaceBefore, "RESULT", err)
 		}
@@ -613,8 +617,8 @@ func machineResultContract(purpose domainrun.Purpose) string {
 文件必须是单个 JSON 对象。正常完成时支持：
 {
   "estimate": {"points": 1|2|3|5|8|13, "remaining_points": 0..points, "confidence": 0..1, "rationale": "依据"},
-  "new_test_cases": [{"title": "测试行为", "description": "预期", "required": true, "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据"}],
-  "test_results": [{"test_case_id": "已有测试项 ID", "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据"}]
+  "new_test_cases": [{"title": "测试行为", "description": "预期", "required": true, "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据", "command": "实际执行的完整测试命令，可留空"}],
+  "test_results": [{"test_case_id": "已有测试项 ID", "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据", "command": "实际执行的完整测试命令，可留空"}]
 }
 如果缺少一个必须由人类决定的信息，可以改为只返回：
 {
@@ -626,7 +630,7 @@ func machineResultContract(purpose domainrun.Purpose) string {
     "allow_custom_answer": true
   }
 }
-Clarification 不得与 estimate、new_test_cases 或 test_results 同时返回，也不能用于请求 Secret 或绕过权限。不要伪造未执行的测试。这里的结果只记为 AGENT_REPORT，不能替代 Runner 命令或人工验证证据。`
+Clarification 不得与 estimate、new_test_cases 或 test_results 同时返回，也不能用于请求 Secret 或绕过权限。不要伪造未执行的测试。填写 command 时必须与本 Run 实际执行的测试命令一致；Runner 只有在结构化命令事件和退出码与 outcome 一致时才记为 COMMAND，否则仍记为 AGENT_REPORT。`
 }
 
 func systemSafetyRules(purpose domainrun.Purpose) string {
@@ -1219,12 +1223,14 @@ type agentTestCase struct {
 	Required    bool                `json:"required"`
 	Outcome     quality.TestOutcome `json:"outcome"`
 	Summary     string              `json:"summary"`
+	Command     string              `json:"command"`
 }
 
 type agentTestResult struct {
 	TestCaseID string              `json:"test_case_id"`
 	Outcome    quality.TestOutcome `json:"outcome"`
 	Summary    string              `json:"summary"`
+	Command    string              `json:"command"`
 }
 
 type collectedAgentResult struct {
@@ -1240,6 +1246,7 @@ func collectAgentResult(
 	runs *storage.RunStore,
 	currentRun domainrun.Run,
 	workspacePath string,
+	executions commandExecutions,
 ) (collectedAgentResult, error) {
 	path := filepath.Join(workspacePath, resultFileName)
 	content, err := readOptionalResult(path)
@@ -1308,7 +1315,10 @@ func collectAgentResult(
 		}
 		return collectedAgentResult{Clarification: &request}, nil
 	}
-	return collectedAgentResult{}, applyAgentResult(ctx, storage.NewQualityStore(database), currentRun.ID, currentRun.TaskID, result)
+	return collectedAgentResult{}, applyAgentResult(
+		ctx, storage.NewQualityStore(database), currentRun.ID, currentRun.TaskID,
+		result, executions,
+	)
 }
 
 func applyTriageResult(ctx context.Context, database *sql.DB, currentRun domainrun.Run, result agentResult) error {
@@ -1341,7 +1351,14 @@ func readOptionalResult(path string) ([]byte, error) {
 	return content, nil
 }
 
-func applyAgentResult(ctx context.Context, store *storage.QualityStore, runID, taskID string, result agentResult) error {
+func applyAgentResult(
+	ctx context.Context,
+	store *storage.QualityStore,
+	runID string,
+	taskID string,
+	result agentResult,
+	executions commandExecutions,
+) error {
 	if err := validateAgentResult(runID, result); err != nil {
 		return err
 	}
@@ -1366,19 +1383,17 @@ func applyAgentResult(ctx context.Context, store *storage.QualityStore, runID, t
 			return err
 		}
 		if proposed.Outcome != "" {
-			if _, err := store.AddTestResult(ctx, taskID, created.ID, quality.TestResultInput{
-				Outcome: proposed.Outcome, EvidenceKind: quality.EvidenceAgentReport,
-				Summary: proposed.Summary, SourceRunID: runID,
-			}); err != nil {
+			input := agentTestResultInput(runID, agentTestResult{
+				Outcome: proposed.Outcome, Summary: proposed.Summary, Command: proposed.Command,
+			}, executions)
+			if _, err := store.AddTestResult(ctx, taskID, created.ID, input); err != nil {
 				return err
 			}
 		}
 	}
 	for _, reported := range result.TestResults {
-		if _, err := store.AddTestResult(ctx, taskID, reported.TestCaseID, quality.TestResultInput{
-			Outcome: reported.Outcome, EvidenceKind: quality.EvidenceAgentReport,
-			Summary: reported.Summary, SourceRunID: runID,
-		}); err != nil {
+		if _, err := store.AddTestResult(ctx, taskID, reported.TestCaseID,
+			agentTestResultInput(runID, reported, executions)); err != nil {
 			return err
 		}
 	}
@@ -1405,7 +1420,7 @@ func validateAgentResult(runID string, result agentResult) error {
 			return fmt.Errorf("validate agent test case: %w", err)
 		}
 		if proposed.Outcome != "" {
-			if err := agentTestResultInput(runID, proposed.Outcome, proposed.Summary).Validate(); err != nil {
+			if err := agentReportedTestResultInput(runID, proposed.Outcome, proposed.Summary).Validate(); err != nil {
 				return fmt.Errorf("validate new test result: %w", err)
 			}
 		}
@@ -1414,7 +1429,7 @@ func validateAgentResult(runID string, result agentResult) error {
 		if strings.TrimSpace(reported.TestCaseID) == "" {
 			return errors.New("agent test result must identify test_case_id")
 		}
-		if err := agentTestResultInput(runID, reported.Outcome, reported.Summary).Validate(); err != nil {
+		if err := agentReportedTestResultInput(runID, reported.Outcome, reported.Summary).Validate(); err != nil {
 			return fmt.Errorf("validate existing test result: %w", err)
 		}
 	}
@@ -1446,11 +1461,129 @@ func validateReportedTestCases(
 	return nil
 }
 
-func agentTestResultInput(runID string, outcome quality.TestOutcome, summary string) quality.TestResultInput {
+func agentReportedTestResultInput(runID string, outcome quality.TestOutcome, summary string) quality.TestResultInput {
 	return quality.TestResultInput{
 		Outcome: outcome, EvidenceKind: quality.EvidenceAgentReport,
 		Summary: summary, SourceRunID: runID,
 	}
+}
+
+func agentTestResultInput(runID string, reported agentTestResult, executions commandExecutions) quality.TestResultInput {
+	input := agentReportedTestResultInput(runID, reported.Outcome, reported.Summary)
+	if execution, ok := executions.match(reported.Command, reported.Outcome); ok {
+		input.EvidenceKind = quality.EvidenceCommand
+		input.Command = execution.Command
+		input.ArtifactRef = filepath.ToSlash(filepath.Join("runs", runID, "stdout.log"))
+	}
+	return input
+}
+
+type commandExecution struct {
+	Command  string
+	ExitCode int
+}
+
+type commandExecutions map[string][]commandExecution
+
+func observedCommandExecutions(adapter string, stdout []byte) commandExecutions {
+	if adapter != "codex" && adapter != "codex-app-server" {
+		return commandExecutions{}
+	}
+	return parseCommandExecutions(stdout)
+}
+
+func (executions commandExecutions) match(command string, outcome quality.TestOutcome) (commandExecution, bool) {
+	for _, execution := range executions[strings.TrimSpace(command)] {
+		if outcome == quality.OutcomePassed && execution.ExitCode == 0 {
+			return execution, true
+		}
+		if outcome == quality.OutcomeFailed && execution.ExitCode != 0 {
+			return execution, true
+		}
+	}
+	return commandExecution{}, false
+}
+
+func parseCommandExecutions(stdout []byte) commandExecutions {
+	result := make(commandExecutions)
+	scanner := bufio.NewScanner(bytes.NewReader(stdout))
+	scanner.Buffer(make([]byte, 64<<10), maxLogBytes)
+	for scanner.Scan() {
+		if execution, ok := parseCommandExecutionLine(scanner.Bytes()); ok {
+			for _, key := range commandEvidenceKeys(execution.Command) {
+				result[key] = append(result[key], execution)
+			}
+		}
+	}
+	return result
+}
+
+func parseCommandExecutionLine(line []byte) (commandExecution, bool) {
+	var event struct {
+		Type   string          `json:"type"`
+		Method string          `json:"method"`
+		Item   json.RawMessage `json:"item"`
+		Params json.RawMessage `json:"params"`
+	}
+	if json.Unmarshal(line, &event) != nil {
+		return commandExecution{}, false
+	}
+	item := event.Item
+	if event.Method == "item/completed" {
+		var params struct {
+			Item json.RawMessage `json:"item"`
+		}
+		if json.Unmarshal(event.Params, &params) != nil {
+			return commandExecution{}, false
+		}
+		item = params.Item
+	} else if event.Type != "item.completed" {
+		return commandExecution{}, false
+	}
+	var command struct {
+		Type        string `json:"type"`
+		Command     string `json:"command"`
+		Status      string `json:"status"`
+		ExitCode    *int   `json:"exit_code"`
+		AppExitCode *int   `json:"exitCode"`
+	}
+	if json.Unmarshal(item, &command) != nil || (command.Type != "command_execution" && command.Type != "commandExecution") {
+		return commandExecution{}, false
+	}
+	exitCode := command.ExitCode
+	if exitCode == nil {
+		exitCode = command.AppExitCode
+	}
+	if command.Status != "completed" || exitCode == nil || strings.TrimSpace(command.Command) == "" {
+		return commandExecution{}, false
+	}
+	return commandExecution{Command: strings.TrimSpace(command.Command), ExitCode: *exitCode}, true
+}
+
+func commandEvidenceKeys(command string) []string {
+	trimmed := strings.TrimSpace(command)
+	keys := []string{trimmed}
+	for _, prefix := range []string{"/bin/zsh -lc ", "/bin/bash -lc ", "/bin/sh -lc "} {
+		if strings.HasPrefix(trimmed, prefix) {
+			if inner, ok := unwrapShellCommand(strings.TrimSpace(strings.TrimPrefix(trimmed, prefix))); ok && inner != trimmed {
+				keys = append(keys, inner)
+			}
+			break
+		}
+	}
+	return keys
+}
+
+func unwrapShellCommand(value string) (string, bool) {
+	if len(value) >= 2 && value[0] == '\'' && value[len(value)-1] == '\'' {
+		inner := strings.ReplaceAll(value[1:len(value)-1], `'"'"'`, `'`)
+		return strings.TrimSpace(inner), true
+	}
+	if len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"' {
+		inner, err := strconv.Unquote(value)
+		return strings.TrimSpace(inner), err == nil
+	}
+	return "", false
 }
 
 func writeRunArtifact(
