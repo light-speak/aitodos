@@ -1,4 +1,4 @@
-import { messageAuthorKinds, releaseStatuses, runPurposes, runStatuses, taskStatuses, topicStatuses, workspaceStates } from '../types'
+import { messageAuthorKinds, releaseStatuses, runPurposes, runStatuses, searchKinds, taskStatuses, topicStatuses, workspaceStates } from '../types'
 import type {
   CreateTaskInput,
   CreateTopicInput,
@@ -57,6 +57,9 @@ import type {
 	ApprovalRequest,
 	ApprovalDecision,
 	TaskIntegration,
+	SearchItem,
+	SearchPage,
+	SearchQueryInput,
 } from '../types'
 
 interface RequestOptions {
@@ -79,6 +82,18 @@ export class ApiError extends Error {
 
 export async function getProject(signal?: AbortSignal): Promise<ProjectInfo> {
   return parseProject(await requestJSON('/api/project', { signal }))
+}
+
+export async function searchProject(input: SearchQueryInput, signal?: AbortSignal): Promise<SearchPage> {
+	const parameters = new URLSearchParams({ q: input.query })
+	for (const kind of input.kinds ?? []) parameters.append('kind', kind)
+	for (const status of input.statuses ?? []) parameters.append('status', status)
+	if (input.only_current !== undefined) parameters.set('only_current', String(input.only_current))
+	if (input.updated_after) parameters.set('updated_after', input.updated_after)
+	if (input.updated_before) parameters.set('updated_before', input.updated_before)
+	if (input.limit !== undefined) parameters.set('limit', String(input.limit))
+	if (input.cursor) parameters.set('cursor', input.cursor)
+	return parseSearchPage(await requestJSON(`/api/search?${parameters.toString()}`, { signal }))
 }
 
 export async function updateWorkerSettings(enabled: boolean, maxWorkers: number): Promise<ProjectInfo> {
@@ -1354,6 +1369,36 @@ function parseTaskIntegration(value: unknown): TaskIntegration {
 		...(typeof value.failure_kind === 'string' && value.failure_kind ? { failure_kind: value.failure_kind } : {}),
 		...(typeof value.failure_message === 'string' && value.failure_message ? { failure_message: value.failure_message } : {}),
 	}
+}
+
+function parseSearchPage(value: unknown): SearchPage {
+	if (!isRecord(value) || !Array.isArray(value.items) || !isOptionalString(value.next_cursor)) {
+		throw new ApiError('搜索结果格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		items: value.items.map(parseSearchItem),
+		...(typeof value.next_cursor === 'string' && value.next_cursor ? { next_cursor: value.next_cursor } : {}),
+	}
+}
+
+function parseSearchItem(value: unknown): SearchItem {
+	if (!isRecord(value) || typeof value.document_id !== 'string' || !isSearchKind(value.kind) ||
+		typeof value.source_id !== 'string' || (value.subject_kind !== 'TOPIC' && value.subject_kind !== 'TASK') ||
+		typeof value.subject_id !== 'string' || typeof value.stable_key !== 'string' ||
+		typeof value.title !== 'string' || typeof value.snippet !== 'string' || typeof value.status !== 'string' ||
+		typeof value.current !== 'boolean' || typeof value.updated_at !== 'string') {
+		throw new ApiError('搜索项目格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		document_id: value.document_id, kind: value.kind, source_id: value.source_id,
+		subject_kind: value.subject_kind, subject_id: value.subject_id, stable_key: value.stable_key,
+		title: value.title, snippet: value.snippet, status: value.status,
+		current: value.current, updated_at: value.updated_at,
+	}
+}
+
+function isSearchKind(value: unknown): value is SearchItem['kind'] {
+	return typeof value === 'string' && searchKinds.some((kind) => kind === value)
 }
 
 function isTaskIntegrationStatus(value: unknown): value is TaskIntegration['status'] {

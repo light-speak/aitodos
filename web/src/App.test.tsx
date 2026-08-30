@@ -172,6 +172,14 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
 			reasoning_output_tokens: null, model_requests: null, peak_input_tokens: null, by_purpose: [],
 		}))
 	}
+	if (url.startsWith('/api/search?') && method === 'GET') {
+		return Promise.resolve(Response.json({ items: [{
+			document_id: 'MESSAGE:message-1', kind: 'MESSAGE', source_id: 'message-1',
+			subject_kind: 'TOPIC', subject_id: 'topic-1', stable_key: 'TOP-001#message-1',
+			title: '你的消息', snippet: 'Session 不是事实来源', status: 'HUMAN', current: true,
+			updated_at: '2026-08-18T01:00:00Z',
+		}] }))
+	}
 	if (url === '/api/runs?active=true&limit=100' && method === 'GET') {
 		return Promise.resolve(Response.json({ items: activeRuns }))
 	}
@@ -623,6 +631,20 @@ describe('App', () => {
     await user.keyboard('n')
     expect(screen.getByRole('dialog', { name: '新建事项' })).toBeInTheDocument()
   })
+
+	it('从全局搜索结果打开对应 Topic', async () => {
+		const user = userEvent.setup()
+		render(<App />)
+		await screen.findByText('讨论 Agent 上下文')
+
+		await user.click(screen.getByRole('button', { name: '搜索项目' }))
+		const searchDialog = screen.getByRole('dialog', { name: '搜索项目' })
+		await user.type(within(searchDialog).getByLabelText('搜索项目内容'), 'Session')
+		await user.click(within(searchDialog).getByRole('button', { name: '搜索' }))
+		await user.click(await within(searchDialog).findByRole('button', { name: /你的消息/ }))
+
+		expect(await screen.findByRole('dialog', { name: '讨论 Agent 上下文' })).toBeInTheDocument()
+	})
 
   it('输入区域内的 N 不触发新建，Cmd+Enter 可以提交', async () => {
     const user = userEvent.setup()

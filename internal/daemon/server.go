@@ -128,6 +128,7 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	))
 	httpapi.RegisterQualityRoutes(mux, storage.NewQualityStore(database))
 	httpapi.RegisterClarificationRoutes(mux, storage.NewClarificationStore(database))
+	httpapi.RegisterSearchRoutes(mux, storage.NewSearchStore(database))
 	runStore := storage.NewRunStore(database)
 	httpapi.RegisterRunRoutes(mux, runStore, currentProject.Paths.Artifacts)
 	httpapi.RegisterApprovalRoutes(mux, runStore)

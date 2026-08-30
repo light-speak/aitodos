@@ -13,7 +13,35 @@ import {
 	requestRunCancellation,
 	requestTopicPlanning,
 	retryTask,
+	searchProject,
 } from './client'
+
+describe('searchProject', () => {
+	afterEach(() => vi.unstubAllGlobals())
+
+	it('编码结构化过滤并解析分页搜索结果', async () => {
+		const fetchMock = vi.fn<typeof fetch>(() => Promise.resolve(Response.json({
+			items: [{
+				document_id: 'MESSAGE:message-1', kind: 'MESSAGE', source_id: 'message-1',
+				subject_kind: 'TOPIC', subject_id: 'topic-1', stable_key: 'TOP-001#message-1',
+				title: 'Agent 消息', snippet: '需要持久上下文', status: 'AGENT', current: true,
+				updated_at: '2026-08-31T00:00:00Z',
+			}], next_cursor: 'MQ',
+		})))
+		vi.stubGlobal('fetch', fetchMock)
+
+		const page = await searchProject({
+			query: '持久上下文', kinds: ['MESSAGE'], statuses: ['AGENT'], only_current: true, limit: 10,
+		})
+
+		expect(page.items[0]?.subject_id).toBe('topic-1')
+		expect(page.next_cursor).toBe('MQ')
+		expect(fetchMock).toHaveBeenCalledWith(
+			'/api/search?q=%E6%8C%81%E4%B9%85%E4%B8%8A%E4%B8%8B%E6%96%87&kind=MESSAGE&status=AGENT&only_current=true&limit=10',
+			expect.objectContaining({ signal: undefined }),
+		)
+	})
+})
 
 describe('getTaskFeedback', () => {
 	afterEach(() => vi.unstubAllGlobals())
