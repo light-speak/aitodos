@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -26,7 +27,8 @@ func TestStartRunsInForegroundUntilContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var stdout, stderr bytes.Buffer
+	var stdout synchronizedBuffer
+	var stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
 		done <- Run(ctx, []string{"start"}, &stdout, &stderr)
@@ -218,6 +220,23 @@ func restoreWorkingDirectory(t *testing.T, directory string) {
 			t.Errorf("restore working directory: %v", err)
 		}
 	})
+}
+
+type synchronizedBuffer struct {
+	mu     sync.Mutex
+	buffer bytes.Buffer
+}
+
+func (b *synchronizedBuffer) Write(content []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.Write(content)
+}
+
+func (b *synchronizedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buffer.String()
 }
 
 func waitForCLIStatus(t *testing.T, currentProject *project.Project, wantRunning bool) {
