@@ -291,6 +291,33 @@ not-json
 	}
 }
 
+func TestParseCodexAppServerUsageSumsCurrentTurnRequests(t *testing.T) {
+	stdout := []byte(`{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-previous","tokenUsage":{"total":{"inputTokens":100,"cachedInputTokens":80,"cacheWriteInputTokens":0,"outputTokens":10,"reasoningOutputTokens":4},"last":{"inputTokens":100,"cachedInputTokens":80,"cacheWriteInputTokens":0,"outputTokens":10,"reasoningOutputTokens":4}}}}
+{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-current","tokenUsage":{"total":{"inputTokens":160,"cachedInputTokens":120,"cacheWriteInputTokens":1,"outputTokens":15,"reasoningOutputTokens":6},"last":{"inputTokens":60,"cachedInputTokens":40,"cacheWriteInputTokens":1,"outputTokens":5,"reasoningOutputTokens":2}}}}
+{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-current","tokenUsage":{"total":{"inputTokens":160,"cachedInputTokens":120,"cacheWriteInputTokens":1,"outputTokens":15,"reasoningOutputTokens":6},"last":{"inputTokens":60,"cachedInputTokens":40,"cacheWriteInputTokens":1,"outputTokens":5,"reasoningOutputTokens":2}}}}
+{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-current","tokenUsage":{"total":{"inputTokens":230,"cachedInputTokens":170,"cacheWriteInputTokens":3,"outputTokens":22,"reasoningOutputTokens":9},"last":{"inputTokens":70,"cachedInputTokens":50,"cacheWriteInputTokens":2,"outputTokens":7,"reasoningOutputTokens":3}}}}
+`)
+
+	usage := parseCodexAppServerUsage(stdout)
+	if usage == nil || usage.InputTokens == nil || *usage.InputTokens != 130 ||
+		usage.CachedInputTokens == nil || *usage.CachedInputTokens != 90 ||
+		usage.CacheWriteInputTokens == nil || *usage.CacheWriteInputTokens != 3 ||
+		usage.OutputTokens == nil || *usage.OutputTokens != 12 ||
+		usage.ReasoningOutputTokens == nil || *usage.ReasoningOutputTokens != 5 ||
+		usage.ModelRequests == nil || *usage.ModelRequests != 2 ||
+		usage.PeakInputTokens == nil || *usage.PeakInputTokens != 70 {
+		t.Fatalf("usage = %#v", usage)
+	}
+}
+
+func TestParseCodexAppServerUsageRejectsInvalidCurrentTurn(t *testing.T) {
+	stdout := []byte(`{"method":"thread/tokenUsage/updated","params":{"turnId":"turn-current","tokenUsage":{"total":{"inputTokens":10},"last":{"inputTokens":-1}}}}
+`)
+	if usage := parseCodexAppServerUsage(stdout); usage != nil {
+		t.Fatalf("usage = %#v, want nil", usage)
+	}
+}
+
 func TestCodexToolPolicyRejectsMissingRequiredServer(t *testing.T) {
 	_, err := codexToolPolicyArgs(nil, []capability.MCPServerSnapshot{{
 		ConfigName: "playwright", Enabled: true, Required: true,

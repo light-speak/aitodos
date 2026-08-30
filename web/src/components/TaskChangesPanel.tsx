@@ -2,9 +2,10 @@ import { lazy, Suspense, useCallback, useEffect, useRef, useState } from 'react'
 import { CheckIcon, ChevronDownIcon, FileDiffIcon, RefreshCwIcon, XIcon } from 'lucide-react'
 
 import {
-	errorMessage, getTaskChanges, getTaskFileDiff, getTaskReviews, reviewTask, submitTaskReview,
+	errorMessage, getTaskChanges, getTaskFileDiff, getTaskIntegration, getTaskReviews,
+	integrateTask, reviewTask, submitTaskReview, syncTaskTarget,
 } from '../api/client'
-import type { FileDiff, Task, TaskChanges, TaskReview } from '../types'
+import type { FileDiff, Task, TaskChanges, TaskIntegration, TaskReview } from '../types'
 import { Button } from './ui/button'
 import { Input } from './ui/input'
 
@@ -23,6 +24,7 @@ const DiffPreview = lazy(async () => {
 export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspaceChanged }: TaskChangesPanelProps) {
 	const [changes, setChanges] = useState<TaskChanges | null>(null)
 	const [reviews, setReviews] = useState<TaskReview[]>([])
+	const [integration, setIntegration] = useState<TaskIntegration | null>(null)
 	const [selectedDiff, setSelectedDiff] = useState<FileDiff | null>(null)
 	const [loadingDiffPath, setLoadingDiffPath] = useState<string | null>(null)
 	const diffRequestID = useRef(0)
@@ -33,9 +35,14 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 
 	const loadLatest = useCallback(async (signal?: AbortSignal) => {
 		try {
-			const loadedReviews = await getTaskReviews(task.id, signal)
+			const [loadedReviews, loadedChanges, loadedIntegration] = await Promise.all([
+				getTaskReviews(task.id, signal),
+				hasWorkspace ? getTaskChanges(task.id, signal) : Promise.resolve(null),
+				getTaskIntegration(task.id, signal),
+			])
 			setReviews(loadedReviews)
-			setChanges(hasWorkspace ? await getTaskChanges(task.id, signal) : null)
+			setChanges(loadedChanges)
+			setIntegration(loadedIntegration)
 		} catch (loadError: unknown) {
 			if (!signal?.aborted) setError(errorMessage(loadError))
 		} finally {
@@ -46,10 +53,11 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 	useEffect(() => {
 		const controller = new AbortController()
 		const changesRequest = hasWorkspace ? getTaskChanges(task.id, controller.signal) : Promise.resolve(null)
-		void Promise.all([getTaskReviews(task.id, controller.signal), changesRequest]).then(
-			([loadedReviews, loadedChanges]) => {
+		void Promise.all([getTaskReviews(task.id, controller.signal), changesRequest, getTaskIntegration(task.id, controller.signal)]).then(
+			([loadedReviews, loadedChanges, loadedIntegration]) => {
 				setReviews(loadedReviews)
 				setChanges(loadedChanges)
+				setIntegration(loadedIntegration)
 				setLoading(false)
 			},
 			(loadError: unknown) => {
@@ -76,6 +84,7 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 			await loadLatest()
 		} catch (actionError: unknown) {
 			setError(errorMessage(actionError))
+			await loadLatest()
 		} finally {
 			setPending(false)
 		}
@@ -149,7 +158,42 @@ export function TaskChangesPanel({ task, hasWorkspace, onTaskUpdated, onWorkspac
 					<div className="flex gap-2"><Button type="button" disabled={pending} onClick={() => { void run(async () => { onTaskUpdated((await reviewTask(task, 'ACCEPTED', comment)).task); onWorkspaceChanged() }) }}><CheckIcon />验收通过</Button><Button variant="outline" type="button" disabled={pending || !comment.trim()} onClick={() => { void run(async () => onTaskUpdated((await reviewTask(task, 'REJECTED', comment)).task)) }}><XIcon />要求修改</Button></div>
 				</div>
 			) : null}
+			<TaskIntegrationPanel
+				task={task}
+				integration={integration}
+				pending={pending}
+				onIntegrate={() => run(async () => setIntegration(await integrateTask(task.id)))}
+				onSync={() => run(async () => {
+					const result = await syncTaskTarget(task.id)
+					setIntegration(result.integration)
+					onTaskUpdated(result.task)
+					onWorkspaceChanged()
+				})}
+			/>
 			{reviews.length > 0 ? <div><h4 className="mb-2 text-xs font-medium text-muted-foreground">验收历史</h4><ul className="space-y-2">{reviews.map((review) => <li className="rounded-lg border px-3 py-2 text-sm" key={review.id}><strong>{review.decision === 'ACCEPTED' ? '已通过' : '要求修改'}</strong>{review.comment ? ` · ${review.comment}` : ''}{review.commit_sha ? <span className="ml-2 font-mono text-xs text-muted-foreground">{review.commit_sha.slice(0, 8)}</span> : null}</li>)}</ul></div> : null}
 		</section>
 	)
+}
+
+function TaskIntegrationPanel(props: {
+	task: Task
+	integration: TaskIntegration | null
+	pending: boolean
+	onIntegrate: () => Promise<void>
+	onSync: () => Promise<void>
+}) {
+	if (props.integration?.status === 'SUCCEEDED') {
+		return <p className="rounded-xl border border-emerald-200 bg-emerald-50 p-3 text-sm text-emerald-700">已集成到 {props.integration.target_branch} · {props.integration.target_after_sha?.slice(0, 8)}</p>
+	}
+	if (props.integration?.status === 'NEEDS_SYNC') {
+		return <div className="flex items-center justify-between gap-3 rounded-xl border border-amber-200 bg-amber-50 p-3"><p className="text-sm text-amber-800">目标分支已经前进，需要同步并重新验证。</p><Button type="button" variant="outline" disabled={props.pending} onClick={() => { void props.onSync() }}>同步并重新验证</Button></div>
+	}
+	if (props.integration?.status === 'CONFLICT') {
+		return <p className="rounded-xl border border-amber-200 bg-amber-50 p-3 text-sm text-amber-800">目标分支存在冲突，已交给 Revision Agent 在 Task Workspace 内处理。</p>
+	}
+	if (props.integration?.status === 'SYNCED') {
+		return <p className="rounded-xl border border-blue-200 bg-blue-50 p-3 text-sm text-blue-800">目标分支已同步，等待重新执行测试并验收。</p>
+	}
+	if (props.task.status !== 'ACCEPTED') return null
+	return <div className="flex items-center justify-between gap-3 rounded-xl border p-3"><div><p className="text-sm font-medium">目标分支交付</p><p className="text-xs text-muted-foreground">只执行本地 fast-forward，不会 push。</p></div><Button type="button" disabled={props.pending} onClick={() => { void props.onIntegrate() }}>集成到 {props.task.target_branch || '目标分支'}</Button></div>
 }

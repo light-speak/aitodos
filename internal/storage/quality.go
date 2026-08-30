@@ -258,7 +258,12 @@ SELECT c.id, c.task_id, c.title, c.description, c.required, c.sort_order,
        c.created_by, COALESCE(c.source_run_id, ''), c.created_at, c.updated_at,
        COALESCE(r.id, ''), COALESCE(r.outcome, ''), COALESCE(r.evidence_kind, ''),
        COALESCE(r.summary, ''), COALESCE(r.command, ''), COALESCE(r.artifact_ref, ''),
-       COALESCE(r.source_run_id, ''), COALESCE(r.created_at, '')
+       COALESCE(r.source_run_id, ''), COALESCE(r.created_at, ''),
+       CASE WHEN r.id IS NOT NULL AND r.created_at <= COALESCE((
+           SELECT MAX(i.updated_at) FROM task_integration_attempts i
+           WHERE i.task_id = c.task_id AND i.operation = 'SYNC'
+             AND i.status IN ('SYNCED', 'CONFLICT')
+       ), '') THEN 1 ELSE 0 END
 FROM task_test_cases c
 LEFT JOIN task_test_results r ON r.id = (
     SELECT latest.id FROM task_test_results latest
@@ -290,6 +295,7 @@ func scanTestCase(scanner rowScanner) (quality.TestCase, error) {
 		&item.SortOrder, &item.CreatedBy, &item.SourceRunID, &createdAt, &updatedAt,
 		&result.ID, &result.Outcome, &result.EvidenceKind, &result.Summary, &result.Command,
 		&result.ArtifactRef, &result.SourceRunID, &resultCreatedAt,
+		&result.Stale,
 	)
 	if err != nil {
 		return quality.TestCase{}, err
@@ -318,7 +324,10 @@ func (store *QualityStore) readTestProgress(ctx context.Context, progress *quali
 	return store.database.QueryRowContext(ctx, `
 SELECT
     COUNT(*),
-    COALESCE(SUM(CASE WHEN r.outcome = 'PASSED' AND r.evidence_kind IN ('COMMAND', 'HUMAN') THEN 1 ELSE 0 END), 0),
+    COALESCE(SUM(CASE WHEN r.outcome = 'PASSED' AND r.evidence_kind IN ('COMMAND', 'HUMAN')
+        AND r.created_at > COALESCE((SELECT MAX(i.updated_at) FROM task_integration_attempts i
+            WHERE i.task_id = c.task_id AND i.operation = 'SYNC'
+              AND i.status IN ('SYNCED', 'CONFLICT')), '') THEN 1 ELSE 0 END), 0),
     COALESCE(SUM(CASE WHEN r.outcome = 'PASSED' AND r.evidence_kind = 'AGENT_REPORT' THEN 1 ELSE 0 END), 0)
 FROM task_test_cases c
 LEFT JOIN task_test_results r ON r.id = (
@@ -339,7 +348,10 @@ LEFT JOIN task_test_results r ON r.id = (
     WHERE latest.test_case_id = c.id ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
 )
 WHERE c.task_id = ? AND c.required = 1
-  AND (r.outcome IS NULL OR r.outcome != 'PASSED' OR r.evidence_kind NOT IN ('COMMAND', 'HUMAN'))`, taskID).Scan(&missing)
+  AND (r.outcome IS NULL OR r.outcome != 'PASSED' OR r.evidence_kind NOT IN ('COMMAND', 'HUMAN')
+       OR r.created_at <= COALESCE((SELECT MAX(i.updated_at) FROM task_integration_attempts i
+           WHERE i.task_id = c.task_id AND i.operation = 'SYNC'
+             AND i.status IN ('SYNCED', 'CONFLICT')), ''))`, taskID).Scan(&missing)
 	if err != nil {
 		return fmt.Errorf("check required tests: %w", err)
 	}

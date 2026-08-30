@@ -570,6 +570,7 @@ export interface TaskTestResult {
 	command?: string
 	artifact_ref?: string
 	source_run_id?: string
+	stale?: boolean
 	created_at: string
 }
 
@@ -634,6 +635,26 @@ export interface Workspace {
   updated_at: string
 }
 
+export type TaskIntegrationOperation = 'INTEGRATE' | 'SYNC'
+export type TaskIntegrationStatus = 'RUNNING' | 'SUCCEEDED' | 'NEEDS_SYNC' | 'SYNCED' | 'CONFLICT' | 'FAILED'
+
+export interface TaskIntegration {
+	id: string
+	task_id: string
+	review_id: string
+	operation: TaskIntegrationOperation
+	status: TaskIntegrationStatus
+	target_branch: string
+	source_commit_sha: string
+	target_before_sha: string
+	target_after_sha?: string
+	workspace_after_sha?: string
+	failure_kind?: string
+	failure_message?: string
+	created_at: string
+	updated_at: string
+}
+
 export interface GitBranch {
   name: string
   head_sha: string
@@ -696,7 +717,7 @@ export interface TaskReview {
   task_id: string
   decision: 'ACCEPTED' | 'REJECTED'
   comment: string
-  commit_sha: string
+  commit_sha?: string
   created_at: string
 }
 

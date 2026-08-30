@@ -29,6 +29,14 @@ var (
 	ErrRepositoryUnborn     = errors.New("repository has no initial commit")
 	ErrTargetBranchInvalid  = errors.New("target branch is invalid")
 	ErrTargetBranchNotFound = errors.New("target branch does not exist locally")
+	ErrTargetNeedsSync      = errors.New("task branch must sync with target branch")
+	ErrTargetWorktreeBusy   = errors.New("target branch is checked out in another worktree")
+	ErrRepositoryDirty      = errors.New("target working tree has uncommitted changes")
+	ErrGitOperationActive   = errors.New("git operation is already in progress")
+	ErrTaskNotAccepted      = errors.New("task is not accepted")
+	ErrReviewCommitMissing  = errors.New("accepted task has no review commit")
+	ErrReviewHeadMismatch   = errors.New("workspace head does not match accepted review")
+	ErrTargetSyncNotNeeded  = errors.New("target branch does not need synchronization")
 )
 
 // Branch 保存本地 Branch 名称和当前 Commit。
@@ -155,10 +163,11 @@ type RepositoryInfo struct {
 
 // Manager 串行执行当前仓库共享 Git 元数据操作。
 type Manager struct {
-	project    *project.Project
-	tasks      *storage.TaskStore
-	workspaces *storage.WorkspaceStore
-	releases   *storage.ReleaseStore
+	project      *project.Project
+	tasks        *storage.TaskStore
+	workspaces   *storage.WorkspaceStore
+	releases     *storage.ReleaseStore
+	integrations *storage.IntegrationStore
 }
 
 // New 创建 Git Workflow Manager。
@@ -166,6 +175,7 @@ func New(currentProject *project.Project, database *sql.DB) *Manager {
 	return &Manager{
 		project: currentProject, tasks: storage.NewTaskStore(database),
 		workspaces: storage.NewWorkspaceStore(database), releases: storage.NewReleaseStore(database),
+		integrations: storage.NewIntegrationStore(database),
 	}
 }
 

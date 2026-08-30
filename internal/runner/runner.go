@@ -528,6 +528,21 @@ func buildTaskPrompt(
 			Required: currentRun.Purpose == domainrun.PurposeRevision, Priority: 10,
 		})
 	}
+	if currentRun.Purpose == domainrun.PurposeRevision {
+		latestIntegration, integrationErr := storage.NewIntegrationStore(database).LatestForTask(ctx, currentRun.TaskID)
+		if integrationErr != nil {
+			return "", contextbuilder.Manifest{}, fmt.Errorf("load target integration context: %w", integrationErr)
+		}
+		if latestIntegration != nil {
+			encoded, marshalErr := json.MarshalIndent(latestIntegration, "", "  ")
+			if marshalErr != nil {
+				return "", contextbuilder.Manifest{}, fmt.Errorf("encode target integration context: %w", marshalErr)
+			}
+			chunks = append(chunks, contextbuilder.Chunk{
+				Source: "Target Branch Integration", Content: string(encoded), Required: true, Priority: 0,
+			})
+		}
+	}
 	if currentRun.Purpose == domainrun.PurposeReview {
 		question, questionErr := storage.NewTaskFeedbackStore(database).QuestionForRun(ctx, currentRun.ID)
 		if questionErr != nil {
@@ -1102,10 +1117,13 @@ func persistLogArtifacts(ctx context.Context, currentProject *project.Project, s
 }
 
 func persistRunUsage(ctx context.Context, store *storage.RunStore, adapter, runID string, stdout []byte) error {
-	if adapter != "codex" {
-		return nil
+	var usage *domainrun.Usage
+	switch adapter {
+	case "codex":
+		usage = parseCodexUsage(stdout)
+	case "codex-app-server":
+		usage = parseCodexAppServerUsage(stdout)
 	}
-	usage := parseCodexUsage(stdout)
 	if usage == nil {
 		return nil
 	}
@@ -1183,6 +1201,131 @@ func parseCodexUsage(stdout []byte) *domainrun.Usage {
 		}
 	}
 	return latest
+}
+
+type appServerTokenCounts struct {
+	InputTokens           *int64 `json:"inputTokens"`
+	CachedInputTokens     *int64 `json:"cachedInputTokens"`
+	CacheWriteInputTokens *int64 `json:"cacheWriteInputTokens"`
+	OutputTokens          *int64 `json:"outputTokens"`
+	ReasoningOutputTokens *int64 `json:"reasoningOutputTokens"`
+}
+
+type appServerUsageEvent struct {
+	Method string `json:"method"`
+	Params struct {
+		TurnID     string `json:"turnId"`
+		TokenUsage *struct {
+			Total *appServerTokenCounts `json:"total"`
+			Last  *appServerTokenCounts `json:"last"`
+		} `json:"tokenUsage"`
+	} `json:"params"`
+}
+
+func parseCodexAppServerUsage(stdout []byte) *domainrun.Usage {
+	events := appServerUsageEvents(stdout)
+	if len(events) == 0 {
+		return nil
+	}
+	currentTurnID := strings.TrimSpace(events[len(events)-1].Params.TurnID)
+	seen := make(map[string]struct{})
+	accumulator := newUsageAccumulator()
+	for _, event := range events {
+		if strings.TrimSpace(event.Params.TurnID) != currentTurnID || event.Params.TokenUsage == nil ||
+			event.Params.TokenUsage.Total == nil || event.Params.TokenUsage.Last == nil {
+			continue
+		}
+		key, err := json.Marshal(event.Params.TokenUsage.Total)
+		if err != nil {
+			return nil
+		}
+		if _, duplicate := seen[string(key)]; duplicate {
+			continue
+		}
+		candidate := event.Params.TokenUsage.Last.usage()
+		if !validParsedUsage(candidate) {
+			return nil
+		}
+		seen[string(key)] = struct{}{}
+		accumulator.add(candidate)
+	}
+	return accumulator.usage()
+}
+
+func appServerUsageEvents(stdout []byte) []appServerUsageEvent {
+	events := make([]appServerUsageEvent, 0)
+	for _, line := range bytes.Split(stdout, []byte("\n")) {
+		var event appServerUsageEvent
+		if json.Unmarshal(line, &event) == nil && event.Method == "thread/tokenUsage/updated" &&
+			strings.TrimSpace(event.Params.TurnID) != "" && event.Params.TokenUsage != nil {
+			events = append(events, event)
+		}
+	}
+	return events
+}
+
+func (counts appServerTokenCounts) usage() domainrun.Usage {
+	return domainrun.Usage{
+		InputTokens: counts.InputTokens, CachedInputTokens: counts.CachedInputTokens,
+		CacheWriteInputTokens: counts.CacheWriteInputTokens, OutputTokens: counts.OutputTokens,
+		ReasoningOutputTokens: counts.ReasoningOutputTokens, Source: domainrun.UsageSourceCodexJSONL,
+	}
+}
+
+type usageAccumulator struct {
+	input, cached, cacheWrite, output, reasoning int64
+	inputKnown, cachedKnown                      bool
+	cacheWriteKnown, outputKnown, reasoningKnown bool
+	requests, peakInput                          int64
+}
+
+func newUsageAccumulator() *usageAccumulator {
+	return &usageAccumulator{
+		inputKnown: true, cachedKnown: true, cacheWriteKnown: true,
+		outputKnown: true, reasoningKnown: true,
+	}
+}
+
+func (accumulator *usageAccumulator) add(usage domainrun.Usage) {
+	addUsageMetric(&accumulator.input, &accumulator.inputKnown, usage.InputTokens)
+	addUsageMetric(&accumulator.cached, &accumulator.cachedKnown, usage.CachedInputTokens)
+	addUsageMetric(&accumulator.cacheWrite, &accumulator.cacheWriteKnown, usage.CacheWriteInputTokens)
+	addUsageMetric(&accumulator.output, &accumulator.outputKnown, usage.OutputTokens)
+	addUsageMetric(&accumulator.reasoning, &accumulator.reasoningKnown, usage.ReasoningOutputTokens)
+	accumulator.requests++
+	if usage.InputTokens != nil && *usage.InputTokens > accumulator.peakInput {
+		accumulator.peakInput = *usage.InputTokens
+	}
+}
+
+func addUsageMetric(total *int64, known *bool, value *int64) {
+	if value == nil {
+		*known = false
+		return
+	}
+	*total += *value
+}
+
+func (accumulator *usageAccumulator) usage() *domainrun.Usage {
+	if accumulator.requests == 0 {
+		return nil
+	}
+	usage := &domainrun.Usage{Source: domainrun.UsageSourceCodexJSONL}
+	usage.InputTokens = knownInt64(accumulator.input, accumulator.inputKnown)
+	usage.CachedInputTokens = knownInt64(accumulator.cached, accumulator.cachedKnown)
+	usage.CacheWriteInputTokens = knownInt64(accumulator.cacheWrite, accumulator.cacheWriteKnown)
+	usage.OutputTokens = knownInt64(accumulator.output, accumulator.outputKnown)
+	usage.ReasoningOutputTokens = knownInt64(accumulator.reasoning, accumulator.reasoningKnown)
+	usage.ModelRequests = knownInt64(accumulator.requests, true)
+	usage.PeakInputTokens = knownInt64(accumulator.peakInput, accumulator.inputKnown)
+	return usage
+}
+
+func knownInt64(value int64, known bool) *int64 {
+	if !known {
+		return nil
+	}
+	return &value
 }
 
 func validParsedUsage(usage domainrun.Usage) bool {

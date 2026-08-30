@@ -41,6 +41,9 @@ func Serve(
 		return fmt.Errorf("open project database: %w", err)
 	}
 	defer database.Close()
+	if err := gitworkflow.New(currentProject, database).RecoverIntegrations(ctx); err != nil {
+		return fmt.Errorf("recover task integrations: %w", err)
+	}
 	if err := recovery.New(currentProject, database).Start(ctx); err != nil {
 		return fmt.Errorf("recover project runs: %w", err)
 	}

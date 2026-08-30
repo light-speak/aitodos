@@ -18,6 +18,7 @@ it('默认只展示文件摘要，点击后按需读取 Diff，并可提交人�
 	const fetchMock = vi.fn<typeof fetch>((input, init) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
 		if (url === '/api/tasks/task-1/reviews') return Promise.resolve(Response.json([]))
+		if (url === '/api/tasks/task-1/integration') return Promise.resolve(Response.json(null))
 		if (url === '/api/tasks/task-1/changes') return Promise.resolve(Response.json({
 			base_commit_sha: 'base', head_sha: 'head', dirty: true, file_count: 1, additions: 2, deletions: 1,
 			files: [{ path: 'internal/authn/authn.go', status: 'MODIFIED', additions: 2, deletions: 1, binary: false }],
@@ -55,6 +56,7 @@ it('验收通过会把脏 Workspace 的 Commit 交给后端自动处理', async 
 	const fetchMock = vi.fn<typeof fetch>((input, init) => {
 		const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
 		if (url === '/api/tasks/task-1/reviews' && (init?.method ?? 'GET') === 'GET') return Promise.resolve(Response.json([]))
+		if (url === '/api/tasks/task-1/integration') return Promise.resolve(Response.json(null))
 		if (url === '/api/tasks/task-1/changes') return Promise.resolve(Response.json({
 			base_commit_sha: 'base', head_sha: 'head', dirty: true, file_count: 1, additions: 1, deletions: 0,
 			files: [{ path: 'main.go', status: 'MODIFIED', additions: 1, deletions: 0, binary: false }],
@@ -77,3 +79,48 @@ it('验收通过会把脏 Workspace 的 Commit 交给后端自动处理', async 
 	expect(onWorkspaceChanged).toHaveBeenCalled()
 	expect(screen.queryByRole('button', { name: '创建 Commit' })).not.toBeInTheDocument()
 })
+
+it('已验收 Task 可以显式集成，分叉后提供同步并重新验证', async () => {
+	const accepted = { ...task, status: 'ACCEPTED' as const, version: 4, target_branch: 'main' }
+	const changesRequested = { ...accepted, status: 'CHANGES_REQUESTED' as const, version: 5 }
+	let integrationState: unknown = null
+	const fetchMock = vi.fn<typeof fetch>((input, init) => {
+		const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
+		if (url === '/api/tasks/task-1/reviews') return Promise.resolve(Response.json([]))
+		if (url === '/api/tasks/task-1/changes') return Promise.resolve(Response.json({
+			base_commit_sha: 'base', head_sha: 'review-head', dirty: false,
+			file_count: 1, additions: 1, deletions: 0,
+			files: [{ path: 'main.go', status: 'ADDED', additions: 1, deletions: 0, binary: false }],
+		}))
+		if (url === '/api/tasks/task-1/integration' && (init?.method ?? 'GET') === 'GET') {
+			return Promise.resolve(Response.json(integrationState))
+		}
+		if (url === '/api/tasks/task-1/integration' && init?.method === 'POST') {
+			integrationState = integrationAttempt('NEEDS_SYNC')
+			return Promise.resolve(Response.json({ error: { code: 'TARGET_NEEDS_SYNC', message: '需要同步' } }, { status: 409 }))
+		}
+		if (url === '/api/tasks/task-1/integration/sync' && init?.method === 'POST') {
+			integrationState = integrationAttempt('SYNCED')
+			return Promise.resolve(Response.json({ task: changesRequested, integration: integrationState }))
+		}
+		return Promise.resolve(Response.json({ error: { code: 'UNEXPECTED', message: url } }, { status: 500 }))
+	})
+	vi.stubGlobal('fetch', fetchMock)
+	const onTaskUpdated = vi.fn()
+	render(<TaskChangesPanel task={accepted} hasWorkspace onTaskUpdated={onTaskUpdated} onWorkspaceChanged={vi.fn()} />)
+
+	await userEvent.click(await screen.findByRole('button', { name: '集成到 main' }))
+	expect(await screen.findByText('目标分支已经前进，需要同步并重新验证。')).toBeInTheDocument()
+	await userEvent.click(screen.getByRole('button', { name: '同步并重新验证' }))
+	expect(onTaskUpdated).toHaveBeenCalledWith(changesRequested)
+})
+
+function integrationAttempt(status: 'NEEDS_SYNC' | 'SYNCED') {
+	return {
+		id: `integration-${status}`, task_id: 'task-1', review_id: 'review-1', operation: status === 'SYNCED' ? 'SYNC' : 'INTEGRATE',
+		status, target_branch: 'main', source_commit_sha: 'review-head', target_before_sha: 'target-head',
+		target_after_sha: '', workspace_after_sha: status === 'SYNCED' ? 'sync-head' : 'review-head',
+		failure_kind: status === 'NEEDS_SYNC' ? 'TARGET_DIVERGED' : '', failure_message: '',
+		created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-20T00:00:01Z',
+	}
+}

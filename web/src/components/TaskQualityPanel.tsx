@@ -45,7 +45,7 @@ function TestCaseDetails({ label, items }: { label: string; items: TaskTestCase[
 }
 
 function isVerified(item: TaskTestCase): boolean {
-	return item.latest_result?.outcome === 'PASSED' && item.latest_result.evidence_kind !== 'AGENT_REPORT'
+	return item.latest_result?.outcome === 'PASSED' && item.latest_result.evidence_kind !== 'AGENT_REPORT' && !item.latest_result.stale
 }
 
 function EstimateSummary({ quality }: { quality: TaskQuality | null }) {
@@ -63,6 +63,7 @@ function TestCaseRow({ item, busy, onRecord }: { item: TaskTestCase; busy: boole
 function resultStatus(item: TaskTestCase): { label: string; tone: string; icon: React.ReactNode } {
 	const result = item.latest_result
 	if (!result) return { label: '尚未执行', tone: 'text-muted-foreground', icon: <CircleHelpIcon className="size-4" /> }
+	if (result.stale) return { label: `${result.summary} · 目标分支同步后需重新验证`, tone: 'text-amber-600', icon: <CircleHelpIcon className="size-4" /> }
 	if (result.outcome === 'PASSED' && result.evidence_kind === 'AGENT_REPORT') return { label: 'Agent 报告通过 · 未验证', tone: 'text-amber-600', icon: <CircleHelpIcon className="size-4" /> }
 	if (result.outcome === 'PASSED') return { label: `${result.summary} · ${result.evidence_kind === 'COMMAND' ? '命令已验证' : '人工已验证'}`, tone: 'text-emerald-600', icon: <CheckCircle2Icon className="size-4" /> }
 	return { label: result.summary, tone: 'text-rose-600', icon: <XCircleIcon className="size-4" /> }

@@ -1,6 +1,6 @@
 # AiTodos 架构设计基线
 
-- 状态：Draft，ADR-0001 至 ADR-0020 已接受；Topic/Task 讨论、显式 Task 反馈意图与只读 Agent 问答、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
+- 状态：Draft，ADR-0001 至 ADR-0021 已接受；Topic/Task 讨论、显式 Task 反馈意图与只读 Agent 问答、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、显式目标分支集成与同步、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
@@ -195,7 +195,7 @@ Project 的仓库身份不能只依赖用户输入路径。初始化和启动时
 
 代表边界明确、可执行和可验收的工作。Task 可以直接创建，也可以从批准的 Plan 或其他 Task 派生。Task 不保存独立的“Agent 是否运行中”布尔值，该信息从活跃 Run 派生，避免双写不一致。
 
-Task 编辑器要求人类显式选择反馈意图：`NOTE` 只保留历史，`DISCUSS` 排队只读 REVIEW Run 并把 Agent 回答追加到同一 Thread，`REQUEST_CHANGES` 进入可审计修订流程。REVIEW 问答不改变 Task 状态，当前问题作为不可裁剪的必选 Context；已验收 Task 的修改请求创建关联后续 Task，不覆盖已经验收的历史。详见 [ADR-0020](adr/0020-task-feedback-turns-and-read-only-agent-discussion.md)。
+Task 编辑器要求人类显式选择反馈意图：`NOTE` 只保留历史，`DISCUSS` 排队只读 REVIEW Run 并把 Agent 回答追加到同一 Thread，`REQUEST_CHANGES` 进入可审计修订流程。REVIEW 问答不改变 Task 状态，当前问题作为不可裁剪的必选 Context；已验收 Task 的修改请求创建关联后续 Task，不覆盖已经验收的历史。详见 [ADR-0020](adr/0020-task-feedback-turns-and-read-only-agent-discussion.md)。Task 验收后仍停留在 Task Branch；人类通过独立命令 fast-forward 集成到目标分支。分叉时先同步 Task Workspace、重新执行 Revision 和验收，详见 [ADR-0021](adr/0021-explicit-task-integration-and-target-sync.md)。
 
 ### Thread、Clarification 与 Decision
 
@@ -465,6 +465,10 @@ release_id, task_id, created_at
 ```
 
 Release 状态为 `CREATING`、`TAGGED` 或 `FAILED`。数据库先保留 `CREATING` 记录并固定 Commit，再执行 Git；失败可在相同输入下安全重放。系统会把最新通过 Review 的 Commit 作为候选，仅在它是 Release Commit 的 Git 祖先时自动写入 `release_tasks`；该关联证明对应验收 Commit 已包含，但不推断未记录到 Review 的外部修改。
+
+### task_integration_attempts
+
+Schema v31 保存 `INTEGRATE`/`SYNC` 的不可变 Task、Review Commit、目标分支、操作前后 SHA、状态和失败诊断。同一 Task 最多一个 `RUNNING` 尝试。同步成功或冲突都会使旧测试证据过期并进入 `CHANGES_REQUESTED`；daemon 启动时对账未完成记录。
 
 ### runs
 
@@ -853,7 +857,7 @@ MCP 第一阶段只提供当前项目的有界只读搜索和读取能力，不�
 
 Runner 只把可信 Adapter 提供的结构化命令完成事件作为候选证据；Agent Result 报告的命令必须精确匹配本 Run 观察到的命令，且结果与退出码一致，才保存为 `COMMAND`，否则保存为 `AGENT_REPORT`。正常验收要求 required Test Case 的最新结果全部为 `PASSED` 且证据为 `COMMAND` 或 `HUMAN`；MVP 不提供 Override。详细决策见 [ADR-0009](adr/0009-ai-estimates-progress-and-test-evidence.md)。
 
-整体进度页同时展示真实 Run Usage：累计输入、其中缓存、非缓存输入、缓存命中率、输出、采集覆盖率和按 Purpose 汇总。Schema v20 使用独立 `run_usage` 表保存 Codex 结构化事件提供的可空指标。累计输入不得标注为“上下文大小”；单次峰值、模型请求次数和 Cost 无可靠来源时保持未知。详细决策见 [ADR-0014](adr/0014-actual-usage-and-quality-first-soft-context-budget.md)。
+整体进度页同时展示真实 Run Usage：累计输入、其中缓存、非缓存输入、缓存命中率、输出、采集覆盖率和按 Purpose 汇总。Schema v20 使用独立 `run_usage` 表保存 Codex 结构化事件提供的可空指标。旧 Codex JSONL 使用最终 `turn.completed`；Codex App Server 按当前 `turnId` 对 `thread/tokenUsage/updated` 的累计快照去重，再累加每次模型请求的 `last`，因此 Session Resume 不会把历史 Turn 重复计入新 Run，并可得到模型请求数和单次输入峰值。累计输入不得标注为“上下文大小”；Cost 无可靠来源时保持未知。详细决策见 [ADR-0014](adr/0014-actual-usage-and-quality-first-soft-context-budget.md)。
 
 ## 12. Proxy、Provider 与环境变量
 
@@ -953,7 +957,7 @@ path:   <repo-root>/.ats/worktrees/<task-id>
 
 `.ats/worktrees` 被项目本地 `.ats/.gitignore` 忽略。Workspace 虽位于项目目录内，Run 前仍必须通过真实路径和 `gitCommonDir` 校验，删除时只允许操作 `.ats/worktrees` 下的已登记路径。
 
-MVP 默认不允许 Agent push，不自动 merge，也不自动删除 Workspace。Scheduler 领取正式 Task 后按需准备 Workspace；人工在 REVIEW 状态查看相对 Base Commit 的文件清单与按需 Diff，执行“验收通过”时系统自动提交 dirty Workspace，并让 Review 固化 HEAD。Release 只接受已经存在于来源分支上的 Commit，并根据 Git 祖先关系自动关联能够证明已包含的已验收 Task；Task Branch 不会自动合并到来源分支。
+MVP 默认不允许 Agent push，不隐式 merge，也不自动删除 Workspace。Scheduler 领取正式 Task 后按需准备 Workspace；人工在 REVIEW 状态查看相对 Base Commit 的文件清单与按需 Diff，执行“验收通过”时系统自动提交 dirty Workspace，并让 Review 固化 HEAD。验收后由人类显式 fast-forward 集成；目标分支分叉时先同步 Task Workspace，再执行 Revision、测试和验收。Release 只接受已经存在于来源分支上的 Commit，并根据 Git 祖先关系自动关联能够证明已包含的已验收 Task。
 
 Dirty Workspace 清理前必须保存恢复 Artifact；无法证明目标路径和 Git 身份时，将 Workspace 标记为 `QUARANTINED`，禁止自动删除。
 
@@ -1109,6 +1113,9 @@ POST   /api/approvals/{approvalId}/decision
 GET    /api/git
 GET    /api/releases
 POST   /api/releases
+GET    /api/tasks/{id}/integration
+POST   /api/tasks/{id}/integration
+POST   /api/tasks/{id}/integration/sync
 POST   /api/artifacts/images
 ```
 

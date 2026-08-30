@@ -8,10 +8,45 @@ import {
 	getRuns,
 	getRunUsageSummary,
 	getTaskRuns,
+	getTaskFeedback,
+	getTaskReviews,
 	requestRunCancellation,
 	requestTopicPlanning,
 	retryTask,
 } from './client'
+
+describe('getTaskFeedback', () => {
+	afterEach(() => vi.unstubAllGlobals())
+
+	it('接受后端省略空 failure_message 的已完成反馈', async () => {
+		vi.stubGlobal('fetch', vi.fn<typeof fetch>(() => Promise.resolve(Response.json([{
+			id: 'feedback-1', task_id: 'task-1', source_message_id: 'message-1',
+			intent: 'REQUEST_CHANGES', status: 'APPLIED',
+			created_at: '2026-08-31T00:00:00Z', updated_at: '2026-08-31T00:00:01Z',
+		}]))))
+
+		const feedback = await getTaskFeedback('task-1')
+
+		expect(feedback[0]?.status).toBe('APPLIED')
+		expect(feedback[0]?.failure_message).toBe('')
+	})
+})
+
+describe('getTaskReviews', () => {
+	afterEach(() => vi.unstubAllGlobals())
+
+	it('接受没有 commit_sha 的驳回记录', async () => {
+		vi.stubGlobal('fetch', vi.fn<typeof fetch>(() => Promise.resolve(Response.json([{
+			id: 'review-1', task_id: 'task-1', decision: 'REJECTED', comment: '需要修改',
+			created_at: '2026-08-31T00:00:00Z',
+		}]))))
+
+		const reviews = await getTaskReviews('task-1')
+
+		expect(reviews[0]?.decision).toBe('REJECTED')
+		expect(reviews[0]).not.toHaveProperty('commit_sha')
+	})
+})
 
 describe('getRepositoryInfo', () => {
 	afterEach(() => vi.unstubAllGlobals())

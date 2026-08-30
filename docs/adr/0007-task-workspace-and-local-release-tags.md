@@ -24,7 +24,7 @@ Task 的数据库 `version` 是乐观锁修订号，不是软件版本。若 UI 
 6. Release 创建采用可恢复流程：先以 `CREATING` 固定数据库事实，再创建本地 annotated tag，验证成功后标记 `TAGGED`；失败保存 `FAILED`，相同输入可以幂等重放。
 7. 已存在的同名 Tag 只有在它是 annotated tag 且指向相同 Commit 时才视为幂等成功，否则返回冲突。
 8. Release 只包含来源分支 Commit 中已经提交的内容。Task Workspace 中未提交或尚未合入来源分支的修改不会进入 Release。
-9. 系统不自动 push，不自动 merge，不因创建 Release 自动 commit。
+9. 系统不自动 push，不隐式 merge，不因创建 Release 自动 commit。人工显式目标分支集成由 [ADR-0021](0021-explicit-task-integration-and-target-sync.md) 补充。
 10. Agent 默认不得 commit。用户显式执行 `AcceptTask` 时，Control Plane 在 Task 处于 `REVIEW`、Workspace 身份有效且确有修改时自动创建 Commit，再把验收时 HEAD 写入不可变 Review。Commit 是人类验收命令的一部分，不是 Agent 静默提交；失败后 Task 保持 `REVIEW`，可安全重试。
 11. READY Task 可通过显式 `SubmitTaskReview` 直接进入 REVIEW，用于人工或外部工具完成实现、尚未接入 Agent Run 的流程；该命令不创建或伪造 Run。
 12. 文件清单相对 Workspace Base Commit 计算，完整单文件 Diff 仅在人类点击时读取，最大返回 512 KiB；不写入主数据库、不默认展开。

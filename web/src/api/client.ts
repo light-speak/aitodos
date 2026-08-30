@@ -56,6 +56,7 @@ import type {
 	RunQueryInput,
 	ApprovalRequest,
 	ApprovalDecision,
+	TaskIntegration,
 } from '../types'
 
 interface RequestOptions {
@@ -340,8 +341,10 @@ export async function retryTaskFeedback(feedbackID: string): Promise<TaskFeedbac
 
 function parseTaskFeedback(value: unknown): TaskFeedback {
 	if (!isRecord(value) || !hasStringFields(value, [
-		'id', 'task_id', 'source_message_id', 'intent', 'status', 'failure_message', 'created_at', 'updated_at',
-	])) throw new ApiError('Task 反馈状态格式无效', 502, 'INVALID_RESPONSE')
+		'id', 'task_id', 'source_message_id', 'intent', 'status', 'created_at', 'updated_at',
+	]) || (value.failure_message !== undefined && typeof value.failure_message !== 'string')) {
+		throw new ApiError('Task 反馈状态格式无效', 502, 'INVALID_RESPONSE')
+	}
 	const intent = value.intent
 	const status = value.status
 	if ((intent !== 'DISCUSS' && intent !== 'REQUEST_CHANGES') || !isTaskFeedbackStatus(status)) {
@@ -349,7 +352,7 @@ function parseTaskFeedback(value: unknown): TaskFeedback {
 	}
 	return {
 		id: value.id as string, task_id: value.task_id as string, source_message_id: value.source_message_id as string,
-		intent, status, failure_message: value.failure_message as string,
+		intent, status, failure_message: typeof value.failure_message === 'string' ? value.failure_message : '',
 		created_at: value.created_at as string, updated_at: value.updated_at as string,
 		...(typeof value.retry_of_feedback_id === 'string' ? { retry_of_feedback_id: value.retry_of_feedback_id } : {}),
 		...(typeof value.run_id === 'string' ? { run_id: value.run_id } : {}),
@@ -478,6 +481,21 @@ export async function getTaskReviews(taskID: string, signal?: AbortSignal): Prom
 	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/reviews`, { signal })
 	if (!Array.isArray(value)) throw new ApiError('Review 历史格式无效', 502, 'INVALID_RESPONSE')
 	return value.map(parseTaskReview)
+}
+
+export async function getTaskIntegration(taskID: string, signal?: AbortSignal): Promise<TaskIntegration | null> {
+	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/integration`, { signal })
+	return value === null ? null : parseTaskIntegration(value)
+}
+
+export async function integrateTask(taskID: string): Promise<TaskIntegration> {
+	return parseTaskIntegration(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/integration`, { method: 'POST' }))
+}
+
+export async function syncTaskTarget(taskID: string): Promise<{ task: Task; integration: TaskIntegration }> {
+	const value = await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/integration/sync`, { method: 'POST' })
+	if (!isRecord(value)) throw new ApiError('目标分支同步结果格式无效', 502, 'INVALID_RESPONSE')
+	return { task: parseTask(value.task), integration: parseTaskIntegration(value.integration) }
 }
 
 export function errorMessage(error: unknown): string {
@@ -883,7 +901,7 @@ function parseTaskTestResult(value: unknown): TaskTestResult {
 	return {
 		id: value.id, test_case_id: value.test_case_id, task_id: value.task_id,
 		outcome: value.outcome, evidence_kind: value.evidence_kind, summary: value.summary,
-		created_at: value.created_at,
+		stale: typeof value.stale === 'boolean' ? value.stale : false, created_at: value.created_at,
 		...(typeof value.command === 'string' ? { command: value.command } : {}),
 		...(typeof value.artifact_ref === 'string' ? { artifact_ref: value.artifact_ref } : {}),
 		...(typeof value.source_run_id === 'string' ? { source_run_id: value.source_run_id } : {}),
@@ -1306,10 +1324,41 @@ function parseFileDiff(value: unknown): FileDiff {
 function parseTaskReview(value: unknown): TaskReview {
 	if (!isRecord(value) || typeof value.id !== 'string' || typeof value.task_id !== 'string' ||
 		(value.decision !== 'ACCEPTED' && value.decision !== 'REJECTED') || typeof value.comment !== 'string' ||
-		typeof value.commit_sha !== 'string' || typeof value.created_at !== 'string') {
+		typeof value.created_at !== 'string' ||
+		(value.decision === 'ACCEPTED' && typeof value.commit_sha !== 'string') ||
+		(value.commit_sha !== undefined && typeof value.commit_sha !== 'string')) {
 		throw new ApiError('Review 格式无效', 502, 'INVALID_RESPONSE')
 	}
-	return { id: value.id, task_id: value.task_id, decision: value.decision, comment: value.comment, commit_sha: value.commit_sha, created_at: value.created_at }
+	return {
+		id: value.id, task_id: value.task_id, decision: value.decision, comment: value.comment,
+		created_at: value.created_at,
+		...(typeof value.commit_sha === 'string' ? { commit_sha: value.commit_sha } : {}),
+	}
+}
+
+function parseTaskIntegration(value: unknown): TaskIntegration {
+	if (!isRecord(value) || typeof value.id !== 'string' || typeof value.task_id !== 'string' ||
+		typeof value.review_id !== 'string' || (value.operation !== 'INTEGRATE' && value.operation !== 'SYNC') ||
+		!isTaskIntegrationStatus(value.status) || typeof value.target_branch !== 'string' ||
+		typeof value.source_commit_sha !== 'string' || typeof value.target_before_sha !== 'string' ||
+		typeof value.created_at !== 'string' || typeof value.updated_at !== 'string') {
+		throw new ApiError('Task 集成记录格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id, task_id: value.task_id, review_id: value.review_id,
+		operation: value.operation, status: value.status, target_branch: value.target_branch,
+		source_commit_sha: value.source_commit_sha, target_before_sha: value.target_before_sha,
+		created_at: value.created_at, updated_at: value.updated_at,
+		...(typeof value.target_after_sha === 'string' && value.target_after_sha ? { target_after_sha: value.target_after_sha } : {}),
+		...(typeof value.workspace_after_sha === 'string' && value.workspace_after_sha ? { workspace_after_sha: value.workspace_after_sha } : {}),
+		...(typeof value.failure_kind === 'string' && value.failure_kind ? { failure_kind: value.failure_kind } : {}),
+		...(typeof value.failure_message === 'string' && value.failure_message ? { failure_message: value.failure_message } : {}),
+	}
+}
+
+function isTaskIntegrationStatus(value: unknown): value is TaskIntegration['status'] {
+	return value === 'RUNNING' || value === 'SUCCEEDED' || value === 'NEEDS_SYNC' ||
+		value === 'SYNCED' || value === 'CONFLICT' || value === 'FAILED'
 }
 
 function parseRelease(value: unknown): Release {

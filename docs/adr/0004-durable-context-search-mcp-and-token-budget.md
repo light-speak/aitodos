@@ -141,6 +141,8 @@ Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summar
 
 第一阶段使用项目 SQLite FTS5 和结构化过滤，不引入外部搜索服务或 Embedding 依赖。Search Projection 可从规范表和 Artifact 元数据重建，不是事实来源。
 
+FTS 索引更新使用同库短事务或有界增量队列，不在写事务中读取 Artifact、生成 Summary 或调用模型。搜索读取设置结果数、匹配片段、字符预算和执行时间上限；查询优先使用 entity/status/time 等结构化过滤缩小候选集，再执行 FTS 排序。索引重建使用新的影子表，完成校验后原子切换，避免长时间阻塞正常读写。
+
 搜索至少支持：
 
 - 关键词和短语。
@@ -150,7 +152,19 @@ Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summar
 - 稳定 ID、可读 Key、匹配片段、来源、Revision 和更新时间。
 - 游标分页和有界结果数量。
 
-原始 stdout、stderr 和完整 Diff 不默认写入全文索引，只索引受限摘要、错误信息、文件清单和 Artifact 引用。语义向量搜索推迟到有明确质量、成本和隐私方案后决定。
+原始 stdout、stderr 和完整 Diff 不默认写入全文索引，只索引受限摘要、错误信息、文件清单和 Artifact 引用。
+
+Embedding 只作为 FTS 后的可选第二阶段召回，不替代结构化过滤和关键词搜索。启用前必须满足：
+
+- 不新增常驻外部服务；Provider、本地模型和维度通过独立配置显式选择。
+- 只处理允许进入 Search Projection 的文本，Secret 和原始日志仍排除。
+- 按规范化内容哈希去重，模型或维度变化创建新索引 Revision，不原地混用向量。
+- 写路径只追加待索引 ID；Embedding 在有界批次中异步生成，可暂停、限速、恢复和全量重建。
+- 保存队列深度、索引覆盖率、批次延迟、检索延迟和 FTS/向量命中来源；索引落后不得阻止领域写入、Run 或 MCP 读取。
+- 查询先执行结构化过滤与 FTS；仅在结果不足或显式语义查询时，对有界候选执行向量召回，再使用确定性规则融合，避免全表扫描。
+- 设置项目级磁盘、并发、请求时限和返回字符预算。超时或 Provider 不可用时立即退化为 FTS，不返回空白知识库。
+
+在 FTS5 基线尚未完成真实数据量基准前，不引入 Embedding 依赖或 Schema。
 
 ### 9. Web Search、Context Builder 和 MCP 共用读取服务
 

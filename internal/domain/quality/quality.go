@@ -150,6 +150,7 @@ type TestResult struct {
 	Command      string       `json:"command,omitempty"`
 	ArtifactRef  string       `json:"artifact_ref,omitempty"`
 	SourceRunID  string       `json:"source_run_id,omitempty"`
+	Stale        bool         `json:"stale"`
 	CreatedAt    time.Time    `json:"created_at"`
 }
 

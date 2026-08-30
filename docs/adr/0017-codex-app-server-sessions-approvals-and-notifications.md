@@ -24,7 +24,7 @@ Codex App Server 协议依据 [OpenAI 官方 App Server 文档](https://develope
 
 - 人类可以在 AiTodos 面板内理解并决定同一次 Agent Turn 的权限，不需要切回 CLI。
 - Session Resume 与持久 Context 重建并存，长任务连续性不会绑定单一 Provider 隐藏状态。
-- App Server 原始流继续保存为 Artifact，未知 Usage 保持未知。
+- App Server 原始流继续保存为 Artifact；稳定的 `thread/tokenUsage/updated` 事件按当前 Turn 聚合为实际 Usage，缺失或无法验证的字段保持未知。
 - 浏览器通知是辅助入口；查询失败不会覆盖主界面的错误处理，也不会替代持久待处理列表。
 
 ## 未选择方案

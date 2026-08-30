@@ -40,7 +40,7 @@ model_requests, peak_input_tokens
 source, captured_at
 ```
 
-所有指标可空，未知不写零。Codex Adapter 从最后一个有效 `turn.completed` JSONL 事件读取累计 Usage；未知、破损和未来事件不导致 Run 失败。Usage 在 Agent 退出后、Run Finalization 前幂等保存，因此成功、失败、取消或超时只要事件可用都可记录。
+所有指标可空，未知不写零。旧 Codex Adapter 从最后一个有效 `turn.completed` JSONL 事件读取累计 Usage。Codex App Server Adapter 从 `thread/tokenUsage/updated` 读取当前 `turnId` 的结构化 Usage：按累计快照去重后累加每次请求的 `last`，从而得到当前 Run 的累计值，并记录请求数和单次输入峰值。Resume 时其他 `turnId` 的历史快照不会计入新 Run。未知、破损、负值和未来事件不导致 Run 失败，也不会生成伪造统计。Usage 在 Agent 退出后、Run Finalization 前幂等保存，因此成功、失败、取消或超时只要事件可用都可记录。
 
 ### 4. 汇总口径明确区分累计值与单次上下文
 
