@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/aitodos/internal/domain/integration"
 	"github.com/light-speak/aitodos/internal/domain/release"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/workspace"
@@ -149,6 +150,20 @@ func TestGitRoutesExposeChangesAndManualReview(t *testing.T) {
 	if !strings.Contains(string(reviewed), `"status":"ACCEPTED"`) || !strings.Contains(string(reviewed), `"commit_sha":"`) {
 		t.Fatalf("review = %s", reviewed)
 	}
+	integratedBody := requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/integration", "", http.StatusOK)
+	var integrated integration.Attempt
+	if err := json.Unmarshal(integratedBody, &integrated); err != nil {
+		t.Fatal(err)
+	}
+	if integrated.Status != integration.StatusSucceeded || integrated.TaskID != created.ID {
+		t.Fatalf("integration = %#v", integrated)
+	}
+	latestBody := requestJSON(t, server.Client(), http.MethodGet,
+		server.URL+"/api/tasks/"+created.ID+"/integration", "", http.StatusOK)
+	if !strings.Contains(string(latestBody), `"status":"SUCCEEDED"`) {
+		t.Fatalf("latest integration = %s", latestBody)
+	}
 }
 
 func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
@@ -178,6 +193,8 @@ func newGitTestServer(t *testing.T) (*httptest.Server, *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runHTTPGit(t, repositoryRoot, "add", ".ats/.gitignore", ".ats/project.toml")
+	runHTTPGit(t, repositoryRoot, "commit", "--quiet", "-m", "configure aitodos")
 	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
 	if err != nil {
 		t.Fatal(err)

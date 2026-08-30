@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/light-speak/aitodos/internal/domain/integration"
 	"github.com/light-speak/aitodos/internal/domain/release"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/gitworkflow"
@@ -33,6 +34,39 @@ func RegisterGitWorkflowRoutes(mux *http.ServeMux, manager *gitworkflow.Manager)
 	mux.HandleFunc("POST /api/tasks/{taskID}/workspace/commit", handler.commitWorkspace)
 	mux.HandleFunc("GET /api/tasks/{taskID}/reviews", handler.listReviews)
 	mux.HandleFunc("POST /api/tasks/{taskID}/reviews", handler.reviewTask)
+	mux.HandleFunc("GET /api/tasks/{taskID}/integration", handler.taskIntegration)
+	mux.HandleFunc("POST /api/tasks/{taskID}/integration", handler.integrateTask)
+	mux.HandleFunc("POST /api/tasks/{taskID}/integration/sync", handler.syncTaskTarget)
+}
+
+func (handler *gitWorkflowHandler) taskIntegration(response http.ResponseWriter, request *http.Request) {
+	item, err := handler.manager.TaskIntegration(request.Context(), request.PathValue("taskID"))
+	if err != nil {
+		writeGitWorkflowError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, item)
+}
+
+func (handler *gitWorkflowHandler) integrateTask(response http.ResponseWriter, request *http.Request) {
+	item, err := handler.manager.IntegrateTask(request.Context(), request.PathValue("taskID"))
+	if err != nil {
+		writeGitWorkflowError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, item)
+}
+
+func (handler *gitWorkflowHandler) syncTaskTarget(response http.ResponseWriter, request *http.Request) {
+	updated, attempt, err := handler.manager.SyncTaskTarget(request.Context(), request.PathValue("taskID"))
+	if err != nil {
+		writeGitWorkflowError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, struct {
+		Task        task.Task           `json:"task"`
+		Integration integration.Attempt `json:"integration"`
+	}{Task: updated, Integration: attempt})
 }
 
 func (handler *gitWorkflowHandler) updateTaskTargetBranch(response http.ResponseWriter, request *http.Request) {
@@ -216,6 +250,18 @@ func writeGitWorkflowError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusConflict, "TASK_VERSION_CONFLICT", "Task 已被更新，请刷新后重试")
 	case errors.Is(err, storage.ErrRequiredTestsNotPassed):
 		writeError(response, http.StatusConflict, "REQUIRED_TESTS_NOT_PASSED", "必测项尚未全部获得可验证的通过证据")
+	case errors.Is(err, gitworkflow.ErrTargetNeedsSync):
+		writeError(response, http.StatusConflict, "TARGET_NEEDS_SYNC", "目标分支已经前进，请先同步 Task Workspace 并重新验证")
+	case errors.Is(err, gitworkflow.ErrTargetWorktreeBusy):
+		writeError(response, http.StatusConflict, "TARGET_WORKTREE_BUSY", "目标分支正在其他 Worktree 中使用，AiTodos 不会修改不受管工作目录")
+	case errors.Is(err, gitworkflow.ErrRepositoryDirty):
+		writeError(response, http.StatusConflict, "TARGET_WORKTREE_DIRTY", "目标分支工作目录存在未提交修改，请先处理后重试")
+	case errors.Is(err, gitworkflow.ErrGitOperationActive):
+		writeError(response, http.StatusConflict, "GIT_OPERATION_ACTIVE", "仓库存在未完成的 Git 操作，请先处理后重试")
+	case errors.Is(err, gitworkflow.ErrTaskNotAccepted), errors.Is(err, gitworkflow.ErrReviewCommitMissing), errors.Is(err, gitworkflow.ErrReviewHeadMismatch):
+		writeError(response, http.StatusConflict, "TASK_NOT_INTEGRATABLE", "Task 必须已验收，且 Workspace HEAD 必须与最新通过 Review 一致")
+	case errors.Is(err, gitworkflow.ErrTargetSyncNotNeeded):
+		writeError(response, http.StatusConflict, "TARGET_SYNC_NOT_NEEDED", "目标分支当前不需要同步，请直接执行集成或刷新状态")
 	default:
 		var transitionErr *task.TransitionError
 		if errors.As(err, &transitionErr) {

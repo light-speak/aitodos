@@ -32,6 +32,7 @@ const (
 	CommandResumeImplementation Command = "RESUME_IMPLEMENTATION"
 	CommandResumeRevision       Command = "RESUME_REVISION"
 	CommandRequestChanges       Command = "REQUEST_CHANGES"
+	CommandSyncTarget           Command = "SYNC_TARGET"
 )
 
 var transitions = map[Status]map[Command]Status{
@@ -60,6 +61,9 @@ var transitions = map[Status]map[Command]Status{
 		CommandResumeImplementation: StatusReady,
 		CommandResumeRevision:       StatusChangesRequested,
 		CommandRequestChanges:       StatusChangesRequested,
+	},
+	StatusAccepted: {
+		CommandSyncTarget: StatusChangesRequested,
 	},
 }
 
@@ -111,5 +115,6 @@ func AllCommands() []Command {
 		CommandResumeImplementation,
 		CommandResumeRevision,
 		CommandRequestChanges,
+		CommandSyncTarget,
 	}
 }

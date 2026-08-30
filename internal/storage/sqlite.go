@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 30
+const currentSchemaVersion = 31
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -1217,6 +1217,29 @@ SELECT lower(hex(randomblob(16))), task_id, id,
 FROM task_feedback_turns;
 CREATE INDEX task_feedback_events_timeline_idx
 ON task_feedback_events(task_id, sequence);`, true
+	case 31:
+		return `CREATE TABLE task_integration_attempts (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    review_id TEXT NOT NULL REFERENCES task_reviews(id) ON DELETE RESTRICT,
+    operation TEXT NOT NULL CHECK (operation IN ('INTEGRATE', 'SYNC')),
+    status TEXT NOT NULL CHECK (status IN (
+        'RUNNING', 'SUCCEEDED', 'NEEDS_SYNC', 'SYNCED', 'CONFLICT', 'FAILED'
+    )),
+    target_branch TEXT NOT NULL CHECK (length(trim(target_branch)) BETWEEN 1 AND 255),
+    source_commit_sha TEXT NOT NULL CHECK (length(source_commit_sha) >= 7),
+    target_before_sha TEXT NOT NULL CHECK (length(target_before_sha) >= 7),
+    target_after_sha TEXT NOT NULL DEFAULT '',
+    workspace_after_sha TEXT NOT NULL DEFAULT '',
+    failure_kind TEXT NOT NULL DEFAULT '' CHECK (length(failure_kind) <= 100),
+    failure_message TEXT NOT NULL DEFAULT '' CHECK (length(failure_message) <= 4000),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE UNIQUE INDEX task_integration_one_running_idx
+ON task_integration_attempts(task_id) WHERE status = 'RUNNING';
+CREATE INDEX task_integration_task_history_idx
+ON task_integration_attempts(task_id, created_at DESC, id DESC);`, true
 	default:
 		return "", false
 	}

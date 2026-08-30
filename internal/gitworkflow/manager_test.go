@@ -10,6 +10,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/light-speak/aitodos/internal/domain/integration"
+	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/release"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/workspace"
@@ -255,6 +257,166 @@ func TestManagerCompletesManualReviewFlow(t *testing.T) {
 	}
 }
 
+func TestManagerIntegratesAcceptedTaskFastForward(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	accepted, review, taskWorkspace := createAcceptedTask(t, manager, database, "集成已验收任务", "feature.txt", "ready\n")
+	if _, _, err := manager.SyncTaskTarget(ctx, accepted.ID); !errors.Is(err, ErrTargetSyncNotNeeded) {
+		t.Fatalf("SyncTaskTarget() before divergence error = %v", err)
+	}
+
+	result, err := manager.IntegrateTask(ctx, accepted.ID)
+	if err != nil {
+		t.Fatalf("IntegrateTask() error = %v", err)
+	}
+	if result.Status != integration.StatusSucceeded || result.SourceCommitSHA != review.CommitSHA || result.TargetAfterSHA != review.CommitSHA {
+		t.Fatalf("integration result = %#v", result)
+	}
+	if head := git(t, repository.Root, "rev-parse", "main"); head != review.CommitSHA {
+		t.Fatalf("main HEAD = %q, want %q", head, review.CommitSHA)
+	}
+	if taskWorkspace.HeadSHA != review.CommitSHA {
+		t.Fatalf("workspace HEAD = %q, review = %q", taskWorkspace.HeadSHA, review.CommitSHA)
+	}
+
+	again, err := manager.IntegrateTask(ctx, accepted.ID)
+	if err != nil || again.ID != result.ID {
+		t.Fatalf("idempotent IntegrateTask() = %#v, %v", again, err)
+	}
+}
+
+func TestManagerSyncsDivergedTargetAndRequiresRevision(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	accepted, _, _ := createAcceptedTask(t, manager, database, "同步目标分支", "feature.txt", "task\n")
+	qualityStore := storage.NewQualityStore(database)
+	testCase, err := qualityStore.CreateTestCase(ctx, accepted.ID, quality.TestCaseInput{
+		Title: "回归检查", Required: true, CreatedBy: quality.TestCreatorHuman,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qualityStore.AddTestResult(ctx, accepted.ID, testCase.ID, quality.TestResultInput{
+		Outcome: quality.OutcomePassed, EvidenceKind: quality.EvidenceHuman, Summary: "同步前验证通过",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repository.Root, "target.txt"), []byte("target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository.Root, "add", "target.txt")
+	runGit(t, repository.Root, "commit", "--quiet", "-m", "advance target")
+
+	blocked, err := manager.IntegrateTask(ctx, accepted.ID)
+	if !errors.Is(err, ErrTargetNeedsSync) || blocked.Status != integration.StatusNeedsSync {
+		t.Fatalf("IntegrateTask() = %#v, %v", blocked, err)
+	}
+	syncedTask, synced, err := manager.SyncTaskTarget(ctx, accepted.ID)
+	if err != nil {
+		t.Fatalf("SyncTaskTarget() error = %v", err)
+	}
+	if syncedTask.Status != task.StatusChangesRequested || synced.Status != integration.StatusSynced {
+		t.Fatalf("sync result = %#v, %#v", syncedTask, synced)
+	}
+	currentWorkspace, err := manager.TaskWorkspace(ctx, accepted.ID)
+	if err != nil || currentWorkspace == nil || currentWorkspace.Dirty {
+		t.Fatalf("workspace after sync = %#v, %v", currentWorkspace, err)
+	}
+	if _, err := os.Stat(filepath.Join(currentWorkspace.Path, "feature.txt")); err != nil {
+		t.Fatalf("task change missing after sync: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(currentWorkspace.Path, "target.txt")); err != nil {
+		t.Fatalf("target change missing after sync: %v", err)
+	}
+	store := storage.NewTaskStore(database)
+	running, err := store.ApplyCommand(ctx, syncedTask.ID, syncedTask.Version, task.CommandClaimRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reviewing, err := store.ApplyCommand(ctx, running.ID, running.Version, task.CommandRunSucceeded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := manager.ReviewTask(ctx, reviewing.ID, reviewing.Version, task.ReviewInput{Decision: task.ReviewAccepted}); !errors.Is(err, storage.ErrRequiredTestsNotPassed) {
+		t.Fatalf("stale test evidence review error = %v", err)
+	}
+}
+
+func TestManagerAbortsSyncConflictBeforeRevision(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	accepted, _, _ := createAcceptedTask(t, manager, database, "处理同步冲突", "README.md", "task version\n")
+	if err := os.WriteFile(filepath.Join(repository.Root, "README.md"), []byte("target version\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository.Root, "add", "README.md")
+	runGit(t, repository.Root, "commit", "--quiet", "-m", "conflicting target")
+
+	syncedTask, attempt, err := manager.SyncTaskTarget(ctx, accepted.ID)
+	if err != nil {
+		t.Fatalf("SyncTaskTarget() error = %v", err)
+	}
+	if syncedTask.Status != task.StatusChangesRequested || attempt.Status != integration.StatusConflict {
+		t.Fatalf("conflict sync = %#v, %#v", syncedTask, attempt)
+	}
+	currentWorkspace, err := manager.TaskWorkspace(ctx, accepted.ID)
+	if err != nil || currentWorkspace == nil || currentWorkspace.Dirty {
+		t.Fatalf("workspace after conflict = %#v, %v", currentWorkspace, err)
+	}
+	if gitPath := git(t, currentWorkspace.Path, "rev-parse", "--git-path", "MERGE_HEAD"); fileExists(gitPath) {
+		t.Fatalf("MERGE_HEAD still exists at %q", gitPath)
+	}
+}
+
+func createAcceptedTask(
+	t *testing.T,
+	manager *Manager,
+	database *sql.DB,
+	title string,
+	path string,
+	content string,
+) (task.Task, task.Review, workspace.Workspace) {
+	t.Helper()
+	ctx := context.Background()
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(ctx, task.CreateInput{Title: title})
+	if err != nil {
+		t.Fatal(err)
+	}
+	taskWorkspace, err := manager.CreateTaskWorkspace(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(taskWorkspace.Path, path), []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created, err = store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err = manager.SubmitTaskReview(ctx, created.ID, created.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	accepted, review, err := manager.ReviewTask(ctx, created.ID, created.Version, task.ReviewInput{Decision: task.ReviewAccepted})
+	if err != nil {
+		t.Fatal(err)
+	}
+	refreshed, err := manager.TaskWorkspace(ctx, created.ID)
+	if err != nil || refreshed == nil {
+		t.Fatalf("TaskWorkspace() = %#v, %v", refreshed, err)
+	}
+	return accepted, review, *refreshed
+}
+
+func fileExists(path string) bool {
+	_, err := os.Stat(path)
+	return err == nil
+}
+
 func TestManagerRejectsConflictingExistingTagAndRecordsFailure(t *testing.T) {
 	repository, database := initializeRepository(t)
 	runGit(t, repository.Root, "tag", "v2.0.0")
@@ -330,6 +492,8 @@ func initializeRepository(t *testing.T) (*project.Project, *sql.DB) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	runGit(t, repoRoot, "add", ".ats/.gitignore", ".ats/project.toml")
+	runGit(t, repoRoot, "commit", "--quiet", "-m", "configure aitodos")
 	database, err := storage.OpenExisting(context.Background(), repository.Paths.Database)
 	if err != nil {
 		t.Fatal(err)
