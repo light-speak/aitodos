@@ -137,11 +137,11 @@ Run 记录 `agent_session_id`、外部 Session ID、父 Run、逻辑 Context Rev
 
 ### 8. 建立统一、可重建的 Search Projection
 
-Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary 投影为统一只读 Search Document。领域写模型保持独立。
+Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary 最终投影为统一只读 Search Document。领域写模型保持独立。第一阶段只索引已有规范事实模型中的 Topic、Task、Message、Plan Revision 和 Clarification；Decision 与 Run Summary 在对应规范表落地前不得从 Agent 输出或日志推断生成。
 
-第一阶段使用项目 SQLite FTS5 和结构化过滤，不引入外部搜索服务或 Embedding 依赖。Search Projection 可从规范表和 Artifact 元数据重建，不是事实来源。
+第一阶段使用项目 SQLite FTS5 trigram 和结构化过滤，不引入外部搜索服务或 Embedding 依赖。Search Projection 从允许检索的规范表重建，不是事实来源；Artifact 只保留稳定引用，不把内容或原始文件名默认写入全文索引。
 
-FTS 索引更新使用同库短事务或有界增量队列，不在写事务中读取 Artifact、生成 Summary 或调用模型。搜索读取设置结果数、匹配片段、字符预算和执行时间上限；查询优先使用 entity/status/time 等结构化过滤缩小候选集，再执行 FTS 排序。索引重建使用新的影子表，完成校验后原子切换，避免长时间阻塞正常读写。
+FTS 索引更新使用同库触发器，与规范写入保持同一短事务；不在写事务中读取 Artifact、生成 Summary 或调用模型。搜索读取设置结果数、匹配片段、字符预算和分页上限；查询同时使用 entity/status/time 等结构化过滤与 FTS 排序。第一阶段全量重建在单个 SQLite 事务中完成，读者只能看到重建前或重建后的完整投影；真实项目基准显示事务时间不可接受时，再引入影子索引切换，不能预先增加两套触发器与动态表管理复杂度。
 
 搜索至少支持：
 

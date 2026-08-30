@@ -1,4 +1,4 @@
-import { AlertCircleIcon, BellIcon, BellOffIcon, BotIcon, CircleHelpIcon, GitBranchIcon, ListTodoIcon, LoaderCircleIcon, MessageSquareIcon, PlusIcon, Settings2Icon, SquareKanbanIcon, TagIcon } from 'lucide-react'
+import { AlertCircleIcon, BellIcon, BellOffIcon, BotIcon, CircleHelpIcon, GitBranchIcon, ListTodoIcon, LoaderCircleIcon, MessageSquareIcon, PlusIcon, SearchIcon, Settings2Icon, SquareKanbanIcon, TagIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
 import { shortGitSHA } from '../lib/utils'
@@ -29,11 +29,12 @@ interface AppHeaderProps {
 	notificationsSupported: boolean
 	notificationsBlocked: boolean
 	onToggleNotifications: () => void
+	onOpenSearch: () => void
   onCreate: () => void
 }
 
 export function AppHeader(props: AppHeaderProps) {
-	const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onOpenRepository, onToggleWorkers, onConfigureWorkers, workersPending, activeRuns, agentActivityError, onOpenRuns, onReloadAgentActivity, attentionCount, onOpenClarifications, notificationLabel, notificationsEnabled, notificationsSupported, notificationsBlocked, onToggleNotifications, onCreate } = props
+	const { project, topicCount, taskCount, repository, latestRelease, onOpenReleases, onOpenRepository, onToggleWorkers, onConfigureWorkers, workersPending, activeRuns, agentActivityError, onOpenRuns, onReloadAgentActivity, attentionCount, onOpenClarifications, notificationLabel, notificationsEnabled, notificationsSupported, notificationsBlocked, onToggleNotifications, onOpenSearch, onCreate } = props
   const branchSummary = repository === null
     ? '正在读取…'
 		: repository.has_head
@@ -70,6 +71,9 @@ export function AppHeader(props: AppHeaderProps) {
 				<AlertCircleIcon />Agent 状态未知
 			</Button>
 		) : null}
+		<Button variant="outline" size="lg" type="button" aria-label="搜索项目" onClick={onOpenSearch}>
+			<SearchIcon />搜索<kbd className="ml-1 rounded border px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground" aria-hidden="true">/</kbd>
+		</Button>
 		<Button
 			variant={project?.workers_enabled ? 'default' : 'outline'}
 			size="lg"

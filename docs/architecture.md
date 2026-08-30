@@ -1,6 +1,6 @@
 # AiTodos 架构设计基线
 
-- 状态：Draft，ADR-0001 至 ADR-0021 已接受；Topic/Task 讨论、显式 Task 反馈意图与只读 Agent 问答、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、显式目标分支集成与同步、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；MCP 调用审计与受管浏览器资源回收、Search/MCP Read Server 正在推进
+- 状态：Draft，ADR-0001 至 ADR-0021 已接受；Topic/Task 讨论、显式 Task 反馈意图与只读 Agent 问答、自动 Planning Run、AI Plan Revision/人工审核/批准建 Task、Task Workspace、人工 Review/Diff、显式目标分支集成与同步、本地 Release Tag、项目级 Worker、Task Run/Runner、Run 查询/取消/人工 Retry、Agent Profile Revision、Codex App Server 结构化审批、Agent Session Resume、显式浏览器通知、项目 Skill/MCP 目录与 Run Tool Policy 快照、基础 Context Builder、SQLite FTS Search Projection/Web Search、Estimate/Test、Progress、Task Triage、持久 Clarification/Continuation Run、实际 Usage 统计、可恢复 Finalization、Runner Crash Recovery、按需日志和可断线续传 Run SSE 已实现；项目只读 MCP、MCP 调用审计与受管浏览器资源回收正在推进
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
@@ -470,6 +470,12 @@ Release 状态为 `CREATING`、`TAGGED` 或 `FAILED`。数据库先保留 `CREAT
 
 Schema v31 保存 `INTEGRATE`/`SYNC` 的不可变 Task、Review Commit、目标分支、操作前后 SHA、状态和失败诊断。同一 Task 最多一个 `RUNNING` 尝试。同步成功或冲突都会使旧测试证据过期并进入 `CHANGES_REQUESTED`；daemon 启动时对账未完成记录。
 
+### search_documents
+
+Schema v32 保存可重建的 Search Document 元数据，并以 FTS5 trigram 索引标题、正文和稳定 Key。Topic、Task、Message、Plan Revision 和 Clarification 的创建、更新与删除通过同库触发器在源事务内增量同步；Migration 会回填已有规范数据，读取服务也能在一个事务内全量重建投影。原始 Run 日志、完整 Diff、Artifact 内容、环境变量和凭据不进入该投影。
+
+Schema v33 将正文更新和状态/活动时间更新拆成独立触发器；只改变元数据时不重写 FTS 文本，避免讨论消息和状态刷新产生无效索引写放大。
+
 ### runs
 
 ```text
@@ -845,7 +851,7 @@ Context 按 L0 固定规则、L1 当前工作集、L2 近期增量和 L3 历史�
 
 每个 Profile Revision 固化内部软预算、输出预留、安全余量、近期 Message 数量、检索数量、关联对象数量和 Artifact 片段上限。普通配置不要求用户调整 Token 预算。Context Builder 按规则、当前对象、有效 Decision、批准 Plan、开放问题、近期增量、检索摘要和 Artifact 片段的顺序装入，并记录每项内容的来源、Revision、哈希、Token 估算、是否采用和省略原因。Token 估算只服务于去重和低价值历史取舍，不是实际 Usage，也不得裁掉安全规则、当前任务、验收标准、项目规则、开放问题或当前修订所依据的驳回意见；必需内容超过软预算仍完整发送。
 
-Search Projection 使用项目 SQLite FTS5，覆盖 Topic、Plan Revision、Task、Message、Decision、Clarification 和 Run Summary。它是可重建的只读投影，不是事实来源；原始日志和完整 Diff 不进入默认全文索引。
+Search Projection 使用项目 SQLite FTS5 trigram，当前覆盖 Topic、Task、Message、Plan Revision 和 Clarification，支持类型、状态、当前版本、更新时间和游标分页过滤。Decision 与 Run Summary 尚无完整规范表，必须在对应事实模型落地后再加入投影，不能从日志或 Agent 文本推断。Search Projection 是可重建的只读投影，不是事实来源；原始日志、完整 Diff 和 Artifact 内容不进入默认全文索引。
 
 MCP 第一阶段只提供当前项目的有界只读搜索和读取能力，不直接暴露数据库，也不提供批准 Plan、启动 Run、验收 Task 或删除对象等高影响命令。检索内容始终视为不可信数据，不得提升到系统安全或 Project Instructions 层。
 
@@ -1117,9 +1123,10 @@ GET    /api/tasks/{id}/integration
 POST   /api/tasks/{id}/integration
 POST   /api/tasks/{id}/integration/sync
 POST   /api/artifacts/images
+GET    /api/search
 ```
 
-Search、项目只读 MCP Server 和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Topic Planning Run、Run 查询、详情、按需日志、SSE、取消、人工 Retry、Task 反馈查询/续传/失败重试和结构化 Approval 已提供有界接口。Plan Revision/人工审核/批准建 Task、Topic/Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
+Web Search 已提供有界接口和全局入口；项目只读 MCP Server、Decision/Run Summary 投影和 Label 接口仍是后续阶段，当前不得由 UI 或 MCP 假定存在。Topic Planning Run、Run 查询、详情、按需日志、SSE、取消、人工 Retry、Task 反馈查询/续传/失败重试和结构化 Approval 已提供有界接口。Plan Revision/人工审核/批准建 Task、Topic/Task Clarification 与 Agent Tool Policy 已提供有界命令；Tool Policy 不等同于 MCP 调用审计，后者仍按 ADR-0012 推进。
 
 写命令携带目标聚合的 `version` 或 `If-Match`，冲突返回 409。批准 Plan、批量生成 Task、回答 Clarification 和状态迁移必须使用领域命令，不提供通用状态 PATCH。
 
@@ -1335,7 +1342,7 @@ MVP 不包含：
 5. 实现 Thread、Plan Review、人工批准和批量创建 Task 的纵向切片。
 6. 实现版本化 Agent Profile、职责默认值和 Prompt 配置 UI。
 7. 实现项目 Skill/MCP 目录、Profile Tool Policy 和 Run 能力快照。
-8. 实现 SQLite FTS Search Projection、Web Search 和只读 MCP。
+8. 实现 SQLite FTS Search Projection 与 Web Search；随后复用读取层实现只读 MCP。
 9. 实现分层 Context Builder、Summary、软 Token Budget、Context Manifest 和 Session 模型。
 10. TDD 实现 SQLite Claim 和 Git Workspace Manager。
 11. 实现本地 Release、annotated tag 和 Git 审计 UI。

@@ -9,6 +9,7 @@ import { KanbanBoard } from './components/KanbanBoard'
 import { ReleaseDialog } from './components/ReleaseDialog'
 import { RepositoryDialog } from './components/RepositoryDialog'
 import { ProgressPage } from './components/ProgressPage'
+import { ProjectSearchDialog } from './components/ProjectSearchDialog'
 import { ProjectCapabilitiesPanel } from './components/ProjectCapabilitiesPanel'
 import { TaskDetailsDialog } from './components/TaskDetailsDialog'
 import { TopicDetailsDialog } from './components/TopicDetailsDialog'
@@ -35,7 +36,8 @@ import { useApprovals } from './features/approvals/useApprovals'
 import { useBrowserNotifications } from './features/notifications/useBrowserNotifications'
 import { useTopicPlanning } from './features/runs/useTopicPlanning'
 import { useAgentActivity } from './features/runs/useAgentActivity'
-import type { TaskFeedbackIntent } from './types'
+import { useProjectSearch } from './features/search/useProjectSearch'
+import type { SearchItem, TaskFeedbackIntent } from './types'
 
 type AppView = 'topics' | 'tasks' | 'runs' | 'progress' | 'agents'
 
@@ -46,7 +48,8 @@ export default function App() {
   const [showReleases, setShowReleases] = useState(false)
 	const [showRepository, setShowRepository] = useState(false)
 	const [showWorkerSettings, setShowWorkerSettings] = useState(false)
-	const [showClarifications, setShowClarifications] = useState(false)
+  const [showClarifications, setShowClarifications] = useState(false)
+	const [showSearch, setShowSearch] = useState(false)
   const [selectedTaskID, setSelectedTaskID] = useState<string | null>(null)
   const [selectedTopicID, setSelectedTopicID] = useState<string | null>(null)
   const selectedTask = useMemo(
@@ -75,6 +78,7 @@ export default function App() {
 	const topicPlan = useTopicPlan(selectedTopicID)
 	const topicPlanning = useTopicPlanning(selectedTopic, board.project?.workers_enabled ?? false)
 	const agentActivity = useAgentActivity(board.project !== null)
+	const projectSearch = useProjectSearch()
 	const selectedTaskActiveRun = useMemo(
 		() => agentActivity.runs.find((run) => run.task_id === selectedTaskID) ?? null,
 		[agentActivity.runs, selectedTaskID],
@@ -142,22 +146,30 @@ export default function App() {
       if (
         event.defaultPrevented ||
         event.repeat ||
-        event.key.toLowerCase() !== 'n' ||
-        event.metaKey ||
-        event.ctrlKey ||
-        event.altKey ||
-        event.shiftKey ||
-        creating ||
-        selectedTaskID !== null ||
-        selectedTopicID !== null ||
         isEditableTarget(event.target)
       ) return
+		const key = event.key.toLowerCase()
+		const modalOpen = creating || showSearch || selectedTaskID !== null || selectedTopicID !== null ||
+			showReleases || showRepository || showWorkerSettings || showClarifications
+		if (key === '/' && !event.metaKey && !event.ctrlKey && !event.altKey && !event.shiftKey && !modalOpen) {
+			event.preventDefault()
+			setShowSearch(true)
+			return
+		}
+		if (key !== 'n' || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey || modalOpen) return
       event.preventDefault()
       setCreating(true)
     }
     document.addEventListener('keydown', handleShortcut)
     return () => document.removeEventListener('keydown', handleShortcut)
-  }, [creating, selectedTaskID, selectedTopicID])
+  }, [creating, selectedTaskID, selectedTopicID, showClarifications, showReleases, showRepository, showSearch, showWorkerSettings])
+
+	function openSearchItem(item: SearchItem) {
+		setShowSearch(false)
+		projectSearch.reset()
+		if (item.subject_kind === 'TOPIC') openTopic(item.subject_id)
+		else openTask(item.subject_id)
+	}
 
   return (
     <div className="min-h-svh bg-background">
@@ -190,6 +202,7 @@ export default function App() {
 		notificationsSupported={notifications.supported}
 		notificationsBlocked={notifications.blocked}
 		onToggleNotifications={() => { void notifications.toggle() }}
+		onOpenSearch={() => setShowSearch(true)}
         onCreate={() => setCreating(true)}
       />
       <main className="min-w-0 py-6">
@@ -229,6 +242,13 @@ export default function App() {
 			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} /></>
 		)}
       </main>
+		{showSearch ? <ProjectSearchDialog
+			items={projectSearch.items} loading={projectSearch.loading} error={projectSearch.error}
+			nextCursor={projectSearch.nextCursor}
+			onClose={() => { setShowSearch(false); projectSearch.reset() }}
+			onSearch={(input) => { void projectSearch.search(input) }}
+			onLoadMore={() => { void projectSearch.loadMore() }} onOpenItem={openSearchItem}
+		/> : null}
       {creating ? (
         <CreateItemDialog
 			repository={git.repository}

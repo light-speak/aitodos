@@ -23,6 +23,40 @@ export const topicStatuses = [
 
 export type TopicStatus = (typeof topicStatuses)[number]
 
+export const searchKinds = ['TOPIC', 'TASK', 'MESSAGE', 'PLAN_REVISION', 'CLARIFICATION'] as const
+
+export type SearchKind = (typeof searchKinds)[number]
+
+export interface SearchItem {
+	document_id: string
+	kind: SearchKind
+	source_id: string
+	subject_kind: 'TOPIC' | 'TASK'
+	subject_id: string
+	stable_key: string
+	title: string
+	snippet: string
+	status: string
+	current: boolean
+	updated_at: string
+}
+
+export interface SearchPage {
+	items: SearchItem[]
+	next_cursor?: string
+}
+
+export interface SearchQueryInput {
+	query: string
+	kinds?: SearchKind[]
+	statuses?: string[]
+	only_current?: boolean
+	updated_after?: string
+	updated_before?: string
+	limit?: number
+	cursor?: string
+}
+
 export const messageAuthorKinds = ['HUMAN', 'AGENT', 'SYSTEM'] as const
 
 export type MessageAuthorKind = (typeof messageAuthorKinds)[number]

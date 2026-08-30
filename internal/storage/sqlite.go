@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 31
+const currentSchemaVersion = 33
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -1240,6 +1240,10 @@ CREATE UNIQUE INDEX task_integration_one_running_idx
 ON task_integration_attempts(task_id) WHERE status = 'RUNNING';
 CREATE INDEX task_integration_task_history_idx
 ON task_integration_attempts(task_id, created_at DESC, id DESC);`, true
+	case 32:
+		return searchMigrationV32, true
+	case 33:
+		return searchOptimizationMigrationV33, true
 	default:
 		return "", false
 	}
