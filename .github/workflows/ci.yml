@@ -55,3 +55,5 @@ jobs:
       - run: pnpm --dir web typecheck
       - run: pnpm --dir web test
       - run: pnpm --dir web build
+      - name: Check embedded web assets
+        run: test -z "$(git status --porcelain -- internal/webui/dist)"
