@@ -4,6 +4,7 @@
 - Go module：`github.com/light-speak/aitodos`
 - 产品形态：本地优先、单用户、每项目独立运行的 Agent 工作流系统
 - 技术基线：Go Control Plane / Runner、React + TypeScript、SQLite WAL、REST + SSE
+- 支持平台：macOS 与 Linux；两个平台共用 `flock` 互斥，进程身份分别读取内核进程信息与 Linux procfs；显式打开浏览器分别使用 `open` 与 `xdg-open`
 
 ## 1. 目标与非目标
 

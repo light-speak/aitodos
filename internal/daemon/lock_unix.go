@@ -1,11 +1,12 @@
-//go:build darwin
+//go:build darwin || linux
 
 package daemon
 
 import (
 	"errors"
 	"os"
-	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 var errAlreadyRunning = errors.New("项目已经在另一个终端运行")
@@ -19,9 +20,9 @@ func acquireFileLock(path string) (*fileLock, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
 		file.Close()
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+		if errors.Is(err, unix.EWOULDBLOCK) {
 			return nil, errAlreadyRunning
 		}
 		return nil, err
@@ -30,7 +31,7 @@ func acquireFileLock(path string) (*fileLock, error) {
 }
 
 func (lock *fileLock) Close() error {
-	unlockErr := syscall.Flock(int(lock.file.Fd()), syscall.LOCK_UN)
+	unlockErr := unix.Flock(int(lock.file.Fd()), unix.LOCK_UN)
 	closeErr := lock.file.Close()
 	if unlockErr != nil {
 		return unlockErr
