@@ -16,6 +16,29 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Run Go tests with coverage
+        run: mkdir -p .tmp && go test ./... -coverprofile=.tmp/coverage.out -covermode=atomic -count=1
+      - name: Enforce coverage floor
+        run: |
+          total=$(go tool cover -func=.tmp/coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
+          echo "Total Go coverage: ${total}%"
+          awk -v total="$total" 'BEGIN { if (total + 0 < 60.0) exit 1 }'
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v7
+        with:
+          files: .tmp/coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+          fail_ci_if_error: false
+
   go:
     strategy:
       fail-fast: false
