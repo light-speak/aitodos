@@ -6,7 +6,7 @@ AiTodos 是本地优先、单用户、每项目独立运行的 Human-Agent 软�
 
 ## 当前状态
 
-项目处于早期可用阶段。默认不自动 push，也不自动合并到主分支；Agent 只在受管 Task Workspace 中执行。
+项目处于早期可用阶段，支持 macOS 和 Linux。默认不自动 push，也不自动合并到主分支；Agent 只在受管 Task Workspace 中执行。
 
 ## 本地开发
 
@@ -22,9 +22,10 @@ pnpm --dir web build
 
 运行 `./ats init` 可在当前 Git 项目中创建 `.ats/` 本地状态，`./ats start` 会以前台模式启动服务且不会自动打开浏览器。
 
+Linux 上显式执行 `./ats open` 需要桌面环境提供 `xdg-open`；无桌面的服务器可直接使用 `ats start` 输出的本地 URL。
+
 架构与安全边界见 `docs/architecture.md` 和 `docs/adr/`。
 
 ## License
 
 Apache License 2.0。
-
