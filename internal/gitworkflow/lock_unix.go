@@ -1,13 +1,15 @@
-//go:build darwin
+//go:build darwin || linux
 
 package gitworkflow
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"syscall"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 type repositoryLock struct {
@@ -22,9 +24,9 @@ func acquireRepositoryLock(ctx context.Context, path string) (*repositoryLock, e
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
+		if err := unix.Flock(int(file.Fd()), unix.LOCK_EX|unix.LOCK_NB); err == nil {
 			return &repositoryLock{file: file}, nil
-		} else if err != syscall.EWOULDBLOCK {
+		} else if !errors.Is(err, unix.EWOULDBLOCK) {
 			file.Close()
 			return nil, fmt.Errorf("lock repository: %w", err)
 		}
@@ -38,7 +40,7 @@ func acquireRepositoryLock(ctx context.Context, path string) (*repositoryLock, e
 }
 
 func (lock *repositoryLock) Close() error {
-	unlockErr := syscall.Flock(int(lock.file.Fd()), syscall.LOCK_UN)
+	unlockErr := unix.Flock(int(lock.file.Fd()), unix.LOCK_UN)
 	closeErr := lock.file.Close()
 	if unlockErr != nil {
 		return unlockErr
