@@ -27,11 +27,11 @@ func TestStartRunsInForegroundUntilContextCancellation(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	var stdout synchronizedBuffer
+	stdout := newSynchronizedBuffer()
 	var stderr bytes.Buffer
 	done := make(chan int, 1)
 	go func() {
-		done <- Run(ctx, []string{"start"}, &stdout, &stderr)
+		done <- Run(ctx, []string{"start"}, stdout, &stderr)
 	}()
 
 	waitForCLIStatus(t, currentProject, true)
@@ -40,8 +40,9 @@ func TestStartRunsInForegroundUntilContextCancellation(t *testing.T) {
 		t.Fatalf("start exited before cancellation with code %d: %s", code, stderr.String())
 	default:
 	}
-	if strings.Contains(stdout.String(), "后台") || !strings.Contains(stdout.String(), "前台已启动") {
-		t.Fatalf("start output = %q", stdout.String())
+	output := stdout.waitForSubstring(t, "前台已启动")
+	if strings.Contains(output, "后台") {
+		t.Fatalf("start output = %q", output)
 	}
 
 	cancel()
@@ -223,20 +224,47 @@ func restoreWorkingDirectory(t *testing.T, directory string) {
 }
 
 type synchronizedBuffer struct {
-	mu     sync.Mutex
-	buffer bytes.Buffer
+	mu      sync.Mutex
+	buffer  bytes.Buffer
+	updated chan struct{}
+}
+
+func newSynchronizedBuffer() *synchronizedBuffer {
+	return &synchronizedBuffer{updated: make(chan struct{}, 1)}
 }
 
 func (b *synchronizedBuffer) Write(content []byte) (int, error) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.buffer.Write(content)
+	written, err := b.buffer.Write(content)
+	b.mu.Unlock()
+	select {
+	case b.updated <- struct{}{}:
+	default:
+	}
+	return written, err
 }
 
 func (b *synchronizedBuffer) String() string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.buffer.String()
+}
+
+func (b *synchronizedBuffer) waitForSubstring(t *testing.T, expected string) string {
+	t.Helper()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	for {
+		output := b.String()
+		if strings.Contains(output, expected) {
+			return output
+		}
+		select {
+		case <-b.updated:
+		case <-timer.C:
+			t.Fatalf("start output = %q, want substring %q", output, expected)
+		}
+	}
 }
 
 func waitForCLIStatus(t *testing.T, currentProject *project.Project, wantRunning bool) {
