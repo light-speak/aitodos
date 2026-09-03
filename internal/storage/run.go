@@ -39,6 +39,8 @@ var (
 	ErrRunWorkspaceSnapshotNotFound = errors.New("run workspace snapshot not found")
 	// ErrRunArtifactNotFound 表示 Run 没有指定类型的 Artifact。
 	ErrRunArtifactNotFound = errors.New("run artifact not found")
+	// ErrRunClosureNotFound 表示 Run 尚未形成结构化收口报告。
+	ErrRunClosureNotFound = errors.New("run closure not found")
 )
 
 // RunFinish 描述 Runner 提交的终态和结构化失败。
@@ -56,6 +58,7 @@ type FinalizationIntent struct {
 	Finish        RunFinish
 	Clarification *clarification.Request
 	Planning      *plan.PlanningResult
+	Closure       *domainrun.Closure
 	TaskReply     string
 }
 
@@ -151,6 +154,16 @@ WHERE id = ? AND status IN ('STARTING', 'RUNNING', 'FINALIZING') AND lease_gener
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
 	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, current.Status, domainrun.StatusNeedsInput, ""); err != nil {
+		return domainrun.Run{}, clarification.Clarification{}, err
+	}
+	closure, err := resolveRunClosure(current, RunFinish{Status: domainrun.StatusNeedsInput, ExitCode: 0}, &request, nil, nil, "", now)
+	if err != nil {
+		return domainrun.Run{}, clarification.Clarification{}, err
+	}
+	if err := insertRunClosure(ctx, transaction, closure); err != nil {
+		return domainrun.Run{}, clarification.Clarification{}, err
+	}
+	if err := createRunSummary(ctx, transaction, string(domainrun.StatusNeedsInput), runID, string(current.Purpose), closureProjectionSummary(closure), now); err != nil {
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
 	current.Status = domainrun.StatusNeedsInput
@@ -1070,11 +1083,11 @@ func (store *RunStore) BeginFinalization(
 	_, err = transaction.ExecContext(ctx, `
 INSERT INTO run_finalization_intents(
     run_id, terminal_status, exit_code, failure_kind, failure_code,
-    failure_message, failure_retryable, clarification_json, planning_result_json, task_reply, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    failure_message, failure_retryable, clarification_json, planning_result_json, closure_json, task_reply, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		runID, intent.Finish.Status, intent.Finish.ExitCode, intent.Finish.FailureKind,
 		intent.Finish.FailureCode, intent.Finish.FailureMessage, nullableBool(intent.Finish.FailureRetryable),
-		payload.ClarificationJSON, payload.PlanningJSON, payload.TaskReply, formatTime(now))
+		payload.ClarificationJSON, payload.PlanningJSON, payload.ClosureJSON, payload.TaskReply, formatTime(now))
 	if err != nil {
 		return domainrun.Run{}, fmt.Errorf("record finalization intent: %w", err)
 	}
@@ -1135,7 +1148,7 @@ func (store *RunStore) completeFinalization(
 	} else if _, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration); err != nil {
 		return domainrun.Run{}, err
 	}
-	intent, request, planning, taskReply, completedAt, err := loadFinalizationIntent(ctx, transaction, runID)
+	intent, request, planning, closure, taskReply, completedAt, err := loadFinalizationIntent(ctx, transaction, runID)
 	if err != nil {
 		return domainrun.Run{}, err
 	}
@@ -1188,7 +1201,14 @@ WHERE id = ? AND status = 'FINALIZING' AND lease_generation = ?`,
 	if _, err := appendRunStatusEvent(ctx, transaction, runID, domainrun.StatusFinalizing, intent.Status, intent.FailureCode); err != nil {
 		return domainrun.Run{}, err
 	}
-	if err := createRunSummary(ctx, transaction, string(intent.Status), runID, string(current.Purpose), now); err != nil {
+	resolvedClosure, err := resolveRunClosure(current, intent, request, planning, closure, taskReply, now)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := insertRunClosure(ctx, transaction, resolvedClosure); err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := createRunSummary(ctx, transaction, string(intent.Status), runID, string(current.Purpose), closureProjectionSummary(resolvedClosure), now); err != nil {
 		return domainrun.Run{}, err
 	}
 	if _, err := transaction.ExecContext(ctx, `UPDATE run_finalization_intents SET completed_at = ? WHERE run_id = ? AND completed_at IS NULL`, formatTime(now), runID); err != nil {
@@ -1206,6 +1226,7 @@ WHERE id = ? AND status = 'FINALIZING' AND lease_generation = ?`,
 type finalizationPayload struct {
 	ClarificationJSON any
 	PlanningJSON      any
+	ClosureJSON       any
 	TaskReply         any
 }
 
@@ -1249,6 +1270,17 @@ func validateFinalizationIntent(intent FinalizationIntent) (finalizationPayload,
 		}
 		payload.PlanningJSON = string(encoded)
 	}
+	if intent.Closure != nil {
+		normalized := intent.Closure.Normalized()
+		if err := normalized.Validate(); err != nil {
+			return finalizationPayload{}, err
+		}
+		encoded, err := json.Marshal(normalized)
+		if err != nil {
+			return finalizationPayload{}, err
+		}
+		payload.ClosureJSON = string(encoded)
+	}
 	return payload, nil
 }
 
@@ -1257,7 +1289,7 @@ func validateFinalizationSubject(current domainrun.Run, intent FinalizationInten
 		if intent.Finish.Status == domainrun.StatusSucceeded && intent.Planning == nil {
 			return errors.New("successful planning finalization requires planning result")
 		}
-		if strings.TrimSpace(intent.TaskReply) != "" {
+		if strings.TrimSpace(intent.TaskReply) != "" || intent.Closure != nil {
 			return errors.New("planning run cannot write task reply")
 		}
 		return nil
@@ -1266,7 +1298,7 @@ func validateFinalizationSubject(current domainrun.Run, intent FinalizationInten
 		if intent.Finish.Status == domainrun.StatusSucceeded && strings.TrimSpace(intent.TaskReply) == "" {
 			return errors.New("successful review finalization requires task reply")
 		}
-		if intent.Clarification != nil || intent.Planning != nil {
+		if intent.Clarification != nil || intent.Planning != nil || intent.Closure != nil {
 			return errors.New("review run can only write task reply")
 		}
 		return nil
@@ -1277,6 +1309,16 @@ func validateFinalizationSubject(current domainrun.Run, intent FinalizationInten
 	if strings.TrimSpace(intent.TaskReply) != "" {
 		return errors.New("non-review run cannot write task reply")
 	}
+	if current.Purpose == domainrun.PurposeImplementation || current.Purpose == domainrun.PurposeRevision {
+		if intent.Finish.Status == domainrun.StatusSucceeded && intent.Closure == nil {
+			return errors.New("successful task finalization requires closure")
+		}
+		if intent.Closure != nil && domainrun.StatusForClosure(*intent.Closure) != intent.Finish.Status {
+			return errors.New("task closure stop_reason conflicts with terminal status")
+		}
+	} else if intent.Closure != nil {
+		return errors.New("only implementation and revision runs can provide closure")
+	}
 	return nil
 }
 
@@ -1284,35 +1326,191 @@ func loadFinalizationIntent(
 	ctx context.Context,
 	transaction *sql.Tx,
 	runID string,
-) (RunFinish, *clarification.Request, *plan.PlanningResult, string, string, error) {
+) (RunFinish, *clarification.Request, *plan.PlanningResult, *domainrun.Closure, string, string, error) {
 	var finish RunFinish
 	var retryable sql.NullBool
-	var clarificationJSON, planningJSON, taskReply, completedAt sql.NullString
+	var clarificationJSON, planningJSON, closureJSON, taskReply, completedAt sql.NullString
 	err := transaction.QueryRowContext(ctx, `
 SELECT terminal_status, exit_code, failure_kind, failure_code, failure_message,
-       failure_retryable, clarification_json, planning_result_json, task_reply, completed_at
+       failure_retryable, clarification_json, planning_result_json, closure_json, task_reply, completed_at
 FROM run_finalization_intents WHERE run_id = ?`, runID).Scan(
 		&finish.Status, &finish.ExitCode, &finish.FailureKind, &finish.FailureCode,
-		&finish.FailureMessage, &retryable, &clarificationJSON, &planningJSON, &taskReply, &completedAt)
+		&finish.FailureMessage, &retryable, &clarificationJSON, &planningJSON, &closureJSON, &taskReply, &completedAt)
 	if err != nil {
-		return RunFinish{}, nil, nil, "", "", err
+		return RunFinish{}, nil, nil, nil, "", "", err
 	}
 	finish.FailureRetryable = optionalBool(retryable)
 	var request *clarification.Request
 	if clarificationJSON.Valid {
 		request = &clarification.Request{}
 		if err := json.Unmarshal([]byte(clarificationJSON.String), request); err != nil {
-			return RunFinish{}, nil, nil, "", "", err
+			return RunFinish{}, nil, nil, nil, "", "", err
 		}
 	}
 	var planning *plan.PlanningResult
 	if planningJSON.Valid {
 		planning = &plan.PlanningResult{}
 		if err := json.Unmarshal([]byte(planningJSON.String), planning); err != nil {
-			return RunFinish{}, nil, nil, "", "", err
+			return RunFinish{}, nil, nil, nil, "", "", err
 		}
 	}
-	return finish, request, planning, taskReply.String, completedAt.String, nil
+	var closure *domainrun.Closure
+	if closureJSON.Valid {
+		closure = &domainrun.Closure{}
+		if err := json.Unmarshal([]byte(closureJSON.String), closure); err != nil {
+			return RunFinish{}, nil, nil, nil, "", "", err
+		}
+	}
+	return finish, request, planning, closure, taskReply.String, completedAt.String, nil
+}
+
+func resolveRunClosure(
+	current domainrun.Run,
+	finish RunFinish,
+	request *clarification.Request,
+	planning *plan.PlanningResult,
+	explicit *domainrun.Closure,
+	taskReply string,
+	createdAt time.Time,
+) (domainrun.Closure, error) {
+	closure := derivedRunClosure(current.Purpose, finish, request, planning, taskReply)
+	if explicit != nil {
+		closure = explicit.Normalized()
+	}
+	closure.RunID = current.ID
+	closure.CreatedAt = createdAt
+	closure = closure.Normalized()
+	if err := closure.Validate(); err != nil {
+		return domainrun.Closure{}, fmt.Errorf("validate run closure: %w", err)
+	}
+	return closure, nil
+}
+
+func derivedRunClosure(
+	purpose domainrun.Purpose,
+	finish RunFinish,
+	request *clarification.Request,
+	planning *plan.PlanningResult,
+	taskReply string,
+) domainrun.Closure {
+	if finish.Status == domainrun.StatusNeedsInput && request != nil {
+		return domainrun.Closure{StopReason: domainrun.StopReasonNeedsInput, Summary: request.Question,
+			Unverified: []string{request.Question}, NextAction: "等待人工回答后继续同一职责"}
+	}
+	if finish.Status == domainrun.StatusSucceeded {
+		return successfulRunClosure(purpose, planning, taskReply)
+	}
+	reason := domainrun.StopReasonProcessFailed
+	switch finish.Status {
+	case domainrun.StatusCancelled:
+		reason = domainrun.StopReasonCancelled
+	case domainrun.StatusTimedOut:
+		reason = domainrun.StopReasonTimedOut
+	case domainrun.StatusLost:
+		reason = domainrun.StopReasonLost
+	}
+	summary := strings.TrimSpace(finish.FailureMessage)
+	if summary == "" {
+		summary = string(purpose) + " Run 未完成，状态为 " + string(finish.Status)
+	}
+	return domainrun.Closure{StopReason: reason, Summary: summary,
+		Unverified: []string{"当前 Run 未证明完成"}, NextAction: "检查失败原因后决定重试、修订或人工处理"}
+}
+
+func successfulRunClosure(purpose domainrun.Purpose, planning *plan.PlanningResult, taskReply string) domainrun.Closure {
+	if purpose == domainrun.PurposePlanning && planning != nil {
+		if planning.Plan == nil {
+			return domainrun.Closure{StopReason: domainrun.StopReasonDiscussionRequired, Summary: planning.Reply,
+				Completed: []string{"完成本轮需求分析"}, Unverified: append([]string(nil), planning.Readiness.OpenQuestions...),
+				NextAction: "继续 Topic 讨论并解决未决问题"}
+		}
+		return domainrun.Closure{StopReason: domainrun.StopReasonGoalReached, Summary: planning.Reply,
+			Completed: []string{"形成可审核的 Plan Revision"}, NextAction: "等待人工审核 Plan"}
+	}
+	if purpose == domainrun.PurposeReview {
+		return domainrun.Closure{StopReason: domainrun.StopReasonGoalReached, Summary: strings.TrimSpace(taskReply),
+			Completed: []string{"完成当前 Task 的只读分析与回复"}}
+	}
+	return domainrun.Closure{StopReason: domainrun.StopReasonGoalReached,
+		Summary: string(purpose) + " Run 已完成", Completed: []string{"完成当前 Run 的结构化职责"}}
+}
+
+func insertRunClosure(ctx context.Context, transaction *sql.Tx, closure domainrun.Closure) error {
+	completed, _ := json.Marshal(closure.Completed)
+	verified, _ := json.Marshal(closure.Verified)
+	unverified, _ := json.Marshal(closure.Unverified)
+	risks, _ := json.Marshal(closure.RemainingRisks)
+	_, err := transaction.ExecContext(ctx, `INSERT INTO run_closures(
+run_id, stop_reason, summary, completed_json, verified_json, unverified_json,
+remaining_risks_json, next_action, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, closure.RunID, closure.StopReason, closure.Summary,
+		string(completed), string(verified), string(unverified), string(risks), closure.NextAction, formatTime(closure.CreatedAt))
+	if err != nil {
+		return fmt.Errorf("insert run closure: %w", err)
+	}
+	return nil
+}
+
+func closureProjectionSummary(closure domainrun.Closure) string {
+	parts := []string{closure.Summary}
+	appendClosureSection := func(label string, values []string) {
+		if len(values) > 0 {
+			parts = append(parts, label+"："+strings.Join(values, "；"))
+		}
+	}
+	appendClosureSection("已完成", closure.Completed)
+	claims := make([]string, 0, len(closure.Verified))
+	for _, item := range closure.Verified {
+		claims = append(claims, item.Claim)
+	}
+	appendClosureSection("已验证", claims)
+	appendClosureSection("未验证", closure.Unverified)
+	appendClosureSection("剩余风险", closure.RemainingRisks)
+	if closure.NextAction != "" {
+		parts = append(parts, "下一步："+closure.NextAction)
+	}
+	return truncateRunes(strings.Join(parts, "\n"), 4000)
+}
+
+// GetClosure 返回 Run Finalization 保存的不可变收口报告。
+func (store *RunStore) GetClosure(ctx context.Context, runID string) (domainrun.Closure, error) {
+	var closure domainrun.Closure
+	var completed, verified, unverified, risks, createdAt string
+	err := store.database.QueryRowContext(ctx, `SELECT run_id, stop_reason, summary, completed_json,
+verified_json, unverified_json, remaining_risks_json, next_action, created_at
+FROM run_closures WHERE run_id = ?`, runID).Scan(&closure.RunID, &closure.StopReason, &closure.Summary,
+		&completed, &verified, &unverified, &risks, &closure.NextAction, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return domainrun.Closure{}, ErrRunClosureNotFound
+	}
+	if err != nil {
+		return domainrun.Closure{}, fmt.Errorf("get run closure: %w", err)
+	}
+	if err := decodeRunClosure(&closure, completed, verified, unverified, risks, createdAt); err != nil {
+		return domainrun.Closure{}, err
+	}
+	return closure, nil
+}
+
+func decodeRunClosure(closure *domainrun.Closure, completed, verified, unverified, risks, createdAt string) error {
+	if err := json.Unmarshal([]byte(completed), &closure.Completed); err != nil {
+		return fmt.Errorf("decode run closure completed: %w", err)
+	}
+	if err := json.Unmarshal([]byte(verified), &closure.Verified); err != nil {
+		return fmt.Errorf("decode run closure verified: %w", err)
+	}
+	if err := json.Unmarshal([]byte(unverified), &closure.Unverified); err != nil {
+		return fmt.Errorf("decode run closure unverified: %w", err)
+	}
+	if err := json.Unmarshal([]byte(risks), &closure.RemainingRisks); err != nil {
+		return fmt.Errorf("decode run closure risks: %w", err)
+	}
+	parsed, err := parseTime(createdAt)
+	if err != nil {
+		return fmt.Errorf("parse run closure time: %w", err)
+	}
+	closure.CreatedAt = parsed
+	return nil
 }
 
 func applyPlanningResult(
@@ -1359,6 +1557,7 @@ func applyPlanningResult(
 	if err != nil {
 		return err
 	}
+	revision.Readiness = result.Readiness
 	if creating {
 		currentPlan.CurrentRevisionID = revision.ID
 		if err := insertPlan(ctx, transaction, currentPlan); err != nil {
@@ -1427,6 +1626,16 @@ WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING') AND 
 		return domainrun.Run{}, err
 	}
 	if _, err := appendRunStatusEvent(ctx, transaction, current.ID, current.Status, finish.Status, finish.FailureCode); err != nil {
+		return domainrun.Run{}, err
+	}
+	closure, err := resolveRunClosure(current, finish, nil, nil, nil, "", now)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := insertRunClosure(ctx, transaction, closure); err != nil {
+		return domainrun.Run{}, err
+	}
+	if err := createRunSummary(ctx, transaction, string(finish.Status), runID, string(current.Purpose), closureProjectionSummary(closure), now); err != nil {
 		return domainrun.Run{}, err
 	}
 	current.Status = finish.Status

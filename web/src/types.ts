@@ -181,10 +181,24 @@ export interface PlanRevision {
 	summary: string
 	rationale: string
 	risks: string
+	readiness?: PlanningReadiness
 	source_run_id?: string
 	previous_revision_id?: string
 	drafts: PlanTaskDraft[]
 	created_at: string
+}
+
+export interface PlanningAlternative {
+	title: string
+	tradeoff: string
+}
+
+export interface PlanningReadiness {
+	status: 'NEEDS_DISCUSSION' | 'READY_FOR_REVIEW'
+	confidence: number
+	assumptions: string[]
+	open_questions: string[]
+	alternatives: PlanningAlternative[]
 }
 
 export interface Plan {
@@ -561,8 +575,30 @@ export interface RunWorkspaceSnapshot {
 export interface RunDetail {
 	run: AgentRun
 	usage?: RunUsage
+	closure?: RunClosure
 	artifacts: RunArtifact[]
 	workspace_snapshot?: RunWorkspaceSnapshot
+}
+
+export type RunStopReason = 'GOAL_REACHED' | 'DISCUSSION_REQUIRED' | 'NEEDS_INPUT' |
+	'ENVIRONMENT_BLOCKED' | 'POLICY_BLOCKED' | 'LIMIT_REACHED' | 'PROCESS_FAILED' |
+	'CANCELLED' | 'TIMED_OUT' | 'LOST'
+
+export interface RunVerification {
+	claim: string
+	evidence: string
+}
+
+export interface RunClosure {
+	run_id: string
+	stop_reason: RunStopReason
+	summary: string
+	completed: string[]
+	verified: RunVerification[]
+	unverified: string[]
+	remaining_risks: string[]
+	next_action: string
+	created_at: string
 }
 
 export interface RunLog {

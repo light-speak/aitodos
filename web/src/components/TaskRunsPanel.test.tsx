@@ -71,7 +71,14 @@ describe('TaskRunsPanel SSE', () => {
 		const fetchMock = vi.fn<typeof fetch>((input, init) => {
 			const path = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
 			if (path === '/api/tasks/task-1/runs') return Promise.resolve(Response.json([run]))
-			if (path === '/api/runs/run-memory') return Promise.resolve(Response.json({ run, artifacts: [] }))
+			if (path === '/api/runs/run-memory') return Promise.resolve(Response.json({
+				run, artifacts: [], closure: {
+					run_id: run.id, stop_reason: 'GOAL_REACHED', summary: '实现完成并通过自动测试',
+					completed: ['实现状态机'], verified: [{ claim: '状态迁移正确', evidence: 'go test ./internal/domain/task' }],
+					unverified: ['真实仓库集成'], remaining_risks: ['大仓库性能'], next_action: '人工审核',
+					created_at: '2026-08-21T00:00:04Z',
+				},
+			}))
 			if (path.endsWith('/summary')) return Promise.resolve(Response.json({ code: 'RUN_SUMMARY_NOT_FOUND', message: 'missing' }, { status: 404 }))
 			if (path.endsWith('/mcp-calls') || path.endsWith('/resources')) return Promise.resolve(Response.json([]))
 			if (path.endsWith('/experiences')) return Promise.resolve(Response.json([{
@@ -90,6 +97,8 @@ describe('TaskRunsPanel SSE', () => {
 		vi.stubGlobal('fetch', fetchMock)
 		render(<TaskRunsPanel task={{ ...taskFixture, status: 'REVIEW' }} onTaskUpdated={vi.fn()} />)
 		await userEvent.click(await screen.findByRole('button', { name: '查看 Run run-memory' }))
+		expect(await screen.findByText('实现完成并通过自动测试')).toBeInTheDocument()
+		expect(screen.getByText('真实仓库集成')).toBeInTheDocument()
 		expect(await screen.findByText('先跑状态机测试')).toBeInTheDocument()
 		await userEvent.click(screen.getByRole('button', { name: '有帮助' }))
 		await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/experience-recalls/recall-1/outcome', expect.objectContaining({ method: 'POST' })))

@@ -176,11 +176,8 @@ func TestCodexArgumentInjectionAndAppServerFailure(t *testing.T) {
 
 func TestPersistAppServerFinalResultRequiresStructuredRoles(t *testing.T) {
 	workspace := t.TempDir()
-	if err := persistAppServerFinalResult(run.PurposeImplementation, workspace, "plain text"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(filepath.Join(workspace, resultFileName)); !os.IsNotExist(err) {
-		t.Fatalf("implementation plain text created result file: %v", err)
+	if err := persistAppServerFinalResult(run.PurposeImplementation, workspace, "plain text"); err == nil {
+		t.Fatal("implementation accepted non-JSON final result")
 	}
 	if err := persistAppServerFinalResult(run.PurposeTriage, workspace, "plain text"); err == nil {
 		t.Fatal("triage accepted non-JSON final result")
@@ -245,7 +242,7 @@ func TestRunnerFakeCodexAppServer(t *testing.T) {
 			if string(message.ID) != `"approval-1"` || !strings.Contains(string(message.Result), `"decision":"accept"`) {
 				t.Fatalf("approval response = %s", scanner.Bytes())
 			}
-			result := `{"estimate":{"points":1,"remaining_points":0,"confidence":1,"rationale":"完成"},"new_test_cases":[{"title":"工作区状态检查","description":"命令可以执行","required":true,"outcome":"PASSED","summary":"命令退出码为零","command":"git status --short"}],"experience_candidates":[{"title":"先检查工作区状态","summary":"修改前确认工作区状态","guidance":"运行 git status --short 并检查输出","applicability":"开始修改 Git 工作区前","project_wide":true}]}`
+			result := `{"closure":{"stop_reason":"GOAL_REACHED","summary":"命令检查与任务实现完成","completed":["检查工作区状态"],"verified":[{"claim":"工作区命令执行成功","evidence":"git status --short 退出码为 0"}],"unverified":[],"remaining_risks":[],"next_action":"进入人工审核"},"estimate":{"points":1,"remaining_points":0,"confidence":1,"rationale":"完成"},"new_test_cases":[{"title":"工作区状态检查","description":"命令可以执行","required":true,"outcome":"PASSED","summary":"命令退出码为零","command":"git status --short"}],"experience_candidates":[{"title":"先检查工作区状态","summary":"修改前确认工作区状态","guidance":"运行 git status --short 并检查输出","applicability":"开始修改 Git 工作区前","project_wide":true}]}`
 			if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 				t.Fatal(err)
 			}

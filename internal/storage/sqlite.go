@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 44
+const currentSchemaVersion = 45
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -1487,6 +1487,27 @@ ON experience_records(source_run_id, candidate_fingerprint)
 WHERE source_run_id IS NOT NULL AND candidate_fingerprint != '';`, true
 	case 44:
 		return retrievalEvalMigrationV44, true
+	case 45:
+		return `ALTER TABLE plan_revisions ADD COLUMN readiness_json TEXT
+    CHECK (readiness_json IS NULL OR json_valid(readiness_json));
+ALTER TABLE run_finalization_intents ADD COLUMN closure_json TEXT
+    CHECK (closure_json IS NULL OR json_valid(closure_json));
+
+CREATE TABLE run_closures (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    stop_reason TEXT NOT NULL CHECK (stop_reason IN (
+        'GOAL_REACHED', 'DISCUSSION_REQUIRED', 'NEEDS_INPUT',
+        'ENVIRONMENT_BLOCKED', 'POLICY_BLOCKED', 'LIMIT_REACHED',
+        'PROCESS_FAILED', 'CANCELLED', 'TIMED_OUT', 'LOST'
+    )),
+    summary TEXT NOT NULL CHECK (length(trim(summary)) BETWEEN 1 AND 4000),
+    completed_json TEXT NOT NULL CHECK (json_valid(completed_json)),
+    verified_json TEXT NOT NULL CHECK (json_valid(verified_json)),
+    unverified_json TEXT NOT NULL CHECK (json_valid(unverified_json)),
+    remaining_risks_json TEXT NOT NULL CHECK (json_valid(remaining_risks_json)),
+    next_action TEXT NOT NULL CHECK (length(next_action) <= 2000),
+    created_at TEXT NOT NULL
+);`, true
 	default:
 		return "", false
 	}

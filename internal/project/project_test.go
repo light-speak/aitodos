@@ -279,7 +279,7 @@ func assertDatabaseInitialized(t *testing.T, databasePath string, instanceID str
 	if err := database.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 44 {
-		t.Fatalf("schema version = %d, want 44", version)
+	if version != 45 {
+		t.Fatalf("schema version = %d, want 45", version)
 	}
 }

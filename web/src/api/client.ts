@@ -55,6 +55,7 @@ import type {
 	RunLog,
 	RunUsage,
 	RunWorkspaceSnapshot,
+	RunClosure,
 	RunPage,
 	RunQueryInput,
 	ApprovalRequest,
@@ -802,8 +803,34 @@ function parseRunDetail(value: unknown): RunDetail {
 		run: parseAgentRun(value.run),
 		artifacts: value.artifacts.map(parseRunArtifact),
 		...(isRecord(value.usage) ? { usage: parseRunUsage(value.usage) } : {}),
+		...(isRecord(value.closure) ? { closure: parseRunClosure(value.closure) } : {}),
 		...(isRecord(value.workspace_snapshot) ? { workspace_snapshot: parseRunWorkspaceSnapshot(value.workspace_snapshot) } : {}),
 	}
+}
+
+function parseRunClosure(value: Record<string, unknown>): RunClosure {
+	if (!hasStringFields(value, ['run_id', 'stop_reason', 'summary', 'next_action', 'created_at']) ||
+		!isRunStopReason(value.stop_reason) || !isStringArray(value.completed) || !isStringArray(value.unverified) ||
+		!isStringArray(value.remaining_risks) || !Array.isArray(value.verified)) {
+		throw new ApiError('Run 收口报告格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const verified = value.verified.map((item) => {
+		if (!isRecord(item) || !hasStringFields(item, ['claim', 'evidence'])) {
+			throw new ApiError('Run 验证证据格式无效', 502, 'INVALID_RESPONSE')
+		}
+		return { claim: item.claim as string, evidence: item.evidence as string }
+	})
+	return {
+		run_id: value.run_id as string, stop_reason: value.stop_reason, summary: value.summary as string,
+		completed: value.completed, verified, unverified: value.unverified,
+		remaining_risks: value.remaining_risks, next_action: value.next_action as string, created_at: value.created_at as string,
+	}
+}
+
+function isRunStopReason(value: unknown): value is RunClosure['stop_reason'] {
+	return typeof value === 'string' && ['GOAL_REACHED', 'DISCUSSION_REQUIRED', 'NEEDS_INPUT',
+		'ENVIRONMENT_BLOCKED', 'POLICY_BLOCKED', 'LIMIT_REACHED', 'PROCESS_FAILED',
+		'CANCELLED', 'TIMED_OUT', 'LOST'].includes(value)
 }
 
 function parseRunArtifact(value: unknown): RunArtifact {
@@ -1292,6 +1319,7 @@ function parsePlanView(value: unknown): PlanView {
 			id: revision.id as string, plan_id: revision.plan_id as string, revision: revision.revision,
 			summary: revision.summary as string, rationale: revision.rationale as string, risks: revision.risks as string,
 			drafts: revision.drafts.map(parsePlanTaskDraft), created_at: revision.created_at as string,
+			...(isRecord(revision.readiness) ? { readiness: parsePlanningReadiness(revision.readiness) } : {}),
 			...(typeof revision.source_run_id === 'string' ? { source_run_id: revision.source_run_id } : {}),
 			...(typeof revision.previous_revision_id === 'string' ? { previous_revision_id: revision.previous_revision_id } : {}),
 		},
@@ -1306,6 +1334,23 @@ function parsePlanView(value: unknown): PlanView {
 				comment: review.comment as string, created_at: review.created_at as string,
 			}
 		}),
+	}
+}
+
+function parsePlanningReadiness(value: Record<string, unknown>): PlanView['revision']['readiness'] {
+	if ((value.status !== 'NEEDS_DISCUSSION' && value.status !== 'READY_FOR_REVIEW') || typeof value.confidence !== 'number' ||
+		!isStringArray(value.assumptions) || !isStringArray(value.open_questions) || !Array.isArray(value.alternatives)) {
+		throw new ApiError('Plan 充分度格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const alternatives = value.alternatives.map((item) => {
+		if (!isRecord(item) || !hasStringFields(item, ['title', 'tradeoff'])) {
+			throw new ApiError('Plan 替代方案格式无效', 502, 'INVALID_RESPONSE')
+		}
+		return { title: item.title as string, tradeoff: item.tradeoff as string }
+	})
+	return {
+		status: value.status, confidence: value.confidence, assumptions: value.assumptions,
+		open_questions: value.open_questions, alternatives,
 	}
 }
 

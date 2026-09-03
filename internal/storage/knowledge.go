@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/light-speak/aitodos/internal/domain/knowledge"
 )
@@ -225,7 +226,7 @@ func (store *KnowledgeStore) UpsertRunSummary(ctx context.Context, summary knowl
 func upsertRunSummary(ctx context.Context, executor sqlExecutor, summary knowledge.RunSummary) error {
 	summary.Status = strings.TrimSpace(summary.Status)
 	summary.Summary = strings.TrimSpace(summary.Summary)
-	if summary.RunID == "" || summary.Status == "" || summary.Summary == "" || len(summary.Summary) > 4000 || summary.PassedTests < 0 || summary.FailedTests < 0 {
+	if summary.RunID == "" || summary.Status == "" || summary.Summary == "" || utf8.RuneCountInString(summary.Summary) > 4000 || summary.PassedTests < 0 || summary.FailedTests < 0 {
 		return errors.New("run summary is invalid")
 	}
 	if summary.CreatedAt.IsZero() {
@@ -243,7 +244,7 @@ passed_tests = excluded.passed_tests, failed_tests = excluded.failed_tests, crea
 	return nil
 }
 
-func createRunSummary(ctx context.Context, transaction *sql.Tx, currentStatus, runID, purpose string, createdAt time.Time) error {
+func createRunSummary(ctx context.Context, transaction *sql.Tx, currentStatus, runID, purpose, closureSummary string, createdAt time.Time) error {
 	var passed, failed int
 	if err := transaction.QueryRowContext(ctx, `SELECT
 COALESCE(SUM(CASE WHEN outcome = 'PASSED' THEN 1 ELSE 0 END), 0),
@@ -251,7 +252,10 @@ COALESCE(SUM(CASE WHEN outcome IN ('FAILED', 'BLOCKED') THEN 1 ELSE 0 END), 0)
 FROM task_test_results WHERE source_run_id = ?`, runID).Scan(&passed, &failed); err != nil {
 		return fmt.Errorf("summarize run tests: %w", err)
 	}
-	summary := purpose + " Run 已完成，状态为 " + currentStatus
+	summary := strings.TrimSpace(closureSummary)
+	if summary == "" {
+		summary = purpose + " Run 已完成，状态为 " + currentStatus
+	}
 	if passed > 0 || failed > 0 {
 		summary += fmt.Sprintf("；本次记录测试通过 %d 项、失败或阻塞 %d 项", passed, failed)
 	}

@@ -47,7 +47,8 @@ func TestRunStoreClaimsTopicPlanningOncePerVersionAndFinalizesDraft(t *testing.T
 		t.Fatal(err)
 	}
 	planning := plan.PlanningResult{
-		Reply: "需求已经足够明确，我整理了一版可审核方案。",
+		Reply:     "需求已经足够明确，我整理了一版可审核方案。",
+		Readiness: &plan.ReadinessAssessment{Status: plan.ReadinessReadyForReview, Confidence: 0.9},
 		Plan: &plan.RevisionInput{
 			Summary: "实现最小社区发帖闭环",
 			Drafts: []plan.TaskDraftInput{{
@@ -70,7 +71,8 @@ func TestRunStoreClaimsTopicPlanningOncePerVersionAndFinalizesDraft(t *testing.T
 		t.Fatalf("run summary = %#v, %v", summary, err)
 	}
 	view, err := NewPlanStore(database).GetByTopic(ctx, created.ID)
-	if err != nil || view.Revision.SourceRunID != claim.Run.ID || view.Revision.Summary != planning.Plan.Summary {
+	if err != nil || view.Revision.SourceRunID != claim.Run.ID || view.Revision.Summary != planning.Plan.Summary ||
+		view.Revision.Readiness == nil || view.Revision.Readiness.Status != plan.ReadinessReadyForReview {
 		t.Fatalf("generated plan = %#v, %v", view, err)
 	}
 	messages, err := NewDiscussionStore(database).ListTopicMessages(ctx, created.ID)
@@ -105,8 +107,10 @@ func TestRunStoreQueuesLatestTopicVersionAfterActivePlanningFinishes(t *testing.
 		t.Fatal(err)
 	}
 	if _, err := store.BeginFinalization(ctx, first.Run.ID, first.ClaimToken, first.Run.LeaseGeneration, FinalizationIntent{
-		Finish:   RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
-		Planning: &plan.PlanningResult{Reply: "收到，我会结合新约束继续分析。"},
+		Finish: RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+		Planning: &plan.PlanningResult{Reply: "收到，我会结合新约束继续分析。", Readiness: &plan.ReadinessAssessment{
+			Status: plan.ReadinessNeedsDiscussion, Confidence: 0.8, OpenQuestions: []string{"新约束如何影响方案"},
+		}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -433,6 +437,8 @@ func TestRunStoreRenewsLeaseAndRecoversFrozenFinalization(t *testing.T) {
 	}
 	if _, err := store.BeginFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, FinalizationIntent{
 		Finish: RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+		Closure: &run.Closure{StopReason: run.StopReasonGoalReached, Summary: "实现完成",
+			Completed: []string{"完成恢复测试实现"}, Unverified: []string{"未验证真实仓库"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -447,6 +453,14 @@ func TestRunStoreRenewsLeaseAndRecoversFrozenFinalization(t *testing.T) {
 	updated, err := NewTaskStore(database).Get(ctx, created.ID)
 	if err != nil || updated.Status != task.StatusReview {
 		t.Fatalf("task = %#v, %v", updated, err)
+	}
+	closure, err := store.GetClosure(ctx, claim.Run.ID)
+	if err != nil || closure.StopReason != run.StopReasonGoalReached || closure.Summary != "实现完成" {
+		t.Fatalf("closure = %#v, %v", closure, err)
+	}
+	summary, err := NewKnowledgeStore(database).GetRunSummary(ctx, claim.Run.ID)
+	if err != nil || !strings.Contains(summary.Summary, "未验证真实仓库") {
+		t.Fatalf("searchable run summary = %#v, %v", summary, err)
 	}
 }
 

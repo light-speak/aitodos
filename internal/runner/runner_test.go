@@ -90,6 +90,8 @@ func TestRecoverFinalizationReplaysWorkspaceAndTerminalState(t *testing.T) {
 	}
 	if _, err := runs.BeginFinalization(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, storage.FinalizationIntent{
 		Finish: storage.RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+		Closure: &run.Closure{StopReason: run.StopReasonGoalReached, Summary: "恢复前已完成",
+			Completed: []string{"完成 Workspace 修改"}},
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -298,7 +300,8 @@ func TestInvocationArgsInjectsCodexResumeBeforePrompt(t *testing.T) {
 		revision, run.PurposeImplementation, "/runtime/run-2", "run-2", "/artifacts/prompt.md",
 		"019c8b9f-c6d5-7020-a5ed-e3a92c861e5d",
 	)
-	if usesPromptFile || strings.Join(args, " ") != "exec --json --model gpt-5.3-codex --sandbox workspace-write resume 019c8b9f-c6d5-7020-a5ed-e3a92c861e5d -" {
+	want := "exec --json --model gpt-5.3-codex --sandbox workspace-write --output-last-message /runtime/run-2/.ats-run-result.json resume 019c8b9f-c6d5-7020-a5ed-e3a92c861e5d -"
+	if usesPromptFile || strings.Join(args, " ") != want {
 		t.Fatalf("invocation args = %#v", args)
 	}
 }
@@ -325,10 +328,28 @@ func TestInvocationArgsAddsManagedReviewResultForLegacyCodexProfile(t *testing.T
 	}
 }
 
+func TestInvocationArgsAddsManagedClosureResultForLegacyCodexProfile(t *testing.T) {
+	revision := agentprofile.Revision{
+		Adapter: "codex", Args: []string{"exec", "--json", "--sandbox", "workspace-write", "-"},
+	}
+	args, _ := invocationArgs(revision, run.PurposeImplementation, "/runtime/run-implementation", "run-implementation", "/artifacts/prompt.md", "")
+	want := "exec --json --sandbox workspace-write --output-last-message /runtime/run-implementation/.ats-run-result.json -"
+	if strings.Join(args, " ") != want {
+		t.Fatalf("invocation args = %#v, want %q", args, want)
+	}
+}
+
 func TestPersistAppServerReviewRejectsUnstructuredFinalMessage(t *testing.T) {
 	err := persistAppServerFinalResult(run.PurposeReview, t.TempDir(), "普通文本回答")
 	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
 		t.Fatalf("persist review result error = %v", err)
+	}
+}
+
+func TestPersistAppServerImplementationRejectsUnstructuredFinalMessage(t *testing.T) {
+	err := persistAppServerFinalResult(run.PurposeImplementation, t.TempDir(), "普通文本回答")
+	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("persist implementation result error = %v", err)
 	}
 }
 
@@ -888,7 +909,7 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 		t.Fatal("claim token leaked to agent")
 	}
 	if os.Getenv("ATS_RUN_PURPOSE") == "PLANNING" {
-		result := `{"reply":"需求已经足够明确，我整理了一版可审核方案。","plan":{"summary":"实现最小文本社区","rationale":"先完成发布和列表闭环","risks":"暂不包含账户体系","drafts":[{"title":"实现帖子发布与列表","description":"支持发布并查看文本帖子","acceptance_criteria":"发布后帖子出现在列表中","priority":1,"test_cases":[{"title":"发布文本帖子","description":"提交后列表展示内容","required":true}]}]}}`
+		result := `{"reply":"需求已经足够明确，我整理了一版可审核方案。","readiness":{"status":"READY_FOR_REVIEW","confidence":0.9,"assumptions":["先实现纯文本帖子"],"open_questions":[],"alternatives":[{"title":"先做单体闭环","tradeoff":"范围最小且容易验证"}]},"plan":{"summary":"实现最小文本社区","rationale":"先完成发布和列表闭环","risks":"暂不包含账户体系","drafts":[{"title":"实现帖子发布与列表","description":"支持发布并查看文本帖子","acceptance_criteria":"发布后帖子出现在列表中","priority":1,"test_cases":[{"title":"发布文本帖子","description":"提交后列表展示内容","required":true}]}]}}`
 		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -937,7 +958,7 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 	if err := os.WriteFile("runner-output.txt", []byte("agent wrote this\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result := `{"estimate":{"points":5,"remaining_points":1,"confidence":0.8,"rationale":"实现已完成，剩余人工验收"},"new_test_cases":[{"title":"Runner 输出文件","description":"文件内容正确","required":true,"outcome":"PASSED","summary":"Agent 检查通过"}]}`
+	result := `{"closure":{"stop_reason":"GOAL_REACHED","summary":"实现与自动测试已经完成","completed":["写入 Runner 输出文件"],"verified":[{"claim":"输出文件内容正确","evidence":"Agent 已读取生成文件"}],"unverified":["仍需人工验收"],"remaining_risks":[],"next_action":"进入人工审核"},"estimate":{"points":5,"remaining_points":1,"confidence":0.8,"rationale":"实现已完成，剩余人工验收"},"new_test_cases":[{"title":"Runner 输出文件","description":"文件内容正确","required":true,"outcome":"PASSED","summary":"Agent 检查通过"}]}`
 	if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 		t.Fatal(err)
 	}

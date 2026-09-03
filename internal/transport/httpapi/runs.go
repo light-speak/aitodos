@@ -29,6 +29,7 @@ type runHandler struct {
 type runDetail struct {
 	Run               domainrun.Run                `json:"run"`
 	Usage             *domainrun.Usage             `json:"usage,omitempty"`
+	Closure           *domainrun.Closure           `json:"closure,omitempty"`
 	Artifacts         []domainrun.Artifact         `json:"artifacts"`
 	WorkspaceSnapshot *domainrun.WorkspaceSnapshot `json:"workspace_snapshot,omitempty"`
 }
@@ -330,6 +331,12 @@ func (handler *runHandler) detail(response http.ResponseWriter, request *http.Re
 		result.WorkspaceSnapshot = &snapshot
 	} else if !errors.Is(snapshotErr, storage.ErrRunWorkspaceSnapshotNotFound) {
 		writeRunReadError(response, snapshotErr)
+		return
+	}
+	if closure, closureErr := handler.store.GetClosure(request.Context(), current.ID); closureErr == nil {
+		result.Closure = &closure
+	} else if !errors.Is(closureErr, storage.ErrRunClosureNotFound) {
+		writeRunReadError(response, closureErr)
 		return
 	}
 	writeJSON(response, http.StatusOK, result)
