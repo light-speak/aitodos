@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
@@ -135,5 +136,40 @@ func TestAgentProfileStoreConfiguresAllUnconfiguredCodexProfilesAtomically(t *te
 	}
 	if _, err := store.ConfigureCodexDefaults(ctx, ""); err == nil {
 		t.Fatal("empty command accepted")
+	}
+}
+
+func TestAgentProfileStoreReturnsErrorsAfterDatabaseClose(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewAgentProfileStore(database)
+	if _, err := store.Get(ctx, "missing"); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing profile error = %v", err)
+	}
+	if _, err := store.GetByRole(ctx, agentprofile.Role("UNKNOWN")); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing role error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error { _, err := store.List(ctx); return err },
+		func() error { _, err := store.GetByRole(ctx, agentprofile.RolePlanner); return err },
+		func() error { _, err := store.Get(ctx, "profile"); return err },
+		func() error { _, err := store.GetRevision(ctx, "revision"); return err },
+		func() error {
+			_, err := store.CreateRevision(ctx, "profile", agentprofile.RevisionInput{
+				Instructions: "职责", Adapter: "generic", Command: "agent",
+				MaxInputTokens: 1000, ReservedOutputTokens: 100, RecentMessageLimit: 1, RetrievalLimit: 1, TimeoutSeconds: 60,
+			})
+			return err
+		},
+		func() error { _, err := store.ConfigureCodexDefaults(ctx, "codex"); return err },
+		func() error { _, err := store.ListRevisions(ctx, "profile"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
 	}
 }

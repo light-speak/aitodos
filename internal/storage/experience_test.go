@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
@@ -210,6 +211,195 @@ func TestExperienceStoreCreatesIdempotentCandidateAndConfirmsIt(t *testing.T) {
 	input.TaskID = otherTask.ID
 	if _, err := store.CreateCandidate(ctx, input); !errors.Is(err, ErrExperienceRunSubjectMismatch) {
 		t.Fatalf("run subject mismatch error = %v", err)
+	}
+}
+
+func TestExperienceStoreRejectsInvalidSubjectsAndCandidateRuns(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewExperienceStore(database)
+	createdTask, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "候选经验边界"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	createdTopic, err := NewTopicStore(database).Create(ctx, topic.CreateInput{Title: "候选主题"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	valid := experience.Input{
+		TaskID: createdTask.ID, Title: "经验", Summary: "摘要", Guidance: "做法", Applicability: "条件",
+	}
+	if _, err := store.CreateVerified(ctx, experience.Input{}); err == nil {
+		t.Fatal("CreateVerified() accepted invalid input")
+	}
+	missingTask := valid
+	missingTask.TaskID = "missing"
+	if _, err := store.CreateVerified(ctx, missingTask); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task error = %v", err)
+	}
+	missingSuperseded := valid
+	missingSuperseded.SupersedesExperienceID = "missing"
+	if _, err := store.CreateVerified(ctx, missingSuperseded); !errors.Is(err, ErrExperienceNotFound) {
+		t.Fatalf("missing superseded experience error = %v", err)
+	}
+
+	for name, mutate := range map[string]func(*experience.Input){
+		"topic": func(input *experience.Input) {
+			input.TopicID, input.TaskID, input.SourceRunID = createdTopic.ID, "", "run"
+		},
+		"no run":      func(input *experience.Input) { input.SourceRunID = "" },
+		"pinned":      func(input *experience.Input) { input.SourceRunID, input.Pinned = "run", true },
+		"supersedes":  func(input *experience.Input) { input.SourceRunID, input.SupersedesExperienceID = "run", "old" },
+		"missing run": func(input *experience.Input) { input.SourceRunID = "missing" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			input := valid
+			mutate(&input)
+			if _, err := store.CreateCandidate(ctx, input); !errors.Is(err, ErrExperienceRunSubjectMismatch) {
+				t.Fatalf("CreateCandidate() error = %v", err)
+			}
+		})
+	}
+	now := formatTime(time.Now())
+	if _, err := database.ExecContext(ctx, `INSERT INTO runs(
+id, purpose, topic_id, status, profile_revision_id, claim_token_hash, lease_generation,
+lease_expires_at, run_nonce, queued_at, claimed_at, created_at, updated_at, subject_version
+) VALUES ('run-planning-candidate', 'PLANNING', ?, 'RUNNING', 'profile-planner-r1', 'hash', 1,
+?, 'nonce', ?, ?, ?, ?, 1)`, createdTopic.ID, now, now, now, now, now); err != nil {
+		t.Fatal(err)
+	}
+	wrongPurpose := valid
+	wrongPurpose.SourceRunID = "run-planning-candidate"
+	if _, err := store.CreateCandidate(ctx, wrongPurpose); !errors.Is(err, ErrExperienceRunSubjectMismatch) {
+		t.Fatalf("wrong-purpose candidate error = %v", err)
+	}
+	if _, err := store.Get(ctx, "missing"); !errors.Is(err, ErrExperienceNotFound) {
+		t.Fatalf("missing experience error = %v", err)
+	}
+	if _, err := store.ListTopic(ctx, "missing", false); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("missing topic list error = %v", err)
+	}
+	if _, err := store.ListTask(ctx, "missing", false); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task list error = %v", err)
+	}
+	if _, err := store.ConfirmCandidate(ctx, "missing"); !errors.Is(err, ErrExperienceNotFound) {
+		t.Fatalf("missing candidate confirmation error = %v", err)
+	}
+	if _, err := store.Challenge(ctx, "missing"); !errors.Is(err, ErrExperienceNotFound) {
+		t.Fatalf("missing challenge error = %v", err)
+	}
+}
+
+func TestExperienceRecallValidatesQueryScopeLimitAndIdempotentOutcome(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	createdTask, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "召回边界"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	insertExperienceRun(t, database, createdTask.ID, "run-recall-boundary")
+	store := NewExperienceStore(database)
+	for index := 0; index < 3; index++ {
+		if _, err := store.CreateVerified(ctx, experience.Input{
+			TaskID: createdTask.ID, Title: "召回边界经验", Summary: "用于检查召回数量限制",
+			Guidance: "限制返回数量", Applicability: "召回边界", Pinned: true,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, query := range []RecallQuery{
+		{},
+		{RunID: "run", TaskID: createdTask.ID, Text: "文本", Limit: -1},
+		{RunID: "run", TaskID: createdTask.ID, Text: "文本", Limit: 11},
+		{RunID: "run", TopicID: "topic", TaskID: createdTask.ID, Text: "文本"},
+	} {
+		if _, err := store.Recall(ctx, query); err == nil {
+			t.Fatalf("Recall(%#v) unexpectedly succeeded", query)
+		}
+	}
+	recalled, err := store.Recall(ctx, RecallQuery{
+		RunID: "run-recall-boundary", Purpose: run.PurposeImplementation, TaskID: createdTask.ID,
+		Text: "召回边界经验", Limit: 1,
+	})
+	if err != nil || len(recalled) != 1 {
+		t.Fatalf("limited recall = %#v, %v", recalled, err)
+	}
+	if err := store.RecordOutcome(ctx, recalled[0].RecallID, experience.OutcomeIgnored); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RecordOutcome(ctx, recalled[0].RecallID, experience.OutcomeIgnored); err != nil {
+		t.Fatalf("idempotent outcome failed: %v", err)
+	}
+	loaded, err := store.Get(ctx, recalled[0].Experience.ID)
+	if err != nil || loaded.SuccessfulApplications != 0 || loaded.FailedApplications != 0 {
+		t.Fatalf("ignored outcome changed counters: %#v, %v", loaded, err)
+	}
+
+	topicRecord := experience.Record{TopicID: "topic"}
+	linkedRecord := experience.Record{TopicID: "linked"}
+	projectRecord := experience.Record{ProjectWide: true}
+	if recallScope(topicRecord, RecallQuery{TopicID: "topic"}) != 1 ||
+		recallScope(linkedRecord, RecallQuery{TaskID: "task"}) != 0.85 ||
+		recallScope(projectRecord, RecallQuery{TaskID: "task"}) != 0.6 {
+		t.Fatal("recallScope() returned unexpected scores")
+	}
+	query := RecallQuery{RunID: " run ", TaskID: " task ", Text: " text ", Now: time.Now().Add(time.Hour)}
+	if err := normalizeRecallQuery(&query); err != nil || query.Limit != 5 || query.RunID != "run" || query.Now.Location() != time.UTC {
+		t.Fatalf("normalized query = %#v, %v", query, err)
+	}
+	if estimateExperienceTokens("abcd中文") != 3 {
+		t.Fatalf("estimateExperienceTokens() = %d", estimateExperienceTokens("abcd中文"))
+	}
+}
+
+func TestExperienceStoreReportsCorruptRowsAndClosedDatabase(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	createdTask, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "经验损坏行"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewExperienceStore(database)
+	created, err := store.CreateVerified(ctx, experience.Input{
+		TaskID: createdTask.ID, Title: "损坏时间", Summary: "摘要", Guidance: "做法", Applicability: "条件",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE experience_records SET created_at = 'invalid' WHERE id = ?`, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Get(ctx, created.ID); err == nil {
+		t.Fatal("Get() accepted invalid timestamps")
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := NewExperienceStore(database)
+	calls := []func() error{
+		func() error {
+			_, err := closed.CreateVerified(ctx, experience.Input{TaskID: createdTask.ID, Title: "经验", Summary: "摘要", Guidance: "做法", Applicability: "条件"})
+			return err
+		},
+		func() error {
+			_, err := closed.CreateCandidate(ctx, experience.Input{TaskID: createdTask.ID, SourceRunID: "run", Title: "经验", Summary: "摘要", Guidance: "做法", Applicability: "条件"})
+			return err
+		},
+		func() error { _, err := closed.Get(ctx, created.ID); return err },
+		func() error { _, err := closed.SetPinned(ctx, created.ID, true); return err },
+		func() error { _, err := closed.ConfirmCandidate(ctx, created.ID); return err },
+		func() error { _, err := closed.Challenge(ctx, created.ID); return err },
+		func() error {
+			_, err := closed.Recall(ctx, RecallQuery{RunID: "run", TaskID: createdTask.ID, Text: "经验"})
+			return err
+		},
+		func() error { return closed.RecordOutcome(ctx, "recall", experience.OutcomeHelpful) },
+		func() error { _, err := closed.ListRunRecalls(ctx, "run"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed call %d error = %v", index, err)
+		}
 	}
 }
 

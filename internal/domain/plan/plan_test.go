@@ -1,6 +1,9 @@
 package plan
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func TestRevisionInputValidate(t *testing.T) {
 	input := RevisionInput{Summary: " 搜索方案 ", Drafts: []TaskDraftInput{{
@@ -88,5 +91,45 @@ func TestTaskDraftRejectsInvalidFields(t *testing.T) {
 		if err := draft.Validate(); err == nil {
 			t.Fatalf("draft %#v unexpectedly valid", draft)
 		}
+	}
+}
+
+func TestReadinessRejectsInvalidBoundaries(t *testing.T) {
+	tooMany := make([]string, 21)
+	for index := range tooMany {
+		tooMany[index] = "item"
+	}
+	tests := []ReadinessAssessment{
+		{Status: "UNKNOWN", Confidence: 0.5},
+		{Status: ReadinessReadyForReview, Confidence: 0},
+		{Status: ReadinessReadyForReview, Confidence: 1.1},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, Assumptions: tooMany},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, OpenQuestions: []string{strings.Repeat("问", 1001)}},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, Alternatives: make([]Alternative, 11)},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, Alternatives: []Alternative{{Title: "", Tradeoff: "取舍"}}},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, Alternatives: []Alternative{{Title: strings.Repeat("题", 201), Tradeoff: "取舍"}}},
+		{Status: ReadinessReadyForReview, Confidence: 0.8, Alternatives: []Alternative{{Title: "方案", Tradeoff: strings.Repeat("取", 1001)}}},
+	}
+	for _, assessment := range tests {
+		if err := assessment.Validate(); err == nil {
+			t.Fatalf("assessment %#v unexpectedly valid", assessment)
+		}
+	}
+
+	normalized := (ReadinessAssessment{
+		Status: ReadinessReadyForReview, Confidence: 0.8,
+		Assumptions: []string{"", " 保留 "}, OpenQuestions: []string{" "},
+	}).Normalized()
+	if len(normalized.Assumptions) != 1 || normalized.Assumptions[0] != "保留" || len(normalized.OpenQuestions) != 0 {
+		t.Fatalf("normalized readiness = %#v", normalized)
+	}
+}
+
+func TestPlanningResultRequiresPlanForReadyAssessment(t *testing.T) {
+	result := PlanningResult{Reply: "已经就绪", Readiness: &ReadinessAssessment{
+		Status: ReadinessReadyForReview, Confidence: 0.9,
+	}}
+	if err := result.Validate(); err == nil {
+		t.Fatal("ready planning result without a plan unexpectedly valid")
 	}
 }

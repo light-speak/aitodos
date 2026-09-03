@@ -148,4 +148,34 @@ func TestRetrievalEvalRoutesRejectInvalidInputAndEmptySuite(t *testing.T) {
 	if missing.StatusCode != http.StatusNotFound {
 		t.Fatalf("missing relevance status = %d", missing.StatusCode)
 	}
+	requestKnowledge(t, server, http.MethodPost, "/api/retrieval-evals/cases", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/retrieval-evals/runs", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodGet, "/api/retrieval-evals/runs/missing", "", http.StatusNotFound)
+}
+
+func TestRetrievalEvalRoutesMapStorageFailures(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterRetrievalEvalRoutes(mux, storage.NewRetrievalEvalStore(database, storage.NewSearchStore(database)))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	requests := []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{method: http.MethodGet, path: "/api/retrieval-evals/cases", status: http.StatusInternalServerError},
+		{method: http.MethodPost, path: "/api/retrieval-evals/cases", body: `{"query":"查询","document_id":"TASK:task"}`, status: http.StatusInternalServerError},
+		{method: http.MethodDelete, path: "/api/retrieval-evals/cases/case/relevances/TASK:task", status: http.StatusInternalServerError},
+		{method: http.MethodGet, path: "/api/retrieval-evals/runs", status: http.StatusInternalServerError},
+		{method: http.MethodPost, path: "/api/retrieval-evals/runs", body: `{"k":10}`, status: http.StatusInternalServerError},
+		{method: http.MethodGet, path: "/api/retrieval-evals/runs/run", status: http.StatusInternalServerError},
+	}
+	for _, item := range requests {
+		requestKnowledge(t, server, item.method, item.path, item.body, item.status)
+	}
 }

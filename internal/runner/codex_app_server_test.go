@@ -174,6 +174,104 @@ func TestCodexArgumentInjectionAndAppServerFailure(t *testing.T) {
 	}
 }
 
+func TestCodexAppServerPolicyAndApprovalBoundaries(t *testing.T) {
+	revision := agentprofile.Revision{Model: "fast", WorkspacePolicy: agentprofile.WorkspaceWriteTask}
+	params := appServerThreadParams(revision, "/workspace")
+	if params["model"] != "fast" || params["sandbox"] != "workspace-write" {
+		t.Fatalf("thread params = %#v", params)
+	}
+	if appServerSandboxMode(agentprofile.WorkspaceReadOnly) != "read-only" {
+		t.Fatal("read-only workspace policy mapped incorrectly")
+	}
+	writePolicy := appServerSandboxPolicy(agentprofile.WorkspaceWriteTask, "/workspace")
+	readPolicy := appServerSandboxPolicy(agentprofile.WorkspaceReadOnly, "/workspace")
+	if writePolicy["type"] != "workspaceWrite" || readPolicy["type"] != "readOnly" {
+		t.Fatalf("sandbox policies = %#v, %#v", writePolicy, readPolicy)
+	}
+	if appServerCleanupReason(nil) != "app server process group exited" || !strings.Contains(appServerCleanupReason(errors.New("failed")), "failed") {
+		t.Fatal("cleanup reason lost process result")
+	}
+	if boundedPermissionSummary(json.RawMessage(`{`)) != "" {
+		t.Fatal("invalid permission JSON produced a summary")
+	}
+	longGrant := json.RawMessage(`{"value":"` + strings.Repeat("x", 4100) + `"}`)
+	if summary := boundedPermissionSummary(longGrant); len(summary) != 4000 || !strings.HasSuffix(summary, "...") {
+		t.Fatalf("bounded permission summary length = %d", len(summary))
+	}
+
+	if _, _, err := mapCodexApprovalRequest("item/commandExecution/requestApproval", nil, json.RawMessage(`{}`)); err == nil {
+		t.Fatal("approval without id was accepted")
+	}
+	if _, _, err := mapCodexApprovalRequest("item/commandExecution/requestApproval", json.RawMessage(`1`), json.RawMessage(`{`)); err == nil {
+		t.Fatal("approval with invalid params was accepted")
+	}
+	if _, _, err := mapCodexApprovalRequest("unknown", json.RawMessage(`1`), json.RawMessage(`{}`)); err == nil {
+		t.Fatal("unknown approval method was accepted")
+	}
+	fileInput, _, err := mapCodexApprovalRequest("item/fileChange/requestApproval", json.RawMessage(`1`), json.RawMessage(`{"reason":"修改文件","grantRoot":"/workspace"}`))
+	if err != nil || fileInput.Kind != approvalrequest.KindFileChange {
+		t.Fatalf("file approval = %#v, %v", fileInput, err)
+	}
+	networkInput, _, err := mapCodexApprovalRequest("item/commandExecution/requestApproval", json.RawMessage(`2`), json.RawMessage(`{"reason":"联网","networkApprovalContext":{"host":"example.com","protocol":"https"}}`))
+	if err != nil || networkInput.Kind != approvalrequest.KindNetwork || networkInput.Host != "example.com" {
+		t.Fatalf("network approval = %#v, %v", networkInput, err)
+	}
+
+	for _, decision := range []approvalrequest.Decision{
+		approvalrequest.DecisionAcceptOnce,
+		approvalrequest.DecisionAcceptSession,
+		approvalrequest.DecisionDecline,
+		approvalrequest.DecisionCancelRun,
+	} {
+		response, interrupt, err := codexApprovalResponse("item/commandExecution/requestApproval", decision, nil)
+		if err != nil || !json.Valid(response) || interrupt != (decision == approvalrequest.DecisionCancelRun) {
+			t.Fatalf("decision %q response = %s, %v, %v", decision, response, interrupt, err)
+		}
+	}
+	if _, _, err := codexApprovalResponse("item/commandExecution/requestApproval", approvalrequest.Decision("UNKNOWN"), nil); err == nil {
+		t.Fatal("unknown approval decision was accepted")
+	}
+	if _, _, err := codexApprovalResponse("item/permissions/requestApproval", approvalrequest.DecisionAcceptOnce, json.RawMessage(`{`)); err == nil {
+		t.Fatal("invalid permission grant was accepted")
+	}
+	response, interrupt, err := codexApprovalResponse("item/permissions/requestApproval", approvalrequest.DecisionCancelRun, nil)
+	if err != nil || !interrupt || !json.Valid(response) {
+		t.Fatalf("cancel permission response = %s, %v, %v", response, interrupt, err)
+	}
+	for _, method := range []string{"item/commandExecution/requestApproval", "item/fileChange/requestApproval", "item/permissions/requestApproval"} {
+		if !isAppServerApprovalMethod(method) {
+			t.Fatalf("approval method %q not recognized", method)
+		}
+	}
+	if isAppServerApprovalMethod("unknown") {
+		t.Fatal("unknown method recognized as approval")
+	}
+	for _, value := range []struct {
+		server string
+		tool   string
+		want   bool
+	}{
+		{server: "playwright", tool: "navigate", want: true},
+		{server: "tools", tool: "browser_open", want: true},
+		{server: "filesystem", tool: "read", want: false},
+	} {
+		if got := isBrowserMCPCall(value.server, value.tool); got != value.want {
+			t.Fatalf("isBrowserMCPCall(%q, %q) = %v", value.server, value.tool, got)
+		}
+	}
+	keys, digest, err := summarizeAppServerArguments(nil)
+	if err != nil || len(keys) != 0 || len(digest) != 64 {
+		t.Fatalf("empty arguments = %#v, %q, %v", keys, digest, err)
+	}
+	keys, _, err = summarizeAppServerArguments(json.RawMessage(`{"z":1,"a":2}`))
+	if err != nil || strings.Join(keys, ",") != "a,z" {
+		t.Fatalf("argument keys = %#v, %v", keys, err)
+	}
+	if _, _, err := summarizeAppServerArguments(json.RawMessage(`{`)); err == nil {
+		t.Fatal("invalid MCP arguments were accepted")
+	}
+}
+
 func TestPersistAppServerFinalResultRequiresStructuredRoles(t *testing.T) {
 	workspace := t.TempDir()
 	if err := persistAppServerFinalResult(run.PurposeImplementation, workspace, "plain text"); err == nil {

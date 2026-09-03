@@ -51,6 +51,15 @@ func TestAPIErrorMappings(t *testing.T) {
 			{name: "subject mismatch", err: storage.ErrDecisionSubjectMismatch, status: http.StatusConflict, code: "DECISION_SUBJECT_MISMATCH"},
 			{name: "invalid", err: errors.New("invalid knowledge"), status: http.StatusBadRequest, code: "KNOWLEDGE_COMMAND_FAILED"},
 		}},
+		{name: "experience", writer: writeExperienceError, cases: []errorMappingCase{
+			{name: "topic", err: storage.ErrTopicNotFound, status: http.StatusNotFound, code: "TOPIC_NOT_FOUND"},
+			{name: "task", err: storage.ErrTaskNotFound, status: http.StatusNotFound, code: "TASK_NOT_FOUND"},
+			{name: "experience", err: storage.ErrExperienceNotFound, status: http.StatusNotFound, code: "EXPERIENCE_NOT_FOUND"},
+			{name: "recall", err: storage.ErrExperienceRecallNotFound, status: http.StatusNotFound, code: "EXPERIENCE_RECALL_NOT_FOUND"},
+			{name: "subject mismatch", err: storage.ErrExperienceSubjectMismatch, status: http.StatusConflict, code: "EXPERIENCE_SUBJECT_MISMATCH"},
+			{name: "run mismatch", err: storage.ErrExperienceRunSubjectMismatch, status: http.StatusConflict, code: "EXPERIENCE_RUN_SUBJECT_MISMATCH"},
+			{name: "invalid", err: errors.New("invalid experience"), status: http.StatusBadRequest, code: "EXPERIENCE_COMMAND_FAILED"},
+		}},
 		{name: "plan", writer: writePlanError, cases: []errorMappingCase{
 			{name: "plan", err: storage.ErrPlanNotFound, status: http.StatusNotFound, code: "PLAN_NOT_FOUND"},
 			{name: "topic", err: storage.ErrTopicNotFound, status: http.StatusNotFound, code: "TOPIC_NOT_FOUND"},

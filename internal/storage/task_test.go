@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/task"
@@ -224,6 +225,96 @@ func TestTaskStoreRecordsReviewWithStatusTransitionAtomically(t *testing.T) {
 	reviews, err := store.ListReviews(ctx, created.ID)
 	if err != nil || len(reviews) != 1 || reviews[0].Comment != "符合验收标准" {
 		t.Fatalf("ListReviews() = %#v, %v", reviews, err)
+	}
+}
+
+func TestTaskStoreCoversEditArchiveAndReviewConflicts(t *testing.T) {
+	ctx := context.Background()
+	store := NewTaskStore(openTaskTestDatabase(t))
+	created, err := store.Create(ctx, task.CreateInput{Title: "编辑冲突", TargetBranch: "main"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateTitle(ctx, created.ID, created.Version, task.UpdateTitleInput{Title: "人工标题"})
+	if err != nil || updated.Title != "人工标题" || !updated.TitleLocked {
+		t.Fatalf("updated title = %#v, %v", updated, err)
+	}
+	if _, err := store.UpdateTitle(ctx, updated.ID, created.Version, task.UpdateTitleInput{Title: "过期标题"}); !errors.Is(err, ErrTaskVersionConflict) {
+		t.Fatalf("stale title error = %v", err)
+	}
+	unchanged, err := store.UpdateTargetBranch(ctx, updated.ID, updated.Version, "main")
+	if err != nil || unchanged.Version != updated.Version {
+		t.Fatalf("unchanged branch = %#v, %v", unchanged, err)
+	}
+	if _, err := store.UpdateDetails(ctx, updated.ID, created.Version, task.UpdateDetailsInput{Description: "过期"}); !errors.Is(err, ErrTaskVersionConflict) {
+		t.Fatalf("stale details error = %v", err)
+	}
+	running, err := store.ApplyCommand(ctx, updated.ID, updated.Version, task.CommandClaimRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.UpdateDetails(ctx, running.ID, running.Version, task.UpdateDetailsInput{Description: "执行中修改"}); !errors.Is(err, ErrTaskEditState) {
+		t.Fatalf("running edit error = %v", err)
+	}
+	if _, err := store.Archive(ctx, running.ID, running.Version); !errors.Is(err, ErrTaskArchiveState) {
+		t.Fatalf("running archive error = %v", err)
+	}
+	if _, _, err := store.ApplyReview(ctx, running.ID, running.Version, task.ReviewInput{Decision: task.ReviewAccepted, Comment: "不在验收态"}, "sha"); err == nil {
+		t.Fatal("ApplyReview() accepted a running task")
+	}
+	blocked, err := store.ApplyCommand(ctx, running.ID, running.Version, task.CommandCancelRun)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cancelled, err := store.ApplyCommand(ctx, blocked.ID, blocked.Version, task.CommandCancelTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := store.Archive(ctx, cancelled.ID, cancelled.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := store.Archive(ctx, archived.ID, archived.Version)
+	if err != nil || again.Version != archived.Version {
+		t.Fatalf("idempotent archive = %#v, %v", again, err)
+	}
+}
+
+func TestTaskStoreReturnsErrorsAfterDatabaseClose(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewTaskStore(database)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error { _, err := store.Create(ctx, task.CreateInput{Title: "任务"}); return err },
+		func() error { _, err := store.Get(ctx, "task"); return err },
+		func() error {
+			_, err := store.UpdateTitle(ctx, "task", 1, task.UpdateTitleInput{Title: "标题"})
+			return err
+		},
+		func() error {
+			_, err := store.UpdateDetails(ctx, "task", 1, task.UpdateDetailsInput{Description: "描述", AcceptanceCriteria: "验收", Priority: 1})
+			return err
+		},
+		func() error { _, err := store.Archive(ctx, "task", 1); return err },
+		func() error { _, err := store.UpdateTargetBranch(ctx, "task", 1, "main"); return err },
+		func() error { _, err := store.List(ctx); return err },
+		func() error { _, err := store.ListIncludingArchived(ctx); return err },
+		func() error { _, err := store.ApplyCommand(ctx, "task", 1, task.CommandCancelTask); return err },
+		func() error { _, err := store.RetryBlocked(ctx, "task", 1); return err },
+		func() error { _, err := store.ListEvents(ctx, "task"); return err },
+		func() error {
+			_, _, err := store.ApplyReview(ctx, "task", 1, task.ReviewInput{Decision: task.ReviewRejected, Comment: "需修改"}, "sha")
+			return err
+		},
+		func() error { _, err := store.ListReviews(ctx, "task"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
 	}
 }
 

@@ -470,14 +470,11 @@ FROM task_reviews WHERE task_id = ? ORDER BY created_at DESC, id DESC`, taskID)
 }
 
 func prepareReviewTransition(current task.Task, input task.ReviewInput) (task.Task, task.Event, error) {
-	return prepareTransition(current, mustReviewStatus(input), input.Command())
-}
-
-func mustReviewStatus(input task.ReviewInput) task.Status {
-	if input.Decision == task.ReviewAccepted {
-		return task.StatusAccepted
+	next, err := task.Transition(current.Status, input.Command())
+	if err != nil {
+		return task.Task{}, task.Event{}, err
 	}
-	return task.StatusChangesRequested
+	return prepareTransition(current, next, input.Command())
 }
 
 func newReview(taskID string, input task.ReviewInput, commitSHA string, createdAt time.Time) (task.Review, error) {

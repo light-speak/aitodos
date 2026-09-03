@@ -41,3 +41,36 @@ func TestRunMCPAuditRoutesReturnCallsAndResources(t *testing.T) {
 		}
 	}
 }
+
+func TestMCPAuditRoutesRejectInvalidLimitAndStorageFailures(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterMCPRoutes(mux, storage.NewMCPAuditStore(database))
+
+	for _, path := range []string{"/api/mcp/audit?limit=invalid", "/api/runs/run/mcp-calls?limit=invalid"} {
+		request := httptest.NewRequest(http.MethodGet, path, nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("%s response = %d %s", path, response.Code, response.Body.String())
+		}
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	for _, item := range []struct {
+		path   string
+		status int
+	}{
+		{path: "/api/mcp/audit", status: http.StatusBadRequest},
+		{path: "/api/runs/run/mcp-calls", status: http.StatusBadRequest},
+		{path: "/api/runs/run/resources", status: http.StatusInternalServerError},
+	} {
+		request := httptest.NewRequest(http.MethodGet, item.path, nil)
+		response := httptest.NewRecorder()
+		mux.ServeHTTP(response, request)
+		if response.Code != item.status {
+			t.Fatalf("%s response = %d %s", item.path, response.Code, response.Body.String())
+		}
+	}
+}

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -108,5 +109,131 @@ func TestMCPAuditStoreTracksOutboundRunCallsAndBrowserLease(t *testing.T) {
 	leases, err := store.ListRunResourceLeases(ctx, claim.Run.ID)
 	if err != nil || len(leases) != 1 || leases[0].State != "RELEASED" || leases[0].ReleasedAt == nil {
 		t.Fatalf("leases = %#v, %v", leases, err)
+	}
+}
+
+func TestMCPAuditStoreRejectsInvalidQueriesAndResourceLeases(t *testing.T) {
+	store := NewMCPAuditStore(openTaskTestDatabase(t))
+	ctx := context.Background()
+	for _, limit := range []int{-1, 0, 501} {
+		if _, err := store.List(ctx, limit); err == nil {
+			t.Fatalf("List(limit=%d) unexpectedly succeeded", limit)
+		}
+	}
+	for _, query := range []struct {
+		runID string
+		limit int
+	}{{"", 10}, {"run", 0}, {"run", 501}} {
+		if _, err := store.ListRun(ctx, query.runID, query.limit); err == nil {
+			t.Fatalf("ListRun(%q, %d) unexpectedly succeeded", query.runID, query.limit)
+		}
+	}
+	for _, input := range []struct{ runID, kind, provider string }{
+		{"", "BROWSER_SESSION", "playwright"},
+		{"run", "OTHER", "playwright"},
+		{"run", "BROWSER_SESSION", ""},
+		{"run", "BROWSER_SESSION", strings.Repeat("p", 201)},
+	} {
+		if _, err := store.OpenResourceLease(ctx, input.runID, input.kind, input.provider); err == nil {
+			t.Fatalf("OpenResourceLease(%#v) unexpectedly succeeded", input)
+		}
+	}
+	if err := store.ReleaseRunResources(ctx, "", false, "reason"); err == nil {
+		t.Fatal("ReleaseRunResources() accepted an empty run")
+	}
+	if err := store.ReleaseRunResources(ctx, "run", false, strings.Repeat("r", 1001)); err == nil {
+		t.Fatal("ReleaseRunResources() accepted an oversized reason")
+	}
+
+	invalidAudit := MCPAuditInput{
+		CallID: "call", ClientName: "client", ToolName: "tool", Phase: mcpaudit.PhaseStarted,
+		ArgumentsSHA256: strings.Repeat("a", 64),
+	}
+	for _, mutate := range []func(*MCPAuditInput){
+		func(input *MCPAuditInput) { input.Direction = "SIDEWAYS" },
+		func(input *MCPAuditInput) { input.Direction, input.RunID, input.ServerName = "OUTBOUND", "", "server" },
+		func(input *MCPAuditInput) { input.Direction, input.RunID, input.ServerName = "OUTBOUND", "run", "" },
+		func(input *MCPAuditInput) { input.Phase = "UNKNOWN" },
+	} {
+		input := invalidAudit
+		mutate(&input)
+		if _, err := store.Append(ctx, input); err == nil {
+			t.Fatalf("Append(%#v) unexpectedly succeeded", input)
+		}
+	}
+}
+
+func TestMCPAuditStoreReopensAndAbandonsBrowserLease(t *testing.T) {
+	database := openTaskTestDatabase(t)
+	ctx := context.Background()
+	configureProfile(t, database, agentprofile.RolePlanner)
+	if _, err := NewTopicStore(database).Create(ctx, topic.CreateInput{Title: "遗留浏览器"}); err != nil {
+		t.Fatal(err)
+	}
+	claim, err := NewRunStore(database).ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewMCPAuditStore(database)
+	first, err := store.OpenResourceLease(ctx, claim.Run.ID, "BROWSER_SESSION", "playwright")
+	if err != nil {
+		t.Fatal(err)
+	}
+	second, err := store.OpenResourceLease(ctx, claim.Run.ID, "BROWSER_SESSION", "playwright")
+	if err != nil || second.ID != first.ID || second.State != "ACTIVE" {
+		t.Fatalf("reopened lease = %#v, %v", second, err)
+	}
+	if err := store.ReleaseRunResources(ctx, claim.Run.ID, true, "进程异常退出"); err != nil {
+		t.Fatal(err)
+	}
+	leasses, err := store.ListRunResourceLeases(ctx, claim.Run.ID)
+	if err != nil || len(leasses) != 1 || leasses[0].State != "ABANDONED" || leasses[0].CleanupReason == "" {
+		t.Fatalf("abandoned leases = %#v, %v", leasses, err)
+	}
+}
+
+func TestMCPAuditStoreReportsCorruptRowsAndClosedDatabase(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewMCPAuditStore(database)
+	if _, err := database.ExecContext(ctx, `INSERT INTO mcp_call_events(
+id, call_id, client_name, tool_name, phase, argument_keys_json, arguments_sha256,
+error_message, occurred_at, direction, server_name
+) VALUES ('corrupt-audit', 'call', 'client', 'tool', 'STARTED', '{}', ?, '', ?, 'INBOUND', '')`,
+		strings.Repeat("a", 64), formatTime(time.Now())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(ctx, 10); err == nil {
+		t.Fatal("List() accepted non-array argument keys")
+	}
+	if _, err := database.ExecContext(ctx, `UPDATE mcp_call_events SET argument_keys_json = '[]', occurred_at = 'invalid' WHERE id = 'corrupt-audit'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.List(ctx, 10); err == nil {
+		t.Fatal("List() accepted invalid occurrence time")
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	closed := NewMCPAuditStore(database)
+	valid := MCPAuditInput{
+		CallID: "call", ClientName: "client", ToolName: "tool", Phase: mcpaudit.PhaseStarted,
+		ArgumentsSHA256: strings.Repeat("a", 64),
+	}
+	calls := []func() error{
+		func() error { _, err := closed.Append(ctx, valid); return err },
+		func() error { _, err := closed.List(ctx, 10); return err },
+		func() error { _, err := closed.ListRun(ctx, "run", 10); return err },
+		func() error {
+			_, err := closed.OpenResourceLease(ctx, "run", "BROWSER_SESSION", "playwright")
+			return err
+		},
+		func() error { return closed.ReleaseRunResources(ctx, "run", false, "closed") },
+		func() error { _, err := closed.ListRunResourceLeases(ctx, "run"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || errors.Is(err, context.Canceled) {
+			t.Fatalf("closed call %d error = %v", index, err)
+		}
 	}
 }

@@ -147,6 +147,131 @@ func TestServerRejectsMalformedAndOversizedMessages(t *testing.T) {
 	}
 }
 
+func TestServerHandlesProtocolEdgesAndWriteFailures(t *testing.T) {
+	database := openMCPTestDatabase(t)
+	server := New(database)
+	requests := strings.Join([]string{
+		" ",
+		`{"jsonrpc":"2.0","method":"notifications/unknown"}`,
+		`{"jsonrpc":"2.0","id":1,"method":"initialize","params":[]}`,
+		`{"jsonrpc":"2.0","id":2,"method":"initialize","params":{"protocolVersion":"future","clientInfo":{}}}`,
+		`{"jsonrpc":"2.0","id":3,"method":"ping"}`,
+	}, "\n") + "\n"
+	var output bytes.Buffer
+	if err := server.Serve(context.Background(), strings.NewReader(requests), &output); err != nil {
+		t.Fatal(err)
+	}
+	responses := decodeResponses(t, output.Bytes())
+	if len(responses) != 3 || responses[0].Error == nil || responses[1].Error != nil || responses[2].Error != nil {
+		t.Fatalf("responses = %#v", responses)
+	}
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := New(database).Serve(canceled, strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"), io.Discard); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled Serve() error = %v", err)
+	}
+	if err := New(database).Serve(context.Background(), strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}`+"\n"), failingWriter{}); err == nil {
+		t.Fatal("Serve() accepted a response writer failure")
+	}
+	oversized := strings.NewReader(strings.Repeat("x", maxMessageBytes+1) + "\n")
+	if err := New(database).Serve(context.Background(), oversized, failingWriter{}); err == nil {
+		t.Fatal("Serve() accepted a read-error response writer failure")
+	}
+}
+
+func TestServerReadToolsReturnStorageErrorsWithoutLeakingData(t *testing.T) {
+	database := openMCPTestDatabase(t)
+	server := New(database)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error {
+			_, err := server.searchItems(t.Context(), json.RawMessage(`{"text":"query"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getTopic(t.Context(), json.RawMessage(`{"topic_id":"topic"}`))
+			return err
+		},
+		func() error { _, err := server.getTask(t.Context(), json.RawMessage(`{"task_id":"task"}`)); return err },
+		func() error {
+			_, err := server.getPlan(t.Context(), json.RawMessage(`{"topic_id":"topic"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getThread(t.Context(), json.RawMessage(`{"subject_kind":"TOPIC","subject_id":"topic"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getThread(t.Context(), json.RawMessage(`{"subject_kind":"TASK","subject_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getTaskRelations(t.Context(), json.RawMessage(`{"task_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getTaskRuns(t.Context(), json.RawMessage(`{"task_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getDecisions(t.Context(), json.RawMessage(`{"subject_kind":"TOPIC","subject_id":"topic"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getDecisions(t.Context(), json.RawMessage(`{"subject_kind":"TASK","subject_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getLabels(t.Context(), json.RawMessage(`{"subject_kind":"TOPIC","subject_id":"topic"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getLabels(t.Context(), json.RawMessage(`{"subject_kind":"TASK","subject_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getRunSummary(t.Context(), json.RawMessage(`{"run_id":"run"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getCIStatus(t.Context(), json.RawMessage(`{"task_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getClarifications(t.Context(), json.RawMessage(`{"subject_kind":"TOPIC","subject_id":"topic"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getClarifications(t.Context(), json.RawMessage(`{"subject_kind":"TASK","subject_id":"task"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getExperience(t.Context(), json.RawMessage(`{"experience_id":"experience"}`))
+			return err
+		},
+		func() error {
+			_, err := server.getRecalledExperiences(t.Context(), json.RawMessage(`{"run_id":"run"}`))
+			return err
+		},
+	}
+	for index, call := range calls {
+		if err := call(); err == nil {
+			t.Fatalf("closed database call %d unexpectedly succeeded", index)
+		}
+	}
+	server.initialized = true
+	response := server.callTool(t.Context(), rpcRequest{
+		JSONRPC: "2.0", ID: json.RawMessage(`1`), Method: "tools/call",
+		Params: json.RawMessage(`{"name":"get_task","arguments":{"task_id":"task"}}`),
+	})
+	if response.Error == nil || response.Error.Code != -32603 {
+		t.Fatalf("audit failure response = %#v", response)
+	}
+}
+
 func TestServerDispatchesEveryBoundedReadTool(t *testing.T) {
 	database := openMCPTestDatabase(t)
 	requests := []string{
@@ -281,6 +406,10 @@ func TestServerRejectsInvalidToolArguments(t *testing.T) {
 	}{
 		{name: "invalid required string JSON", call: func() error { _, err := requiredString(json.RawMessage(`[]`), "task_id"); return err }},
 		{name: "missing required string", call: func() error { _, err := requiredString(json.RawMessage(`{}`), "task_id"); return err }},
+		{name: "oversized required string", call: func() error {
+			_, err := requiredString(encodeArguments(t, map[string]any{"task_id": strings.Repeat("x", 501)}), "task_id")
+			return err
+		}},
 		{name: "invalid subject", call: func() error {
 			_, _, err := requiredSubject(json.RawMessage(`{"subject_kind":"PROJECT","subject_id":"one"}`))
 			return err
@@ -306,6 +435,12 @@ func TestServerRejectsInvalidToolArguments(t *testing.T) {
 			}
 		})
 	}
+}
+
+type failingWriter struct{}
+
+func (failingWriter) Write([]byte) (int, error) {
+	return 0, errors.New("write failed")
 }
 
 func encodeArguments(t *testing.T, values map[string]any) json.RawMessage {

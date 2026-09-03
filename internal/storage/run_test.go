@@ -876,6 +876,82 @@ func TestRunStoreRecoversLostRunAndBlocksTask(t *testing.T) {
 	}
 }
 
+func TestRunStoreReturnsBoundedErrorsAfterDatabaseClose(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewRunStore(database)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	metric := int64(1)
+	clarificationRequest := clarification.Request{
+		Category: clarification.CategoryDecision, Question: "如何继续？", AllowCustomAnswer: true,
+	}
+	closure := run.Closure{StopReason: run.StopReasonGoalReached, Summary: "完成", Completed: []string{"实现"}}
+	calls := []func() error{
+		func() error {
+			_, _, err := store.FinishNeedsInput(ctx, "run", "claim", 1, clarificationRequest)
+			return err
+		},
+		func() error { _, err := store.RequestCancel(ctx, "run", "取消"); return err },
+		func() error { _, err := store.CancellationRequested(ctx, "run", "claim", 1); return err },
+		func() error { _, err := store.ClaimNextTask(ctx, 1, time.Minute); return err },
+		func() error { _, err := store.ListTaskRuns(ctx, "task"); return err },
+		func() error { _, err := store.Query(ctx, RunQuery{Limit: 10}); return err },
+		func() error { _, err := store.ListEvents(ctx, "run", 0, 10); return err },
+		func() error { _, err := store.Get(ctx, "run"); return err },
+		func() error { _, err := store.ListRecoveryRuns(ctx); return err },
+		func() error { return store.AttachAgentProcess(ctx, "run", "claim", 1, 1, strings.Repeat("a", 64)) },
+		func() error { return store.ReleaseAgentProcess(ctx, "run", "claim", 1) },
+		func() error { _, err := store.RecoverLost(ctx, "run", 1, "LOST", "lost"); return err },
+		func() error { _, err := store.GetToolPolicySnapshot(ctx, "run"); return err },
+		func() error {
+			_, err := store.RecordUsage(ctx, run.Usage{RunID: "run", Source: run.UsageSourceCodexJSONL, InputTokens: &metric})
+			return err
+		},
+		func() error { _, err := store.GetUsage(ctx, "run"); return err },
+		func() error { _, err := store.UsageSummary(ctx); return err },
+		func() error {
+			_, err := store.RecordArtifact(ctx, run.Artifact{RunID: "run", Kind: "RESULT", RelativePath: "runs/run/result.json", SHA256: strings.Repeat("a", 64)})
+			return err
+		},
+		func() error { _, err := store.ListArtifacts(ctx, "run"); return err },
+		func() error { _, err := store.GetArtifact(ctx, "run", "RESULT"); return err },
+		func() error {
+			_, err := store.Start(ctx, "run", "claim", 1, 1, strings.Repeat("a", 64), time.Minute)
+			return err
+		},
+		func() error { return store.RenewLease(ctx, "run", "claim", 1, time.Minute) },
+		func() error { _, err := store.MarkRunning(ctx, "run", "claim", 1); return err },
+		func() error { _, err := store.MarkFinalizing(ctx, "run", "claim", 1); return err },
+		func() error {
+			_, err := store.BeginFinalization(ctx, "run", "claim", 1, FinalizationIntent{
+				Finish: RunFinish{Status: run.StatusSucceeded, ExitCode: 0}, Closure: &closure,
+			})
+			return err
+		},
+		func() error { _, err := store.CompleteFinalization(ctx, "run", "claim", 1); return err },
+		func() error { _, err := store.RecoverFinalization(ctx, "run", 1); return err },
+		func() error { _, err := store.GetClosure(ctx, "run"); return err },
+		func() error {
+			_, err := store.Finish(ctx, "run", "claim", 1, RunFinish{Status: run.StatusFailed, ExitCode: 1})
+			return err
+		},
+		func() error {
+			_, err := store.RecordWorkspaceSnapshot(ctx, run.WorkspaceSnapshot{
+				RunID: "run", WorkspaceID: "workspace", HeadBefore: "before", HeadAfter: "after",
+			})
+			return err
+		},
+		func() error { _, err := store.GetWorkspaceSnapshot(ctx, "run"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
+	}
+}
+
 func tokenCount(value int64) *int64 {
 	return &value
 }

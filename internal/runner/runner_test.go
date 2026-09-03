@@ -233,6 +233,117 @@ func TestValidateAgentResultLimitsExperienceCandidates(t *testing.T) {
 	}
 }
 
+func TestValidateAgentResultEnforcesStructuredTaskBoundaries(t *testing.T) {
+	validClosure := &run.Closure{
+		StopReason: run.StopReasonGoalReached,
+		Summary:    "实现完成",
+		Completed:  []string{"完成实现"},
+	}
+	validResult := agentResult{
+		Closure: validClosure,
+		Estimate: &agentEstimate{
+			Points: 3, RemainingPoints: 0, Confidence: 0.9, Rationale: "范围明确",
+		},
+		NewTestCases: []agentTestCase{{Title: "回归测试", Required: true, Outcome: quality.OutcomePassed, Summary: "测试通过"}},
+		TestResults:  []agentTestResult{{TestCaseID: "test-case", Outcome: quality.OutcomePassed, Summary: "测试通过"}},
+		Experiences: []agentExperienceCandidate{{
+			Title: "先跑测试", Summary: "修改前建立基线", Guidance: "运行回归测试", Applicability: "修改状态机时",
+		}},
+	}
+	if err := validateAgentResult("run-1", validResult); err != nil {
+		t.Fatalf("valid result error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*agentResult)
+	}{
+		{name: "missing closure", mutate: func(result *agentResult) { result.Closure = nil }},
+		{name: "invalid closure", mutate: func(result *agentResult) { result.Closure = &run.Closure{} }},
+		{name: "disallowed task stop", mutate: func(result *agentResult) {
+			result.Closure = &run.Closure{StopReason: run.StopReasonNeedsInput, Summary: "需要输入", NextAction: "发起结构化问题"}
+		}},
+		{name: "invalid estimate", mutate: func(result *agentResult) { result.Estimate.Points = 4 }},
+		{name: "invalid new test", mutate: func(result *agentResult) { result.NewTestCases[0].Title = "" }},
+		{name: "invalid new test result", mutate: func(result *agentResult) { result.NewTestCases[0].Outcome = "UNKNOWN" }},
+		{name: "missing existing test id", mutate: func(result *agentResult) { result.TestResults[0].TestCaseID = "" }},
+		{name: "invalid existing test result", mutate: func(result *agentResult) { result.TestResults[0].Outcome = "UNKNOWN" }},
+		{name: "invalid experience", mutate: func(result *agentResult) { result.Experiences[0].Guidance = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := validResult
+			result.Estimate = &agentEstimate{
+				Points: validResult.Estimate.Points, RemainingPoints: validResult.Estimate.RemainingPoints,
+				Confidence: validResult.Estimate.Confidence, Rationale: validResult.Estimate.Rationale,
+			}
+			result.NewTestCases = append([]agentTestCase(nil), validResult.NewTestCases...)
+			result.TestResults = append([]agentTestResult(nil), validResult.TestResults...)
+			result.Experiences = append([]agentExperienceCandidate(nil), validResult.Experiences...)
+			test.mutate(&result)
+			if err := validateAgentResult("run-1", result); err == nil {
+				t.Fatal("validateAgentResult() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestValidateReportedTestCasesRejectsForeignAndMissingTasks(t *testing.T) {
+	database, err := storage.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"), storage.ProjectMetadata{
+		InstanceID: "runner-quality", Name: "runner-quality", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	createdTask, err := storage.NewTaskStore(database).Create(t.Context(), task.CreateInput{Title: "验证测试归属"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualityStore := storage.NewQualityStore(database)
+	testCase, err := qualityStore.CreateTestCase(t.Context(), createdTask.ID, quality.TestCaseInput{
+		Title: "已有测试", Required: true, CreatedBy: quality.TestCreatorHuman,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, []agentTestResult{{TestCaseID: testCase.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, []agentTestResult{{TestCaseID: "foreign"}}); err == nil {
+		t.Fatal("foreign test case was accepted")
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, "missing", []agentTestResult{{TestCaseID: testCase.ID}}); !errors.Is(err, storage.ErrTaskNotFound) {
+		t.Fatalf("missing task error = %v", err)
+	}
+}
+
+func TestResultAndCommandHelpersCoverSafeBoundaries(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	if content, err := readOptionalResult(missing); err != nil || content != nil {
+		t.Fatalf("missing result = %q, %v", content, err)
+	}
+	oversized := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(oversized, bytes.Repeat([]byte("x"), (256<<10)+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readOptionalResult(oversized); err == nil {
+		t.Fatal("oversized result was accepted")
+	}
+	if value, ok := unwrapShellCommand(`"go test ./..."`); !ok || value != "go test ./..." {
+		t.Fatalf("double quoted command = %q, %v", value, ok)
+	}
+	if _, ok := unwrapShellCommand(`"unterminated`); ok {
+		t.Fatal("unterminated command was accepted")
+	}
+	if keys := commandEvidenceKeys("go test ./..."); len(keys) != 1 || keys[0] != "go test ./..." {
+		t.Fatalf("plain command keys = %#v", keys)
+	}
+}
+
 func TestCommandEvidenceParsesCodexAndAppServerEvents(t *testing.T) {
 	stdout := []byte(strings.Join([]string{
 		`{"type":"item.completed","item":{"type":"command_execution","command":"/bin/zsh -lc 'go test ./...'","exit_code":0,"status":"completed"}}`,

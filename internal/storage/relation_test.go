@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/relation"
@@ -114,5 +115,45 @@ func TestRelationStoreLinksTasksSymmetricallyAndRejectsSelfLink(t *testing.T) {
 	}
 	if err := store.UnlinkTasks(ctx, first.ID, second.ID); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRelationStoreRejectsMissingSubjectsAndClosedDatabase(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewRelationStore(database)
+	if err := store.LinkTopicTask(ctx, "missing", "missing"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("missing topic link error = %v", err)
+	}
+	if err := store.LinkTasksTyped(ctx, "missing", "other", relation.TypeBlocks); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task link error = %v", err)
+	}
+	if _, err := store.ListTopicTasks(ctx, "missing"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("missing topic list error = %v", err)
+	}
+	if _, err := store.ListTaskTopics(ctx, "missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task topic list error = %v", err)
+	}
+	if _, err := store.ListTaskRelations(ctx, "missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task relation list error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error { return store.LinkTopicTask(ctx, "topic", "task") },
+		func() error { return store.UnlinkTopicTask(ctx, "topic", "task") },
+		func() error { _, err := store.ListTopicTasks(ctx, "topic"); return err },
+		func() error { _, err := store.ListTaskTopics(ctx, "task"); return err },
+		func() error { return store.LinkTasks(ctx, "task", "other") },
+		func() error { return store.LinkTasksTyped(ctx, "task", "other", relation.TypeBlocks) },
+		func() error { return store.UnlinkTasks(ctx, "task", "other") },
+		func() error { return store.UnlinkTaskRelation(ctx, "task", "other", relation.TypeBlocks) },
+		func() error { _, err := store.ListTaskRelations(ctx, "task"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
 	}
 }

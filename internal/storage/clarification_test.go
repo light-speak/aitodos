@@ -190,3 +190,53 @@ func TestClarificationFinishesRunAndAnswerCreatesContinuation(t *testing.T) {
 		t.Fatalf("continuation clarification = %#v, %v", linked, err)
 	}
 }
+
+func TestClarificationStoreRejectsMissingDataAndClosedDatabase(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewClarificationStore(database)
+	if _, err := store.GetForContinuationRun(ctx, "missing"); !errors.Is(err, ErrClarificationNotFound) {
+		t.Fatalf("missing continuation error = %v", err)
+	}
+	if _, err := store.ListTask(ctx, "missing"); !errors.Is(err, ErrTaskNotFound) {
+		t.Fatalf("missing task error = %v", err)
+	}
+	if _, err := store.ListTopic(ctx, "missing"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("missing topic error = %v", err)
+	}
+	if command, err := resumeCommand(domainrun.PurposeImplementation); err != nil || command != task.CommandResumeImplementation {
+		t.Fatalf("implementation resume = %q, %v", command, err)
+	}
+	if command, err := resumeCommand(domainrun.PurposeRevision); err != nil || command != task.CommandResumeRevision {
+		t.Fatalf("revision resume = %q, %v", command, err)
+	}
+	if _, err := resumeCommand(domainrun.PurposeReview); err == nil {
+		t.Fatal("review purpose was accepted for clarification resume")
+	}
+	if nullableString("") != nil || nullableString("value") != "value" {
+		t.Fatal("nullableString() returned an unexpected value")
+	}
+
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error { _, err := store.ListOpen(ctx); return err },
+		func() error { _, err := store.ListTask(ctx, "task"); return err },
+		func() error { _, err := store.ListTopic(ctx, "topic"); return err },
+		func() error { _, err := store.GetForContinuationRun(ctx, "run"); return err },
+		func() error {
+			_, _, err := store.Answer(ctx, "question", clarification.AnswerInput{CustomAnswer: "回答", ExpectedVersion: 1})
+			return err
+		},
+		func() error {
+			_, err := store.AnswerSubject(ctx, "question", clarification.AnswerInput{CustomAnswer: "回答", ExpectedVersion: 1})
+			return err
+		},
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
+	}
+}

@@ -76,6 +76,46 @@ func TestKnowledgeRoutesRejectInvalidInputAndMissingSubject(t *testing.T) {
 	t.Cleanup(server.Close)
 	requestKnowledge(t, server, http.MethodPost, "/api/labels", `{"name":"bad","color":"red"}`, http.StatusBadRequest)
 	requestKnowledge(t, server, http.MethodPost, "/api/tasks/missing/decisions", `{"title":"决策","content":"内容"}`, http.StatusNotFound)
+	requestKnowledge(t, server, http.MethodPost, "/api/labels", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/topics/missing/decisions", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/tasks/missing/decisions", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/tasks/missing/ci-snapshots", `{`, http.StatusBadRequest)
+}
+
+func TestKnowledgeRoutesReturnBoundedErrorsWhenStorageFails(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterKnowledgeRoutes(mux, storage.NewKnowledgeStore(database))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	requests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodGet, path: "/api/labels"},
+		{method: http.MethodPost, path: "/api/labels", body: `{"name":"closed"}`},
+		{method: http.MethodGet, path: "/api/topics/topic/labels"},
+		{method: http.MethodPost, path: "/api/topics/topic/labels/label"},
+		{method: http.MethodDelete, path: "/api/topics/topic/labels/label"},
+		{method: http.MethodGet, path: "/api/tasks/task/labels"},
+		{method: http.MethodPost, path: "/api/tasks/task/labels/label"},
+		{method: http.MethodDelete, path: "/api/tasks/task/labels/label"},
+		{method: http.MethodGet, path: "/api/topics/topic/decisions"},
+		{method: http.MethodPost, path: "/api/topics/topic/decisions", body: `{"title":"决策","content":"内容"}`},
+		{method: http.MethodGet, path: "/api/tasks/task/decisions"},
+		{method: http.MethodPost, path: "/api/tasks/task/decisions", body: `{"title":"决策","content":"内容"}`},
+		{method: http.MethodGet, path: "/api/runs/run/summary"},
+		{method: http.MethodGet, path: "/api/tasks/task/ci-snapshots"},
+		{method: http.MethodPost, path: "/api/tasks/task/ci-snapshots", body: `{"provider":"github","commit_sha":"abcdef1","state":"passed"}`},
+	}
+	for _, item := range requests {
+		requestKnowledge(t, server, item.method, item.path, item.body, http.StatusBadRequest)
+	}
 }
 
 func TestExperienceRoutesCreateListPinAndChallenge(t *testing.T) {
@@ -167,6 +207,43 @@ func TestExperienceRoutesManageTopicExperienceAndMapErrors(t *testing.T) {
 	}
 	requestKnowledge(t, server, http.MethodGet, "/api/experiences/missing", "", http.StatusNotFound)
 	requestKnowledge(t, server, http.MethodPost, "/api/experience-recalls/missing/outcome", `{"outcome":"HELPFUL"}`, http.StatusNotFound)
+}
+
+func TestExperienceRoutesRejectMalformedRequestsAndStorageFailures(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterExperienceRoutes(mux, storage.NewExperienceStore(database))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	requestKnowledge(t, server, http.MethodPost, "/api/topics/topic/experiences", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/tasks/task/experiences", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/experiences/experience/pin", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/experience-recalls/recall/outcome", `{`, http.StatusBadRequest)
+	requestKnowledge(t, server, http.MethodPost, "/api/experience-recalls/recall/outcome", `{"outcome":"UNKNOWN"}`, http.StatusBadRequest)
+
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	requests := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{method: http.MethodPost, path: "/api/topics/topic/experiences", body: `{"title":"经验","summary":"摘要","guidance":"做法","applicability":"条件"}`},
+		{method: http.MethodGet, path: "/api/topics/topic/experiences"},
+		{method: http.MethodPost, path: "/api/tasks/task/experiences", body: `{"title":"经验","summary":"摘要","guidance":"做法","applicability":"条件"}`},
+		{method: http.MethodGet, path: "/api/tasks/task/experiences"},
+		{method: http.MethodGet, path: "/api/experiences/experience"},
+		{method: http.MethodPost, path: "/api/experiences/experience/pin", body: `{"pinned":true}`},
+		{method: http.MethodPost, path: "/api/experiences/experience/confirm"},
+		{method: http.MethodPost, path: "/api/experiences/experience/challenge"},
+		{method: http.MethodPost, path: "/api/experience-recalls/recall/outcome", body: `{"outcome":"HELPFUL"}`},
+		{method: http.MethodGet, path: "/api/runs/run/experiences"},
+	}
+	for _, item := range requests {
+		requestKnowledge(t, server, item.method, item.path, item.body, http.StatusBadRequest)
+	}
 }
 
 func TestKnowledgeRoutesManageTopicKnowledgeAndReadSummaries(t *testing.T) {
