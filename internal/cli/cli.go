@@ -2,6 +2,7 @@ package cli
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -125,6 +126,7 @@ func runRestore(ctx context.Context, args []string, stdout io.Writer, stderr io.
 func runDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
 	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	flags.SetOutput(stderr)
+	jsonOutput := flags.Bool("json", false, "以 JSON 输出完整性结果")
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
@@ -139,11 +141,31 @@ func runDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 	if err != nil {
 		return err
 	}
+	if *jsonOutput {
+		output := doctorJSONReport{
+			SchemaVersion:     1,
+			ProjectInstanceID: currentProject.InstanceID,
+			OK:                report.OK,
+			Problems:          report.Problems,
+		}
+		if err := json.NewEncoder(stdout).Encode(output); err != nil {
+			return fmt.Errorf("输出完整性检查 JSON: %w", err)
+		}
+	}
 	if !report.OK {
 		return fmt.Errorf("项目完整性检查失败: %s", strings.Join(report.Problems, "; "))
 	}
-	fmt.Fprintln(stdout, "项目完整性检查通过")
+	if !*jsonOutput {
+		fmt.Fprintln(stdout, "项目完整性检查通过")
+	}
 	return nil
+}
+
+type doctorJSONReport struct {
+	SchemaVersion     int      `json:"schema_version"`
+	ProjectInstanceID string   `json:"project_instance_id"`
+	OK                bool     `json:"ok"`
+	Problems          []string `json:"problems"`
 }
 
 func runMCP(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {
@@ -377,6 +399,6 @@ func printUsage(output io.Writer) {
 	fmt.Fprintln(output, "  mcp                     启动当前项目只读 MCP stdio Server")
 	fmt.Fprintln(output, "  backup [--output PATH]  备份项目事实数据（export 同义）")
 	fmt.Fprintln(output, "  restore --input PATH    校验并恢复项目事实数据")
-	fmt.Fprintln(output, "  doctor                  检查数据库、外键和 Artifact 完整性")
+	fmt.Fprintln(output, "  doctor [--json]         检查数据库、外键和 Artifact 完整性")
 	fmt.Fprintln(output, "  version                 显示二进制版本、Commit 和构建时间")
 }

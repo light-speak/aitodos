@@ -87,6 +87,7 @@ WSL2 建议把项目放在 Linux 文件系统的 `/home/...`，避免 `/mnt/c/..
 
 ```sh
 go test ./...
+go mod verify
 go vet ./...
 test -z "$(gofmt -l cmd internal)"
 go build -o ats ./cmd/ats
@@ -120,7 +121,7 @@ ats stop                    停止当前项目运行进程
 ats mcp                     启动当前项目只读 MCP stdio Server
 ats backup [--output PATH]  备份项目事实数据
 ats restore --input PATH    校验并恢复项目事实数据
-ats doctor                  检查数据库、外键和 Artifact 完整性
+ats doctor [--json]         检查数据库、外键和 Artifact 完整性
 ats version                 显示版本、Commit 和构建时间
 ```
 
@@ -132,6 +133,8 @@ port = 4173
 ```
 
 Linux/WSL 没有桌面环境时，`ats open` 可能不可用，直接在浏览器访问启动输出中的 URL 即可。
+
+自动化脚本可以使用 `ats doctor --json` 获取带 `schema_version`、项目实例 ID、检查结论和问题列表的稳定 JSON；完整性失败时命令返回非零退出码。
 
 ## Agent 与代理环境
 
@@ -169,6 +172,7 @@ export NO_PROXY="localhost,127.0.0.1,::1"
 
 ```sh
 go test ./...
+go mod verify
 go vet ./...
 test -z "$(gofmt -l cmd internal)"
 pnpm --dir web lint

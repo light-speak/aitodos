@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net"
 	"os"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/light-speak/aitodos/internal/daemon"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/storage"
 )
 
 func TestStartRunsInForegroundUntilContextCancellation(t *testing.T) {
@@ -251,6 +253,69 @@ func TestBackupRestoreAndDoctorCommands(t *testing.T) {
 	if code := Run(context.Background(), []string{"restore", "--input", backupPath}, &stdout, &stderr); code != 0 || !strings.Contains(stdout.String(), "恢复完成") {
 		t.Fatalf("restore code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
 	}
+}
+
+func TestDoctorJSONReportsSuccessAndIntegrityFailure(t *testing.T) {
+	repoRoot := initializeCLIProject(t)
+	restoreWorkingDirectory(t, repoRoot)
+
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{"doctor", "--json"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("doctor --json code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+	report := decodeDoctorReport(t, stdout.Bytes())
+	if report.SchemaVersion != 1 || report.ProjectInstanceID == "" || !report.OK || len(report.Problems) != 0 {
+		t.Fatalf("success report = %#v", report)
+	}
+
+	currentProject, err := project.Load(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(context.Background(), `INSERT INTO artifacts(
+id, kind, original_name, original_media_type, original_relative_path, original_size, original_sha256,
+optimized_media_type, optimized_relative_path, optimized_size, optimized_sha256, created_at
+) VALUES ('missing-artifact', 'IMAGE', 'missing.png', 'image/png', 'missing.png', 1, ?,
+'image/png', 'missing.png', 1, ?, '2026-01-01T00:00:00Z')`, strings.Repeat("a", 64), strings.Repeat("b", 64)); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(context.Background(), []string{"doctor", "--json"}, &stdout, &stderr); code != 1 {
+		t.Fatalf("failed doctor --json code = %d, stdout = %q, stderr = %q", code, stdout.String(), stderr.String())
+	}
+	report = decodeDoctorReport(t, stdout.Bytes())
+	if report.OK || len(report.Problems) == 0 || !strings.Contains(stderr.String(), "完整性检查失败") {
+		t.Fatalf("failure report = %#v, stderr = %q", report, stderr.String())
+	}
+}
+
+func decodeDoctorReport(t *testing.T, content []byte) struct {
+	SchemaVersion     int      `json:"schema_version"`
+	ProjectInstanceID string   `json:"project_instance_id"`
+	OK                bool     `json:"ok"`
+	Problems          []string `json:"problems"`
+} {
+	t.Helper()
+	var report struct {
+		SchemaVersion     int      `json:"schema_version"`
+		ProjectInstanceID string   `json:"project_instance_id"`
+		OK                bool     `json:"ok"`
+		Problems          []string `json:"problems"`
+	}
+	if err := json.Unmarshal(content, &report); err != nil {
+		t.Fatalf("decode doctor report %q: %v", content, err)
+	}
+	return report
 }
 
 func TestCommandsRejectInvalidArguments(t *testing.T) {
