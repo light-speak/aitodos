@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 43
+const currentSchemaVersion = 44
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -1485,6 +1485,8 @@ ALTER TABLE experience_records ADD COLUMN candidate_fingerprint TEXT NOT NULL DE
 CREATE UNIQUE INDEX experience_records_run_candidate_idx
 ON experience_records(source_run_id, candidate_fingerprint)
 WHERE source_run_id IS NOT NULL AND candidate_fingerprint != '';`, true
+	case 44:
+		return retrievalEvalMigrationV44, true
 	default:
 		return "", false
 	}

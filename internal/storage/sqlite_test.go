@@ -54,8 +54,8 @@ func TestOpenEnablesRequiredPragmasAndMigrates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 43 {
-		t.Fatalf("schema version = %d, want 43", version)
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 }
 
@@ -217,8 +217,8 @@ CREATE TABLE schema_migrations (
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 43 {
-		t.Fatalf("schema version = %d, want 43", version)
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 	if _, err := NewTopicStore(upgraded).Create(ctx, topic.CreateInput{Title: "迁移后的 Topic"}); err != nil {
 		t.Fatalf("create Topic after migration: %v", err)

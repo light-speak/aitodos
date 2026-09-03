@@ -1,7 +1,14 @@
 import { useCallback, useState } from 'react'
 
-import { searchProject } from '../../api/client'
-import type { SearchItem, SearchQueryInput } from '../../types'
+import {
+	addRetrievalEvalResult,
+	getRetrievalEvalCases,
+	getRetrievalEvalRuns,
+	removeRetrievalEvalResult,
+	runRetrievalEval,
+	searchProject,
+} from '../../api/client'
+import type { CreateRetrievalEvalCaseInput, RetrievalEvalCase, RetrievalEvalRun, SearchItem, SearchQueryInput } from '../../types'
 
 interface SearchState {
 	items: SearchItem[]
@@ -15,6 +22,10 @@ const initialState: SearchState = { items: [], loading: false, error: null }
 
 export function useProjectSearch() {
 	const [state, setState] = useState<SearchState>(initialState)
+	const [evalCases, setEvalCases] = useState<RetrievalEvalCase[]>([])
+	const [evalRuns, setEvalRuns] = useState<RetrievalEvalRun[]>([])
+	const [evalLoading, setEvalLoading] = useState(false)
+	const [evalError, setEvalError] = useState<unknown>(null)
 	const search = useCallback(async (input: SearchQueryInput) => {
 		setState((current) => ({ ...current, loading: true, error: null }))
 		try {
@@ -38,7 +49,59 @@ export function useProjectSearch() {
 		}
 	}, [state.lastInput, state.loading, state.nextCursor])
 	const reset = useCallback(() => setState(initialState), [])
-	return { ...state, search, loadMore, reset }
+	const loadEvals = useCallback(async () => {
+		setEvalLoading(true)
+		setEvalError(null)
+		try {
+			const [cases, runs] = await Promise.all([getRetrievalEvalCases(), getRetrievalEvalRuns()])
+			setEvalCases(cases)
+			setEvalRuns(runs)
+		} catch (error: unknown) {
+			setEvalError(error)
+		} finally {
+			setEvalLoading(false)
+		}
+	}, [])
+	const addEvalResult = useCallback(async (input: CreateRetrievalEvalCaseInput) => {
+		setEvalLoading(true)
+		setEvalError(null)
+		try {
+			const updated = await addRetrievalEvalResult(input)
+			setEvalCases((current) => [updated, ...current.filter((item) => item.id !== updated.id)])
+		} catch (error: unknown) {
+			setEvalError(error)
+		} finally {
+			setEvalLoading(false)
+		}
+	}, [])
+	const removeEvalResult = useCallback(async (caseID: string, documentID: string) => {
+		setEvalLoading(true)
+		setEvalError(null)
+		try {
+			await removeRetrievalEvalResult(caseID, documentID)
+			setEvalCases(await getRetrievalEvalCases())
+		} catch (error: unknown) {
+			setEvalError(error)
+		} finally {
+			setEvalLoading(false)
+		}
+	}, [])
+	const runEval = useCallback(async (k: number) => {
+		setEvalLoading(true)
+		setEvalError(null)
+		try {
+			const created = await runRetrievalEval(k)
+			setEvalRuns((current) => [created, ...current])
+		} catch (error: unknown) {
+			setEvalError(error)
+		} finally {
+			setEvalLoading(false)
+		}
+	}, [])
+	return {
+		...state, search, loadMore, reset,
+		evalCases, evalRuns, evalLoading, evalError, loadEvals, addEvalResult, removeEvalResult, runEval,
+	}
 }
 
 function mergeSearchItems(current: SearchItem[], incoming: SearchItem[]): SearchItem[] {

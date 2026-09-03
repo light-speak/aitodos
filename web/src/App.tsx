@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIcon, AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from './api/client'
@@ -9,7 +9,6 @@ import { KanbanBoard } from './components/KanbanBoard'
 import { ReleaseDialog } from './components/ReleaseDialog'
 import { RepositoryDialog } from './components/RepositoryDialog'
 import { ProgressPage } from './components/ProgressPage'
-import { ProjectSearchDialog } from './components/ProjectSearchDialog'
 import { ProjectCapabilitiesPanel } from './components/ProjectCapabilitiesPanel'
 import { TaskDetailsDialog } from './components/TaskDetailsDialog'
 import { TopicDetailsDialog } from './components/TopicDetailsDialog'
@@ -40,6 +39,11 @@ import { useProjectSearch } from './features/search/useProjectSearch'
 import type { SearchItem, TaskFeedbackIntent } from './types'
 
 type AppView = 'topics' | 'tasks' | 'runs' | 'progress' | 'agents'
+
+const ProjectSearchDialog = lazy(async () => {
+	const module = await import('./components/ProjectSearchDialog')
+	return { default: module.ProjectSearchDialog }
+})
 
 export default function App() {
   const board = useTaskBoard()
@@ -79,6 +83,10 @@ export default function App() {
 	const topicPlanning = useTopicPlanning(selectedTopic, board.project?.workers_enabled ?? false)
 	const agentActivity = useAgentActivity(board.project !== null)
 	const projectSearch = useProjectSearch()
+	const loadRetrievalEvals = projectSearch.loadEvals
+	useEffect(() => {
+		if (showSearch) void loadRetrievalEvals()
+	}, [loadRetrievalEvals, showSearch])
 	const selectedTaskActiveRun = useMemo(
 		() => agentActivity.runs.find((run) => run.task_id === selectedTaskID) ?? null,
 		[agentActivity.runs, selectedTaskID],
@@ -242,13 +250,18 @@ export default function App() {
 			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} onConfigureDefaults={agents.configureDefaults} /></>
 		)}
       </main>
-		{showSearch ? <ProjectSearchDialog
+		{showSearch ? <Suspense fallback={null}><ProjectSearchDialog
 			items={projectSearch.items} loading={projectSearch.loading} error={projectSearch.error}
 			nextCursor={projectSearch.nextCursor}
+			evalCases={projectSearch.evalCases} evalRuns={projectSearch.evalRuns}
+			evalLoading={projectSearch.evalLoading} evalError={projectSearch.evalError}
 			onClose={() => { setShowSearch(false); projectSearch.reset() }}
 			onSearch={(input) => { void projectSearch.search(input) }}
 			onLoadMore={() => { void projectSearch.loadMore() }} onOpenItem={openSearchItem}
-		/> : null}
+			onAddEvalResult={(input) => { void projectSearch.addEvalResult(input) }}
+			onRemoveEvalResult={(caseID, documentID) => { void projectSearch.removeEvalResult(caseID, documentID) }}
+			onRunEval={(k) => { void projectSearch.runEval(k) }}
+		/></Suspense> : null}
       {creating ? (
         <CreateItemDialog
 			repository={git.repository}

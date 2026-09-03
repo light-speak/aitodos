@@ -74,6 +74,9 @@ import type {
 	CreateExperienceInput,
 	ExperienceRecall,
 	ExperienceOutcome,
+	RetrievalEvalCase,
+	CreateRetrievalEvalCaseInput,
+	RetrievalEvalRun,
 } from '../types'
 
 interface RequestOptions {
@@ -114,6 +117,26 @@ export async function searchProject(input: SearchQueryInput, signal?: AbortSigna
 	if (input.limit !== undefined) parameters.set('limit', String(input.limit))
 	if (input.cursor) parameters.set('cursor', input.cursor)
 	return parseSearchPage(await requestJSON(`/api/search?${parameters.toString()}`, { signal }))
+}
+
+export async function getRetrievalEvalCases(signal?: AbortSignal): Promise<RetrievalEvalCase[]> {
+	return parseArray(await requestJSON('/api/retrieval-evals/cases', { signal }), parseRetrievalEvalCase, '检索评测集格式无效')
+}
+
+export async function addRetrievalEvalResult(input: CreateRetrievalEvalCaseInput): Promise<RetrievalEvalCase> {
+	return parseRetrievalEvalCase(await requestJSON('/api/retrieval-evals/cases', { method: 'POST', body: input }))
+}
+
+export async function removeRetrievalEvalResult(caseID: string, documentID: string): Promise<void> {
+	await requestJSON(`/api/retrieval-evals/cases/${encodeURIComponent(caseID)}/relevances/${encodeURIComponent(documentID)}`, { method: 'DELETE' })
+}
+
+export async function getRetrievalEvalRuns(signal?: AbortSignal): Promise<RetrievalEvalRun[]> {
+	return parseArray(await requestJSON('/api/retrieval-evals/runs?limit=20', { signal }), parseRetrievalEvalRun, '检索评测历史格式无效')
+}
+
+export async function runRetrievalEval(k: number): Promise<RetrievalEvalRun> {
+	return parseRetrievalEvalRun(await requestJSON('/api/retrieval-evals/runs', { method: 'POST', body: { k } }))
 }
 
 export async function updateWorkerSettings(enabled: boolean, maxWorkers: number): Promise<ProjectInfo> {
@@ -1543,6 +1566,46 @@ function parseSearchItem(value: unknown): SearchItem {
 		subject_kind: value.subject_kind, subject_id: value.subject_id, stable_key: value.stable_key,
 		title: value.title, snippet: value.snippet, status: value.status,
 		current: value.current, updated_at: value.updated_at,
+	}
+}
+
+function parseRetrievalEvalCase(value: unknown): RetrievalEvalCase {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'query', 'note', 'created_at', 'updated_at']) ||
+		!Array.isArray(value.kinds) || !value.kinds.every(isSearchKind) || typeof value.only_current !== 'boolean' ||
+		typeof value.active !== 'boolean' || !Array.isArray(value.relevances)) {
+		throw new ApiError('检索评测用例格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id as string, query: value.query as string, kinds: value.kinds,
+		only_current: value.only_current, note: value.note as string, active: value.active,
+		relevances: value.relevances.map((relevance) => {
+			if (!isRecord(relevance) || !hasStringFields(relevance, ['document_id', 'stable_key', 'title']) || typeof relevance.available !== 'boolean') {
+				throw new ApiError('检索相关性标注格式无效', 502, 'INVALID_RESPONSE')
+			}
+			return { document_id: relevance.document_id as string, stable_key: relevance.stable_key as string, title: relevance.title as string, available: relevance.available }
+		}),
+		created_at: value.created_at as string, updated_at: value.updated_at as string,
+	}
+}
+
+function parseRetrievalEvalRun(value: unknown): RetrievalEvalRun {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'engine', 'created_at']) ||
+		!hasNumberFields(value, ['k', 'case_count', 'relevant_count', 'recalled_count', 'hit_cases', 'recall_at_k', 'hit_at_k', 'mrr']) ||
+		!Array.isArray(value.results)) {
+		throw new ApiError('检索评测结果格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id as string, engine: value.engine as string, k: value.k as number,
+		case_count: value.case_count as number, relevant_count: value.relevant_count as number,
+		recalled_count: value.recalled_count as number, hit_cases: value.hit_cases as number,
+		recall_at_k: value.recall_at_k as number, hit_at_k: value.hit_at_k as number, mrr: value.mrr as number,
+		results: value.results.map((result) => {
+			if (!isRecord(result) || !hasStringFields(result, ['case_id', 'document_id']) || typeof result.rank !== 'number') {
+				throw new ApiError('检索评测排名格式无效', 502, 'INVALID_RESPONSE')
+			}
+			return { case_id: result.case_id as string, document_id: result.document_id as string, rank: result.rank }
+		}),
+		created_at: value.created_at as string,
 	}
 }
 

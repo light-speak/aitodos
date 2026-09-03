@@ -61,6 +61,54 @@ export interface SearchQueryInput {
 	cursor?: string
 }
 
+export interface RetrievalEvalRelevance {
+	document_id: string
+	stable_key: string
+	title: string
+	available: boolean
+}
+
+export interface RetrievalEvalCase {
+	id: string
+	query: string
+	kinds: SearchKind[]
+	only_current: boolean
+	note: string
+	active: boolean
+	relevances: RetrievalEvalRelevance[]
+	created_at: string
+	updated_at: string
+}
+
+export interface CreateRetrievalEvalCaseInput {
+	query: string
+	kinds: SearchKind[]
+	only_current: boolean
+	document_id: string
+	note?: string
+}
+
+export interface RetrievalEvalResult {
+	case_id: string
+	document_id: string
+	rank: number
+}
+
+export interface RetrievalEvalRun {
+	id: string
+	engine: string
+	k: number
+	case_count: number
+	relevant_count: number
+	recalled_count: number
+	hit_cases: number
+	recall_at_k: number
+	hit_at_k: number
+	mrr: number
+	results: RetrievalEvalResult[]
+	created_at: string
+}
+
 export const messageAuthorKinds = ['HUMAN', 'AGENT', 'SYSTEM'] as const
 
 export type MessageAuthorKind = (typeof messageAuthorKinds)[number]

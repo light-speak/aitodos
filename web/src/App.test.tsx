@@ -651,7 +651,7 @@ describe('App', () => {
 		await screen.findByText('讨论 Agent 上下文')
 
 		await user.click(screen.getByRole('button', { name: '搜索项目' }))
-		const searchDialog = screen.getByRole('dialog', { name: '搜索项目' })
+		const searchDialog = await screen.findByRole('dialog', { name: '搜索项目' })
 		await user.type(within(searchDialog).getByLabelText('搜索项目内容'), 'Session')
 		await user.click(within(searchDialog).getByRole('button', { name: '搜索' }))
 		await user.click(await within(searchDialog).findByRole('button', { name: /你的消息/ }))
