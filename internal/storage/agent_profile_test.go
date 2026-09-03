@@ -97,4 +97,43 @@ func TestAgentProfileStoreCreatesImmutableRevision(t *testing.T) {
 	if history[1].Instructions != profile.CurrentRevision.Instructions {
 		t.Fatal("creating revision changed revision 1")
 	}
+	loadedRevision, err := store.GetRevision(ctx, created.CurrentRevision.ID)
+	if err != nil || loadedRevision.ID != created.CurrentRevision.ID || len(loadedRevision.ToolPolicy.Skills) != 1 {
+		t.Fatalf("GetRevision() = %#v, %v", loadedRevision, err)
+	}
+	if _, err := store.GetRevision(ctx, "missing"); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing GetRevision() error = %v", err)
+	}
+}
+
+func TestAgentProfileStoreConfiguresAllUnconfiguredCodexProfilesAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := NewAgentProfileStore(openTaskTestDatabase(t))
+
+	configured, err := store.ConfigureCodexDefaults(ctx, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configured) != 5 {
+		t.Fatalf("profiles = %d", len(configured))
+	}
+	for _, profile := range configured {
+		revision := profile.CurrentRevision
+		if revision.Revision != 2 || revision.Adapter != "codex-app-server" || revision.Command != "codex" || revision.Model != "" {
+			t.Fatalf("configured profile = %#v", profile)
+		}
+	}
+
+	again, err := store.ConfigureCodexDefaults(ctx, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range again {
+		if profile.CurrentRevision.Revision != 2 {
+			t.Fatalf("idempotent profile = %#v", profile)
+		}
+	}
+	if _, err := store.ConfigureCodexDefaults(ctx, ""); err == nil {
+		t.Fatal("empty command accepted")
+	}
 }

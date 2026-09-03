@@ -24,6 +24,11 @@ func TestTaskFeedbackDiscussionClaimsReadOnlyReviewWithoutChangingTaskState(t *t
 	if err != nil || feedback.Status != taskfeedback.StatusQueued || feedback.SourceMessageID != message.ID {
 		t.Fatalf("Discuss() = %#v, %#v, %v", message, feedback, err)
 	}
+	feedbackStore := NewTaskFeedbackStore(database)
+	pending, err := feedbackStore.HasPendingTask(ctx, created.ID)
+	if err != nil || !pending {
+		t.Fatalf("HasPendingTask() = %v, %v", pending, err)
+	}
 
 	runs := NewRunStore(database)
 	claim, err := runs.ClaimNextTask(ctx, 1, time.Minute)
@@ -32,6 +37,10 @@ func TestTaskFeedbackDiscussionClaimsReadOnlyReviewWithoutChangingTaskState(t *t
 	}
 	if claim.Run.Purpose != run.PurposeReview || claim.Run.TaskID != created.ID {
 		t.Fatalf("review claim = %#v", claim.Run)
+	}
+	question, err := feedbackStore.QuestionForRun(ctx, claim.Run.ID)
+	if err != nil || question.ID != message.ID {
+		t.Fatalf("QuestionForRun() = %#v, %v", question, err)
 	}
 	loaded, err := NewTaskStore(database).Get(ctx, created.ID)
 	if err != nil || loaded.Status != task.StatusReady {
@@ -58,6 +67,13 @@ func TestTaskFeedbackDiscussionClaimsReadOnlyReviewWithoutChangingTaskState(t *t
 	finished, err := NewTaskFeedbackStore(database).Get(ctx, feedback.ID)
 	if err != nil || finished.Status != taskfeedback.StatusAnswered || finished.RunID != claim.Run.ID || finished.ResponseMessageID != messages[1].ID {
 		t.Fatalf("finished feedback = %#v, %v", finished, err)
+	}
+	pending, err = feedbackStore.HasPendingTask(ctx, created.ID)
+	if err != nil || pending {
+		t.Fatalf("HasPendingTask() after answer = %v, %v", pending, err)
+	}
+	if _, err := feedbackStore.QuestionForRun(ctx, "missing"); err != ErrTaskFeedbackNotFound {
+		t.Fatalf("missing QuestionForRun() error = %v", err)
 	}
 }
 

@@ -107,6 +107,7 @@ const runningRun = {
 let openClarifications: unknown[] = []
 let openApprovals: unknown[] = []
 let activeRuns: unknown[] = []
+let schedulerError = ''
 
 const fetchMock = vi.fn<typeof fetch>((input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -119,12 +120,15 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
       agent: 'codex',
 		workers_enabled: false,
       max_workers: 2,
+		scheduler_failures: schedulerError ? 1 : 0,
+		scheduler_error: schedulerError,
     }))
   }
 	if (url === '/api/project/workers' && method === 'POST') {
 		return Promise.resolve(Response.json({
 			name: 'AiTodos', root: '/projects/aitodos', agent: 'codex',
 			workers_enabled: true, max_workers: 2,
+			scheduler_failures: 0, scheduler_error: '',
 		}))
 	}
   if (url === '/api/tasks' && method === 'GET') {
@@ -399,7 +403,16 @@ describe('App', () => {
 		openClarifications = []
 		openApprovals = []
 		activeRuns = []
+		schedulerError = ''
   })
+
+	it('在顶部暴露 Worker 调度异常', async () => {
+		schedulerError = 'database unavailable'
+		render(<App />)
+
+		const warning = await screen.findByRole('button', { name: 'Worker 调度异常' })
+		expect(warning).toHaveAttribute('title', 'database unavailable')
+	})
 
   afterEach(() => {
     vi.unstubAllGlobals()

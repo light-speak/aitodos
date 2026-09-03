@@ -15,13 +15,18 @@ import (
 func TestProjectRoutesReadAndUpdateWorkerSettings(t *testing.T) {
 	currentProject := initializeHTTPTestProject(t)
 	mux := http.NewServeMux()
-	RegisterProjectRoutes(mux, currentProject)
+	RegisterProjectRoutes(mux, currentProject, func() SchedulerStatus {
+		return SchedulerStatus{ConsecutiveFailures: 3, LastError: "database unavailable"}
+	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 
 	initial := requestProjectInfo(t, server.Client(), http.MethodGet, server.URL+"/api/project", "", http.StatusOK)
 	if initial.WorkersEnabled || initial.MaxWorkers != 2 {
 		t.Fatalf("initial project info = %#v", initial)
+	}
+	if initial.SchedulerFailures != 3 || initial.SchedulerError != "database unavailable" {
+		t.Fatalf("initial scheduler info = %#v", initial)
 	}
 
 	updated := requestProjectInfo(t, server.Client(), http.MethodPost, server.URL+"/api/project/workers", `{
@@ -55,12 +60,36 @@ func TestProjectRoutesRejectInvalidWorkerSettings(t *testing.T) {
 	}
 }
 
+func TestProjectRoutesRejectJSONBodyWithUnsafeContentType(t *testing.T) {
+	currentProject := initializeHTTPTestProject(t)
+	mux := http.NewServeMux()
+	RegisterProjectRoutes(mux, currentProject)
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/project/workers", bytes.NewBufferString(`{"enabled":true,"max_workers":2}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "text/plain")
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", response.StatusCode, http.StatusBadRequest)
+	}
+}
+
 type projectInfoResponse struct {
-	Name           string `json:"name"`
-	Root           string `json:"root"`
-	Agent          string `json:"agent"`
-	WorkersEnabled bool   `json:"workers_enabled"`
-	MaxWorkers     int    `json:"max_workers"`
+	Name              string `json:"name"`
+	Root              string `json:"root"`
+	Agent             string `json:"agent"`
+	WorkersEnabled    bool   `json:"workers_enabled"`
+	MaxWorkers        int    `json:"max_workers"`
+	SchedulerFailures int    `json:"scheduler_failures"`
+	SchedulerError    string `json:"scheduler_error"`
 }
 
 func requestProjectInfo(

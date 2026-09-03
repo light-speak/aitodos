@@ -79,6 +79,34 @@ func TestTaskRoutesValidateInputAndNotFound(t *testing.T) {
 	requestTask(t, server.Client(), http.MethodGet, server.URL+"/api/tasks/missing", "", http.StatusNotFound)
 }
 
+func TestTaskRoutesEditCancelAndArchive(t *testing.T) {
+	server := newTaskTestServer(t)
+	created := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"导出项目","description":"旧范围"}`, http.StatusCreated)
+	updated := requestTask(t, server.Client(), http.MethodPut, server.URL+"/api/tasks/"+created.ID+"/details", `{
+		"description":"导出完整项目","acceptance_criteria":"ZIP 可以恢复","priority":0,"expected_version":1
+	}`, http.StatusOK)
+	if updated.Priority != 0 || updated.AcceptanceCriteria != "ZIP 可以恢复" {
+		t.Fatalf("updated = %#v", updated)
+	}
+	cancelled := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/cancel", `{"expected_version":2}`, http.StatusOK)
+	if cancelled.Status != task.StatusCancelled {
+		t.Fatalf("cancelled = %#v", cancelled)
+	}
+	archived := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/archive", `{"expected_version":3}`, http.StatusOK)
+	if archived.ArchivedAt == nil {
+		t.Fatalf("archived = %#v", archived)
+	}
+	response, err := server.Client().Get(server.URL + "/api/tasks")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	var active []task.Task
+	if err := json.NewDecoder(response.Body).Decode(&active); err != nil || len(active) != 0 {
+		t.Fatalf("active = %#v, %v", active, err)
+	}
+}
+
 func TestTaskRoutesDiscussAndRelateTasks(t *testing.T) {
 	server := newTaskTestServer(t)
 	owner := requestTask(t, server.Client(), http.MethodPost, server.URL+"/api/tasks", `{"title":"前端交互"}`, http.StatusCreated)

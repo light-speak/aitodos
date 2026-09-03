@@ -5,6 +5,7 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/light-speak/aitodos/internal/domain/relation"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/topic"
 )
@@ -47,6 +48,41 @@ func TestRelationStoreLinksTopicsAndTasksIdempotently(t *testing.T) {
 	linked, err = store.ListTopicTasks(ctx, createdTopic.ID)
 	if err != nil || len(linked) != 0 {
 		t.Fatalf("linked tasks after unlink = %#v, %v", linked, err)
+	}
+}
+
+func TestRelationStorePreservesTypedDirection(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	tasks := NewTaskStore(database)
+	blocker, err := tasks.Create(ctx, task.CreateInput{Title: "先完成数据库迁移"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	blocked, err := tasks.Create(ctx, task.CreateInput{Title: "再上线接口"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRelationStore(database)
+	if err := store.LinkTasksTyped(ctx, blocker.ID, blocked.ID, relation.TypeBlocks); err != nil {
+		t.Fatal(err)
+	}
+	outgoing, err := store.ListTaskRelations(ctx, blocker.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	incoming, err := store.ListTaskRelations(ctx, blocked.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(outgoing) != 1 || outgoing[0].Type != relation.TypeBlocks || outgoing[0].Direction != relation.DirectionOutgoing {
+		t.Fatalf("outgoing = %#v", outgoing)
+	}
+	if len(incoming) != 1 || incoming[0].Type != relation.TypeBlocks || incoming[0].Direction != relation.DirectionIncoming {
+		t.Fatalf("incoming = %#v", incoming)
+	}
+	if err := store.UnlinkTaskRelation(ctx, blocker.ID, blocked.ID, relation.TypeBlocks); err != nil {
+		t.Fatal(err)
 	}
 }
 

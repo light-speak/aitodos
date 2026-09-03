@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/knowledge"
 	"github.com/light-speak/aitodos/internal/domain/plan"
 	"github.com/light-speak/aitodos/internal/domain/search"
 	"github.com/light-speak/aitodos/internal/domain/task"
@@ -210,6 +211,50 @@ func TestSearchStoreIndexesCanonicalItemsAndMessagesIncrementally(t *testing.T) 
 	}
 	if len(page.Items) != 1 || page.Items[0].SourceID != message.ID || page.Items[0].SubjectID != createdTopic.ID {
 		t.Fatalf("message results = %#v", page.Items)
+	}
+}
+
+func TestSearchStoreIndexesKnowledgeAndLabelsIncrementally(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "发布版本"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	knowledgeStore := NewKnowledgeStore(database)
+	decision, err := knowledgeStore.CreateDecision(ctx, knowledge.DecisionInput{
+		TaskID: created.ID, Title: "使用 squash merge", Content: "公共仓库保持线性历史",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	label, err := knowledgeStore.CreateLabel(ctx, knowledge.LabelInput{Name: "release"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := knowledgeStore.AttachTaskLabel(ctx, created.ID, label.ID); err != nil {
+		t.Fatal(err)
+	}
+	ci, err := knowledgeStore.CreateCISnapshot(ctx, created.ID, knowledge.CISnapshotInput{
+		Provider: "github", CommitSHA: "abcdef123", State: "FAILED",
+		Checks: []knowledge.CICheck{{Name: "CI / web", State: "FAILED"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, test := range []struct {
+		text string
+		kind search.Kind
+		id   string
+	}{
+		{text: "squash merge", kind: search.KindDecision, id: decision.ID},
+		{text: "release", kind: search.KindLabel, id: created.ID + ":" + label.ID},
+		{text: "CI / web", kind: search.KindCICheck, id: ci.ID},
+	} {
+		page, searchErr := NewSearchStore(database).Search(ctx, search.Query{Text: test.text, Kinds: []search.Kind{test.kind}, Limit: 20})
+		if searchErr != nil || len(page.Items) != 1 || page.Items[0].SourceID != test.id {
+			t.Fatalf("Search(%q) = %#v, %v", test.text, page.Items, searchErr)
+		}
 	}
 }
 

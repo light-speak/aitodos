@@ -11,6 +11,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
 )
 
 var (
@@ -21,7 +22,7 @@ var (
 )
 
 const clarificationColumns = `
-id, task_id, source_run_id, COALESCE(continuation_run_id, ''), continuation_purpose,
+id, COALESCE(topic_id, ''), COALESCE(task_id, ''), source_run_id, COALESCE(continuation_run_id, ''), continuation_purpose,
 category, question, options_json, recommended_option_id, allow_custom_answer,
 status, selected_option_id, custom_answer, version, created_at, updated_at,
 COALESCE(answered_at, '')`
@@ -49,6 +50,21 @@ func (store *ClarificationStore) ListTask(ctx context.Context, taskID string) ([
 	return listClarifications(ctx, store.database, `WHERE task_id = ? ORDER BY created_at DESC`, []any{taskID})
 }
 
+// ListTopic 返回 Topic 的完整问题历史。
+func (store *ClarificationStore) ListTopic(ctx context.Context, topicID string) ([]clarification.Clarification, error) {
+	if err := requireTopic(ctx, store.database, topicID); err != nil {
+		return nil, err
+	}
+	return listClarifications(ctx, store.database, `WHERE topic_id = ? ORDER BY created_at DESC`, []any{topicID})
+}
+
+// ClarificationAnswer 保存回答后需要刷新的领域主体。
+type ClarificationAnswer struct {
+	Clarification clarification.Clarification
+	Task          *task.Task
+	Topic         *topic.Topic
+}
+
 // GetForContinuationRun 返回触发指定续跑的已回答问题。
 func (store *ClarificationStore) GetForContinuationRun(ctx context.Context, runID string) (clarification.Clarification, error) {
 	item, err := scanClarification(store.database.QueryRowContext(ctx,
@@ -65,43 +81,51 @@ func (store *ClarificationStore) Answer(
 	id string,
 	input clarification.AnswerInput,
 ) (clarification.Clarification, task.Task, error) {
+	result, err := store.AnswerSubject(ctx, id, input)
+	if err != nil {
+		return clarification.Clarification{}, task.Task{}, err
+	}
+	if result.Task == nil {
+		return result.Clarification, task.Task{}, nil
+	}
+	return result.Clarification, *result.Task, nil
+}
+
+// AnswerSubject 原子保存人工回答并恢复对应 Topic 或 Task 的执行队列。
+func (store *ClarificationStore) AnswerSubject(
+	ctx context.Context,
+	id string,
+	input clarification.AnswerInput,
+) (ClarificationAnswer, error) {
 	transaction, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
-		return clarification.Clarification{}, task.Task{}, fmt.Errorf("begin clarification answer: %w", err)
+		return ClarificationAnswer{}, fmt.Errorf("begin clarification answer: %w", err)
 	}
 	defer transaction.Rollback()
 	current, err := getClarification(ctx, transaction, id)
 	if err != nil {
-		return clarification.Clarification{}, task.Task{}, err
+		return ClarificationAnswer{}, err
 	}
 	if current.Status != clarification.StatusOpen || current.Version != input.ExpectedVersion {
-		return clarification.Clarification{}, task.Task{}, ErrClarificationConflict
+		return ClarificationAnswer{}, ErrClarificationConflict
 	}
 	input = input.Normalized()
 	if err := input.ValidateFor(current); err != nil {
-		return clarification.Clarification{}, task.Task{}, err
+		return ClarificationAnswer{}, err
 	}
-	currentTask, err := getTask(ctx, transaction, current.TaskID)
-	if err != nil {
-		return clarification.Clarification{}, task.Task{}, err
-	}
-	command, err := resumeCommand(current.ContinuationPurpose)
-	if err != nil {
-		return clarification.Clarification{}, task.Task{}, err
-	}
-	next, err := task.Transition(currentTask.Status, command)
-	if err != nil {
-		return clarification.Clarification{}, task.Task{}, err
-	}
-	updatedTask, event, err := prepareTransition(currentTask, next, command)
-	if err != nil {
-		return clarification.Clarification{}, task.Task{}, err
-	}
-	if err := updateTaskStatus(ctx, transaction, currentTask, updatedTask); err != nil {
-		return clarification.Clarification{}, task.Task{}, err
-	}
-	if err := insertTaskEvent(ctx, transaction, event); err != nil {
-		return clarification.Clarification{}, task.Task{}, err
+	answer := ClarificationAnswer{}
+	if current.TopicID != "" {
+		updatedTopic, resumeErr := resumeTopicClarification(ctx, transaction, current)
+		if resumeErr != nil {
+			return ClarificationAnswer{}, resumeErr
+		}
+		answer.Topic = &updatedTopic
+	} else {
+		updatedTask, resumeErr := resumeTaskClarification(ctx, transaction, current)
+		if resumeErr != nil {
+			return ClarificationAnswer{}, resumeErr
+		}
+		answer.Task = &updatedTask
 	}
 	now := time.Now().UTC()
 	result, err := transaction.ExecContext(ctx, `
@@ -111,10 +135,10 @@ SET status = 'ANSWERED', selected_option_id = ?, custom_answer = ?,
 WHERE id = ? AND status = 'OPEN' AND version = ?`, input.SelectedOptionID,
 		input.CustomAnswer, formatTime(now), formatTime(now), id, input.ExpectedVersion)
 	if err != nil {
-		return clarification.Clarification{}, task.Task{}, fmt.Errorf("answer clarification: %w", err)
+		return ClarificationAnswer{}, fmt.Errorf("answer clarification: %w", err)
 	}
 	if err := requireClarificationChange(result); err != nil {
-		return clarification.Clarification{}, task.Task{}, err
+		return ClarificationAnswer{}, err
 	}
 	current.Status = clarification.StatusAnswered
 	current.SelectedOptionID = input.SelectedOptionID
@@ -123,9 +147,73 @@ WHERE id = ? AND status = 'OPEN' AND version = ?`, input.SelectedOptionID,
 	current.AnsweredAt = now
 	current.UpdatedAt = now
 	if err := transaction.Commit(); err != nil {
-		return clarification.Clarification{}, task.Task{}, fmt.Errorf("commit clarification answer: %w", err)
+		return ClarificationAnswer{}, fmt.Errorf("commit clarification answer: %w", err)
 	}
-	return current, updatedTask, nil
+	answer.Clarification = current
+	return answer, nil
+}
+
+func resumeTaskClarification(ctx context.Context, transaction *sql.Tx, current clarification.Clarification) (task.Task, error) {
+	currentTask, err := getTask(ctx, transaction, current.TaskID)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.ContinuationPurpose == domainrun.PurposeTriage {
+		return currentTask, nil
+	}
+	command, err := resumeCommand(current.ContinuationPurpose)
+	if err != nil {
+		return task.Task{}, err
+	}
+	next, err := task.Transition(currentTask.Status, command)
+	if err != nil {
+		return task.Task{}, err
+	}
+	updated, event, err := prepareTransition(currentTask, next, command)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := updateTaskStatus(ctx, transaction, currentTask, updated); err != nil {
+		return task.Task{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	return updated, nil
+}
+
+func resumeTopicClarification(ctx context.Context, transaction *sql.Tx, current clarification.Clarification) (topic.Topic, error) {
+	if current.ContinuationPurpose != domainrun.PurposePlanning {
+		return topic.Topic{}, errors.New("topic clarification continuation purpose 无效")
+	}
+	loaded, err := getTopic(ctx, transaction, current.TopicID)
+	if err != nil {
+		return topic.Topic{}, err
+	}
+	if loaded.Status != topic.StatusOpen {
+		return topic.Topic{}, errors.New("only open topic can resume planning")
+	}
+	updated := loaded
+	updated.Version++
+	updated.UpdatedAt = time.Now().UTC()
+	result, err := transaction.ExecContext(ctx, `UPDATE topics SET version = ?, updated_at = ?
+WHERE id = ? AND status = 'OPEN' AND version = ?`, updated.Version, formatTime(updated.UpdatedAt), loaded.ID, loaded.Version)
+	if err != nil {
+		return topic.Topic{}, fmt.Errorf("resume topic clarification: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return topic.Topic{}, ErrTopicVersionConflict
+	}
+	event, err := newTopicActivityEvent(updated, topic.EventPlanningAsked, map[string]any{
+		"schema_version": 1, "clarification_id": current.ID,
+	})
+	if err != nil {
+		return topic.Topic{}, err
+	}
+	if err := insertTopicEvent(ctx, transaction, event); err != nil {
+		return topic.Topic{}, err
+	}
+	return updated, nil
 }
 
 func listClarifications(ctx context.Context, queryer interface {
@@ -159,7 +247,7 @@ func getClarification(ctx context.Context, queryer rowQueryer, id string) (clari
 func scanClarification(scanner rowScanner) (clarification.Clarification, error) {
 	var item clarification.Clarification
 	var optionsJSON, createdAt, updatedAt, answeredAt string
-	if err := scanner.Scan(&item.ID, &item.TaskID, &item.SourceRunID, &item.ContinuationRunID,
+	if err := scanner.Scan(&item.ID, &item.TopicID, &item.TaskID, &item.SourceRunID, &item.ContinuationRunID,
 		&item.ContinuationPurpose, &item.Category, &item.Question, &optionsJSON,
 		&item.RecommendedOptionID, &item.AllowCustomAnswer, &item.Status,
 		&item.SelectedOptionID, &item.CustomAnswer, &item.Version, &createdAt,
@@ -202,7 +290,7 @@ func buildClarification(currentRun domainrun.Run, request clarification.Request)
 	}
 	now := time.Now().UTC()
 	return clarification.Clarification{
-		ID: id, TaskID: currentRun.TaskID, SourceRunID: currentRun.ID,
+		ID: id, TopicID: currentRun.TopicID, TaskID: currentRun.TaskID, SourceRunID: currentRun.ID,
 		ContinuationPurpose: currentRun.Purpose, Category: request.Category,
 		Question: request.Question, Options: request.Options,
 		RecommendedOptionID: request.RecommendedOptionID,
@@ -218,11 +306,11 @@ func insertClarification(ctx context.Context, transaction *sql.Tx, item clarific
 	}
 	_, err = transaction.ExecContext(ctx, `
 INSERT INTO clarifications(
-    id, task_id, source_run_id, continuation_run_id, continuation_purpose,
+    id, topic_id, task_id, source_run_id, continuation_run_id, continuation_purpose,
     category, question, options_json, recommended_option_id, allow_custom_answer,
     status, selected_option_id, custom_answer, version, created_at, updated_at, answered_at
-) VALUES (?, ?, ?, NULL, ?, ?, ?, ?, ?, ?, 'OPEN', '', '', 1, ?, ?, NULL)`,
-		item.ID, item.TaskID, item.SourceRunID, item.ContinuationPurpose,
+) VALUES (?, NULLIF(?, ''), NULLIF(?, ''), ?, NULL, ?, ?, ?, ?, ?, ?, 'OPEN', '', '', 1, ?, ?, NULL)`,
+		item.ID, item.TopicID, item.TaskID, item.SourceRunID, item.ContinuationPurpose,
 		item.Category, item.Question, string(optionsJSON), item.RecommendedOptionID,
 		item.AllowCustomAnswer, formatTime(item.CreatedAt), formatTime(item.UpdatedAt))
 	if err != nil {

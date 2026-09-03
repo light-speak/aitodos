@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ActivityIcon, RefreshCwIcon, TerminalIcon } from 'lucide-react'
 
-import { errorMessage, retryTask } from '../api/client'
+import { ApiError, errorMessage, getRunExperiences, getRunMCPCalls, getRunResources, getRunSummary, recordExperienceOutcome, retryTask } from '../api/client'
 import { useTaskRuns } from '../features/runs/useTaskRuns'
-import type { AgentRun, RunArtifact, RunLog, RunStatus, RunUsage, Task } from '../types'
+import type { AgentRun, ExperienceOutcome, ExperienceRecall, MCPAuditEvent, RunArtifact, RunLog, RunResourceLease, RunStatus, RunSummary, RunUsage, Task } from '../types'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog'
@@ -140,9 +140,51 @@ function RunDetailContent({ state }: { state: RunPanelState }) {
 				</div>
 			) : null}
 			{detail.usage ? <UsageSummary usage={detail.usage} /> : null}
+			<RunObservability run={run} />
 			<RunLogs artifacts={detail.artifacts} state={state} />
 		</div>
 	)
+}
+
+function RunObservability({ run }: { run: AgentRun }) {
+	const [data, setData] = useState<{ summary?: RunSummary; calls: MCPAuditEvent[]; resources: RunResourceLease[]; experiences: ExperienceRecall[] } | null>(null)
+	const [error, setError] = useState<unknown>(null)
+	useEffect(() => {
+		const controller = new AbortController()
+		const summary = getRunSummary(run.id, controller.signal).catch((cause: unknown) => {
+			if (cause instanceof ApiError && cause.status === 404) return undefined
+			throw cause
+		})
+		void Promise.all([summary, getRunMCPCalls(run.id, controller.signal), getRunResources(run.id, controller.signal), getRunExperiences(run.id, controller.signal)]).then(
+			([runSummary, calls, resources, experiences]) => setData({ ...(runSummary ? { summary: runSummary } : {}), calls, resources, experiences }),
+			(cause: unknown) => { if (!controller.signal.aborted) setError(cause) },
+		)
+		return () => controller.abort()
+	}, [run.id])
+	if (error) return <p className="rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive" role="alert">无法读取 Run 审计：{errorMessage(error)}</p>
+	if (data === null) return <p className="text-sm text-muted-foreground">正在读取 Run 摘要与工具审计…</p>
+	async function recordOutcome(recallID: string, outcome: Exclude<ExperienceOutcome, 'PENDING'>) {
+		setError(null)
+		try {
+			await recordExperienceOutcome(recallID, outcome)
+			setData((current) => current === null ? current : {
+				...current, experiences: current.experiences.map((item) => item.recall_id === recallID ? { ...item, outcome } : item),
+			})
+		} catch (cause: unknown) {
+			setError(cause)
+		}
+	}
+	return <div className="rounded-xl border p-4">
+		<h4 className="mb-3 text-sm font-semibold">摘要、经验与 MCP 审计</h4>
+		{data.summary ? <p className="text-sm">{data.summary.summary} · 测试通过 {data.summary.passed_tests}，失败 {data.summary.failed_tests}</p> : <p className="text-sm text-muted-foreground">Run 完成后生成确定性摘要。</p>}
+		{data.experiences.length > 0 ? <div className="mt-4"><p className="text-xs font-medium">本次召回经验</p><ul className="mt-2 space-y-2">{data.experiences.map((item) => <li key={item.recall_id} className="rounded-lg bg-muted/40 p-3 text-xs"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{item.experience.title}</span><Badge variant="outline">匹配 {Math.round(item.score.final_score * 100)}%</Badge><span className="text-muted-foreground">{item.experience.summary}</span></div><div className="mt-2 flex flex-wrap items-center gap-1"><span className="mr-1 text-muted-foreground">这条经验：</span>{(['HELPFUL', 'IGNORED', 'HARMFUL'] as const).map((outcome) => <Button key={outcome} type="button" size="sm" variant={item.outcome === outcome ? 'secondary' : 'ghost'} onClick={() => { void recordOutcome(item.recall_id, outcome) }}>{experienceOutcomeLabel(outcome)}</Button>)}</div></li>)}</ul></div> : <p className="mt-3 text-xs text-muted-foreground">本次 Run 没有召回项目经验。</p>}
+		{data.calls.length > 0 ? <ul className="mt-3 space-y-1 text-xs">{data.calls.map((call) => <li key={call.id} className="flex flex-wrap items-center gap-2"><Badge variant="outline">{call.phase}</Badge><span className="font-mono">{call.server_name}/{call.tool_name}</span><span className="text-muted-foreground">参数字段：{call.argument_keys.join(', ') || '无'}</span></li>)}</ul> : <p className="mt-3 text-xs text-muted-foreground">本次 Run 没有可观测的 MCP 调用。</p>}
+		{data.resources.map((resource) => <p key={resource.id} className={`mt-2 text-xs ${resource.state === 'ABANDONED' ? 'text-destructive' : 'text-muted-foreground'}`}>浏览器资源 {resource.provider_name}：{resource.state}{resource.cleanup_reason ? ` · ${resource.cleanup_reason}` : ''}</p>)}
+	</div>
+}
+
+function experienceOutcomeLabel(outcome: Exclude<ExperienceOutcome, 'PENDING'>): string {
+	return ({ HELPFUL: '有帮助', IGNORED: '无关', HARMFUL: '造成误导' })[outcome]
 }
 
 function UsageSummary({ usage }: { usage: RunUsage }) {

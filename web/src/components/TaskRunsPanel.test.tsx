@@ -1,4 +1,5 @@
 import { cleanup, render, screen, waitFor } from '@testing-library/react'
+import userEvent from '@testing-library/user-event'
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import type { RunEvent, RunStatus, Task } from '../types'
@@ -57,6 +58,41 @@ describe('TaskRunsPanel SSE', () => {
 		source.emit(runEvent(2, 'SUCCEEDED'))
 		await waitFor(() => expect(screen.getByText('成功')).toBeInTheDocument())
 		expect(source.close).toHaveBeenCalled()
+	})
+
+	it('展示 Run 召回经验并记录人工结果', async () => {
+		const run = {
+			id: 'run-memory', purpose: 'IMPLEMENTATION', task_id: 'task-1', status: 'SUCCEEDED',
+			profile_revision_id: 'revision-1', subject_version: 1, lease_generation: 1,
+			lease_expires_at: '2026-08-21T00:10:00Z', queued_at: '2026-08-21T00:00:00Z',
+			claimed_at: '2026-08-21T00:00:01Z', started_at: '2026-08-21T00:00:02Z',
+			finished_at: '2026-08-21T00:00:04Z', created_at: '2026-08-21T00:00:00Z', updated_at: '2026-08-21T00:00:04Z',
+		}
+		const fetchMock = vi.fn<typeof fetch>((input, init) => {
+			const path = typeof input === 'string' ? input : input instanceof URL ? input.toString() : input.url
+			if (path === '/api/tasks/task-1/runs') return Promise.resolve(Response.json([run]))
+			if (path === '/api/runs/run-memory') return Promise.resolve(Response.json({ run, artifacts: [] }))
+			if (path.endsWith('/summary')) return Promise.resolve(Response.json({ code: 'RUN_SUMMARY_NOT_FOUND', message: 'missing' }, { status: 404 }))
+			if (path.endsWith('/mcp-calls') || path.endsWith('/resources')) return Promise.resolve(Response.json([]))
+			if (path.endsWith('/experiences')) return Promise.resolve(Response.json([{
+				recall_id: 'recall-1', rank: 1, outcome: 'PENDING', recalled_at: '2026-08-21T00:00:02Z',
+				score: { relevance_score: 0.9, utility_score: 0.8, scope_score: 1, freshness_score: 1, final_score: 0.88 },
+				experience: {
+					id: 'experience-1', key: 'EXP-1', task_id: 'task-1', title: '先跑状态机测试', summary: '修改前后都运行表驱动测试',
+					guidance: 'go test', applicability: '状态迁移', project_wide: true, status: 'ACTIVE', pinned: false,
+					verification_count: 1, successful_applications: 0, failed_applications: 0, recall_count: 1,
+					created_at: '2026-08-20T00:00:00Z', updated_at: '2026-08-20T00:00:00Z',
+				},
+			}]))
+			if (path === '/api/experience-recalls/recall-1/outcome' && init?.method === 'POST') return Promise.resolve(new Response(null, { status: 204 }))
+			return Promise.reject(new Error(`unexpected request: ${path}`))
+		})
+		vi.stubGlobal('fetch', fetchMock)
+		render(<TaskRunsPanel task={{ ...taskFixture, status: 'REVIEW' }} onTaskUpdated={vi.fn()} />)
+		await userEvent.click(await screen.findByRole('button', { name: '查看 Run run-memory' }))
+		expect(await screen.findByText('先跑状态机测试')).toBeInTheDocument()
+		await userEvent.click(screen.getByRole('button', { name: '有帮助' }))
+		await waitFor(() => expect(fetchMock).toHaveBeenCalledWith('/api/experience-recalls/recall-1/outcome', expect.objectContaining({ method: 'POST' })))
 	})
 })
 

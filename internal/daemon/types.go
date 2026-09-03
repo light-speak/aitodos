@@ -18,4 +18,6 @@ type Health struct {
 	ProjectInstanceID string `json:"project_instance_id"`
 	Nonce             string `json:"nonce"`
 	PID               int    `json:"pid"`
+	Version           string `json:"version"`
+	Commit            string `json:"commit"`
 }

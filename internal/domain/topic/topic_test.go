@@ -44,6 +44,18 @@ func TestTransitionRejectsUndocumentedCombination(t *testing.T) {
 	if !errors.As(err, &transitionErr) {
 		t.Fatalf("Transition() error = %T, want *TransitionError", err)
 	}
+	if transitionErr.Error() == "" {
+		t.Fatal("TransitionError.Error() returned an empty message")
+	}
+}
+
+func TestStateCatalogsContainEveryDeclaredValue(t *testing.T) {
+	if got := AllStatuses(); len(got) != 5 || got[0] != StatusOpen || got[len(got)-1] != StatusClosed {
+		t.Fatalf("AllStatuses() = %#v", got)
+	}
+	if got := AllCommands(); len(got) != 6 || got[0] != CommandRequestClarification || got[len(got)-1] != CommandClose {
+		t.Fatalf("AllCommands() = %#v", got)
+	}
 }
 
 func TestCreateInputValidationAndNormalization(t *testing.T) {

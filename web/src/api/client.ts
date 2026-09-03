@@ -11,7 +11,10 @@ import type {
   ProjectInfo,
   Task,
   TaskAssociation,
+	TaskRelationDirection,
+	TaskRelationType,
   TaskStatus,
+	UpdateTaskDetailsInput,
   Topic,
   TopicAssociation,
   MessageAuthorKind,
@@ -60,6 +63,17 @@ import type {
 	SearchItem,
 	SearchPage,
 	SearchQueryInput,
+	KnowledgeLabel,
+	Decision,
+	CISnapshot,
+	CIState,
+	RunSummary,
+	MCPAuditEvent,
+	RunResourceLease,
+	ExperienceRecord,
+	CreateExperienceInput,
+	ExperienceRecall,
+	ExperienceOutcome,
 } from '../types'
 
 interface RequestOptions {
@@ -82,6 +96,12 @@ export class ApiError extends Error {
 
 export async function getProject(signal?: AbortSignal): Promise<ProjectInfo> {
   return parseProject(await requestJSON('/api/project', { signal }))
+}
+
+export async function configureCodexAgentDefaults(): Promise<AgentProfile[]> {
+	const value = await requestJSON('/api/agent-profiles/configure-codex', { method: 'POST' })
+	if (!Array.isArray(value)) throw new ApiError('Agent 配置列表格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseAgentProfile)
 }
 
 export async function searchProject(input: SearchQueryInput, signal?: AbortSignal): Promise<SearchPage> {
@@ -165,6 +185,84 @@ export async function getRunLog(runID: string, stream: RunLog['stream'], signal?
 	return parseRunLog(await requestJSON(`/api/runs/${encodeURIComponent(runID)}/logs?stream=${stream}`, { signal }))
 }
 
+export async function getRunSummary(runID: string, signal?: AbortSignal): Promise<RunSummary> {
+	return parseRunSummary(await requestJSON(`/api/runs/${encodeURIComponent(runID)}/summary`, { signal }))
+}
+
+export async function getRunMCPCalls(runID: string, signal?: AbortSignal): Promise<MCPAuditEvent[]> {
+	const value = await requestJSON(`/api/runs/${encodeURIComponent(runID)}/mcp-calls`, { signal })
+	if (!Array.isArray(value)) throw new ApiError('MCP 调用记录格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseMCPAuditEvent)
+}
+
+export async function getRunResources(runID: string, signal?: AbortSignal): Promise<RunResourceLease[]> {
+	const value = await requestJSON(`/api/runs/${encodeURIComponent(runID)}/resources`, { signal })
+	if (!Array.isArray(value)) throw new ApiError('Run 资源记录格式无效', 502, 'INVALID_RESPONSE')
+	return value.map(parseRunResourceLease)
+}
+
+export async function getLabels(signal?: AbortSignal): Promise<KnowledgeLabel[]> {
+	return parseArray(await requestJSON('/api/labels', { signal }), parseKnowledgeLabel, '标签列表格式无效')
+}
+
+export async function createLabel(name: string, color: string): Promise<KnowledgeLabel> {
+	return parseKnowledgeLabel(await requestJSON('/api/labels', { method: 'POST', body: { name, color } }))
+}
+
+export async function getSubjectLabels(kind: 'topics' | 'tasks', id: string, signal?: AbortSignal): Promise<KnowledgeLabel[]> {
+	return parseArray(await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/labels`, { signal }), parseKnowledgeLabel, '主体标签格式无效')
+}
+
+export async function setSubjectLabel(kind: 'topics' | 'tasks', id: string, labelID: string, attached: boolean): Promise<void> {
+	await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/labels/${encodeURIComponent(labelID)}`, { method: attached ? 'POST' : 'DELETE' })
+}
+
+export async function getSubjectDecisions(kind: 'topics' | 'tasks', id: string, signal?: AbortSignal): Promise<Decision[]> {
+	return parseArray(await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/decisions`, { signal }), parseDecision, '决策列表格式无效')
+}
+
+export async function createSubjectDecision(kind: 'topics' | 'tasks', id: string, title: string, content: string): Promise<Decision> {
+	return parseDecision(await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/decisions`, { method: 'POST', body: { title, content } }))
+}
+
+export async function getSubjectExperiences(kind: 'topics' | 'tasks', id: string, signal?: AbortSignal): Promise<ExperienceRecord[]> {
+	return parseArray(await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/experiences?include_inactive=true`, { signal }), parseExperience, '经验列表格式无效')
+}
+
+export async function createSubjectExperience(kind: 'topics' | 'tasks', id: string, input: CreateExperienceInput): Promise<ExperienceRecord> {
+	return parseExperience(await requestJSON(`/api/${kind}/${encodeURIComponent(id)}/experiences`, { method: 'POST', body: input }))
+}
+
+export async function pinExperience(id: string, pinned: boolean): Promise<ExperienceRecord> {
+	return parseExperience(await requestJSON(`/api/experiences/${encodeURIComponent(id)}/pin`, { method: 'POST', body: { pinned } }))
+}
+
+export async function confirmExperience(id: string): Promise<ExperienceRecord> {
+	return parseExperience(await requestJSON(`/api/experiences/${encodeURIComponent(id)}/confirm`, { method: 'POST' }))
+}
+
+export async function challengeExperience(id: string): Promise<ExperienceRecord> {
+	return parseExperience(await requestJSON(`/api/experiences/${encodeURIComponent(id)}/challenge`, { method: 'POST' }))
+}
+
+export async function getRunExperiences(runID: string, signal?: AbortSignal): Promise<ExperienceRecall[]> {
+	return parseArray(await requestJSON(`/api/runs/${encodeURIComponent(runID)}/experiences`, { signal }), parseExperienceRecall, 'Run 经验召回格式无效')
+}
+
+export async function recordExperienceOutcome(recallID: string, outcome: Exclude<ExperienceOutcome, 'PENDING'>): Promise<void> {
+	await requestJSON(`/api/experience-recalls/${encodeURIComponent(recallID)}/outcome`, { method: 'POST', body: { outcome } })
+}
+
+export async function getTaskCISnapshots(taskID: string, signal?: AbortSignal): Promise<CISnapshot[]> {
+	return parseArray(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/ci-snapshots`, { signal }), parseCISnapshot, 'CI 快照格式无效')
+}
+
+export async function createTaskCISnapshot(taskID: string, input: { provider: string; commit_sha: string; state: CIState; source_url: string }): Promise<CISnapshot> {
+	return parseCISnapshot(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/ci-snapshots`, {
+		method: 'POST', body: { ...input, checks: [], observed_at: new Date().toISOString() },
+	}))
+}
+
 export async function getAgentProfiles(signal?: AbortSignal): Promise<AgentProfile[]> {
 	const value = await requestJSON('/api/agent-profiles', { signal })
 	if (!Array.isArray(value)) throw new ApiError('Agent 配置格式无效', 502, 'INVALID_RESPONSE')
@@ -203,10 +301,18 @@ export async function getTaskClarifications(taskID: string, signal?: AbortSignal
 	return parseClarifications(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/clarifications`, { signal }))
 }
 
-export async function answerClarification(id: string, input: ClarificationAnswerInput): Promise<{ clarification: Clarification; task: Task }> {
+export async function getTopicClarifications(topicID: string, signal?: AbortSignal): Promise<Clarification[]> {
+	return parseClarifications(await requestJSON(`/api/topics/${encodeURIComponent(topicID)}/clarifications`, { signal }))
+}
+
+export async function answerClarification(id: string, input: ClarificationAnswerInput): Promise<{ clarification: Clarification; task?: Task; topic?: Topic }> {
 	const value = await requestJSON(`/api/clarifications/${encodeURIComponent(id)}/answer`, { method: 'POST', body: input })
 	if (!isRecord(value)) throw new ApiError('问题回答结果格式无效', 502, 'INVALID_RESPONSE')
-	return { clarification: parseClarification(value.clarification), task: parseTask(value.task) }
+	return {
+		clarification: parseClarification(value.clarification),
+		task: value.task === undefined ? undefined : parseTask(value.task),
+		topic: value.topic === undefined ? undefined : parseTopic(value.topic),
+	}
 }
 
 export async function getTaskQuality(taskID: string, signal?: AbortSignal): Promise<TaskQuality> {
@@ -220,6 +326,24 @@ export async function getTaskAssessment(taskID: string, signal?: AbortSignal): P
 export async function updateTaskTitle(taskID: string, title: string, expectedVersion: number): Promise<Task> {
 	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/title`, {
 		method: 'PUT', body: { title, expected_version: expectedVersion },
+	}))
+}
+
+export async function updateTaskDetails(taskID: string, input: UpdateTaskDetailsInput, expectedVersion: number): Promise<Task> {
+	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/details`, {
+		method: 'PUT', body: { ...input, expected_version: expectedVersion },
+	}))
+}
+
+export async function cancelTask(taskID: string, expectedVersion: number): Promise<Task> {
+	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/cancel`, {
+		method: 'POST', body: { expected_version: expectedVersion },
+	}))
+}
+
+export async function archiveTask(taskID: string, expectedVersion: number): Promise<Task> {
+	return parseTask(await requestJSON(`/api/tasks/${encodeURIComponent(taskID)}/archive`, {
+		method: 'POST', body: { expected_version: expectedVersion },
 	}))
 }
 
@@ -391,16 +515,19 @@ export async function getTaskAssociations(
   return payload.map(parseTaskAssociation)
 }
 
-export async function linkTask(subjectKind: DiscussionSubjectKind, subjectID: string, taskID: string): Promise<void> {
+export async function linkTask(subjectKind: DiscussionSubjectKind, subjectID: string, taskID: string, relationType: TaskRelationType = 'RELATES_TO'): Promise<void> {
   await requestJSON(`/api/${subjectKind}/${encodeURIComponent(subjectID)}/relations`, {
     method: 'POST',
-    body: { task_id: taskID },
+    body: subjectKind === 'tasks' ? { task_id: taskID, type: relationType } : { task_id: taskID },
   })
 }
 
-export async function unlinkTask(subjectKind: DiscussionSubjectKind, subjectID: string, taskID: string): Promise<void> {
+export async function unlinkTask(subjectKind: DiscussionSubjectKind, subjectID: string, association: TaskAssociation): Promise<void> {
+	const query = subjectKind === 'tasks' && association.type
+		? `?type=${encodeURIComponent(association.type)}&direction=${encodeURIComponent(association.direction ?? 'BIDIRECTIONAL')}`
+		: ''
   await requestJSON(
-    `/api/${subjectKind}/${encodeURIComponent(subjectID)}/relations/${encodeURIComponent(taskID)}`,
+    `/api/${subjectKind}/${encodeURIComponent(subjectID)}/relations/${encodeURIComponent(association.task.id)}${query}`,
     { method: 'DELETE' },
   )
 }
@@ -551,13 +678,16 @@ function parseProject(value: unknown): ProjectInfo {
     typeof value.root !== 'string' ||
     typeof value.agent !== 'string' ||
 		typeof value.workers_enabled !== 'boolean' ||
-    typeof value.max_workers !== 'number'
+		typeof value.max_workers !== 'number' ||
+		typeof value.scheduler_failures !== 'number' ||
+		typeof value.scheduler_error !== 'string'
   ) {
     throw new ApiError('Project 信息格式无效', 502, 'INVALID_RESPONSE')
   }
   return {
 		name: value.name, root: value.root, agent: value.agent,
 		workers_enabled: value.workers_enabled, max_workers: value.max_workers,
+		scheduler_failures: value.scheduler_failures, scheduler_error: value.scheduler_error,
 	}
 }
 
@@ -815,8 +945,9 @@ function parseClarifications(value: unknown): Clarification[] {
 }
 
 function parseClarification(value: unknown): Clarification {
-	if (!isRecord(value) || !hasStringFields(value, ['id', 'task_id', 'source_run_id', 'question', 'created_at', 'updated_at']) ||
-		(value.continuation_purpose !== 'IMPLEMENTATION' && value.continuation_purpose !== 'REVISION') ||
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'source_run_id', 'question', 'created_at', 'updated_at']) ||
+		(typeof value.task_id === 'string') === (typeof value.topic_id === 'string') ||
+		!isClarificationPurpose(value.continuation_purpose) ||
 		!isClarificationCategory(value.category) || (value.status !== 'OPEN' && value.status !== 'ANSWERED') ||
 		!Array.isArray(value.options) || typeof value.allow_custom_answer !== 'boolean' || typeof value.version !== 'number') {
 		throw new ApiError('待回答问题格式无效', 502, 'INVALID_RESPONSE')
@@ -828,16 +959,22 @@ function parseClarification(value: unknown): Clarification {
 		return { id: option.id as string, label: option.label as string, description: option.description as string }
 	})
 	return {
-		id: value.id as string, task_id: value.task_id as string, source_run_id: value.source_run_id as string,
+		id: value.id as string, source_run_id: value.source_run_id as string,
 		continuation_purpose: value.continuation_purpose, category: value.category, question: value.question as string,
 		options, allow_custom_answer: value.allow_custom_answer, status: value.status, version: value.version,
 		created_at: value.created_at as string, updated_at: value.updated_at as string,
 		...(typeof value.continuation_run_id === 'string' ? { continuation_run_id: value.continuation_run_id } : {}),
+		...(typeof value.task_id === 'string' ? { task_id: value.task_id } : {}),
+		...(typeof value.topic_id === 'string' ? { topic_id: value.topic_id } : {}),
 		...(typeof value.recommended_option_id === 'string' ? { recommended_option_id: value.recommended_option_id } : {}),
 		...(typeof value.selected_option_id === 'string' ? { selected_option_id: value.selected_option_id } : {}),
 		...(typeof value.custom_answer === 'string' ? { custom_answer: value.custom_answer } : {}),
 		...(typeof value.answered_at === 'string' ? { answered_at: value.answered_at } : {}),
 	}
+}
+
+function isClarificationPurpose(value: unknown): value is Clarification['continuation_purpose'] {
+	return value === 'PLANNING' || value === 'TRIAGE' || value === 'IMPLEMENTATION' || value === 'REVISION'
 }
 
 function isClarificationCategory(value: unknown): value is Clarification['category'] {
@@ -918,6 +1055,7 @@ function parseTaskTestResult(value: unknown): TaskTestResult {
 		outcome: value.outcome, evidence_kind: value.evidence_kind, summary: value.summary,
 		stale: typeof value.stale === 'boolean' ? value.stale : false, created_at: value.created_at,
 		...(typeof value.command === 'string' ? { command: value.command } : {}),
+		...(typeof value.exit_code === 'number' ? { exit_code: value.exit_code } : {}),
 		...(typeof value.artifact_ref === 'string' ? { artifact_ref: value.artifact_ref } : {}),
 		...(typeof value.source_run_id === 'string' ? { source_run_id: value.source_run_id } : {}),
 	}
@@ -1045,6 +1183,7 @@ function optionalTaskFields(value: Record<string, unknown>): Partial<Task> {
       result[field] = value[field]
     }
   }
+	if (typeof value.archived_at === 'string') result.archived_at = value.archived_at
   return result
 }
 
@@ -1207,7 +1346,17 @@ function parseTaskAssociation(value: unknown): TaskAssociation {
     task: parseTask(value.task),
     created_at: value.created_at,
     ...(typeof value.source_message_id === 'string' ? { source_message_id: value.source_message_id } : {}),
+		...(isTaskRelationType(value.type) ? { type: value.type } : {}),
+		...(isTaskRelationDirection(value.direction) ? { direction: value.direction } : {}),
   }
+}
+
+function isTaskRelationType(value: unknown): value is TaskRelationType {
+	return value === 'RELATES_TO' || value === 'BLOCKS' || value === 'PARENT_OF' || value === 'SUPERSEDES' || value === 'DERIVED_FROM'
+}
+
+function isTaskRelationDirection(value: unknown): value is TaskRelationDirection {
+	return value === 'BIDIRECTIONAL' || value === 'OUTGOING' || value === 'INCOMING'
 }
 
 function parseTopicAssociation(value: unknown): TopicAssociation {
@@ -1476,6 +1625,158 @@ function isReleaseStatus(value: unknown): value is ReleaseStatus {
 
 function isWorkspaceState(value: unknown): value is WorkspaceState {
   return typeof value === 'string' && workspaceStates.some((state) => state === value)
+}
+
+function parseArray<T>(value: unknown, parse: (item: unknown) => T, message: string): T[] {
+	if (!Array.isArray(value)) throw new ApiError(message, 502, 'INVALID_RESPONSE')
+	return value.map(parse)
+}
+
+function parseKnowledgeLabel(value: unknown): KnowledgeLabel {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'name', 'color', 'created_at'])) {
+		throw new ApiError('标签格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { id: string; name: string; color: string; created_at: string }
+	return { id: item.id, name: item.name, color: item.color, created_at: item.created_at }
+}
+
+function parseDecision(value: unknown): Decision {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'key', 'title', 'content', 'created_at']) ||
+		(value.status !== 'ACTIVE' && value.status !== 'SUPERSEDED')) {
+		throw new ApiError('决策格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { id: string; key: string; title: string; content: string; created_at: string; status: Decision['status'] }
+	return {
+		id: item.id, key: item.key, title: item.title, content: item.content,
+		status: item.status, created_at: item.created_at,
+		...(typeof value.topic_id === 'string' ? { topic_id: value.topic_id } : {}),
+		...(typeof value.task_id === 'string' ? { task_id: value.task_id } : {}),
+		...(typeof value.supersedes_decision_id === 'string' ? { supersedes_decision_id: value.supersedes_decision_id } : {}),
+	}
+}
+
+function parseExperience(value: unknown): ExperienceRecord {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'key', 'title', 'summary', 'guidance', 'applicability', 'created_at', 'updated_at']) ||
+		typeof value.project_wide !== 'boolean' || typeof value.pinned !== 'boolean' ||
+		typeof value.verification_count !== 'number' || typeof value.successful_applications !== 'number' ||
+		typeof value.failed_applications !== 'number' || typeof value.recall_count !== 'number' ||
+		!isExperienceStatus(value.status)) {
+		throw new ApiError('经验格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & {
+		id: string; key: string; title: string; summary: string; guidance: string; applicability: string
+		created_at: string; updated_at: string; status: ExperienceRecord['status']
+		project_wide: boolean; pinned: boolean; verification_count: number
+		successful_applications: number; failed_applications: number; recall_count: number
+	}
+	return {
+		id: item.id, key: item.key, title: item.title, summary: item.summary, guidance: item.guidance,
+		applicability: item.applicability, project_wide: item.project_wide, status: item.status,
+		pinned: item.pinned, verification_count: item.verification_count,
+		successful_applications: item.successful_applications, failed_applications: item.failed_applications,
+		recall_count: item.recall_count, created_at: item.created_at, updated_at: item.updated_at,
+		...(typeof value.topic_id === 'string' ? { topic_id: value.topic_id } : {}),
+		...(typeof value.task_id === 'string' ? { task_id: value.task_id } : {}),
+		...(typeof value.source_run_id === 'string' ? { source_run_id: value.source_run_id } : {}),
+		...(typeof value.supersedes_experience_id === 'string' ? { supersedes_experience_id: value.supersedes_experience_id } : {}),
+	}
+}
+
+function isExperienceStatus(value: unknown): value is ExperienceRecord['status'] {
+	return value === 'CANDIDATE' || value === 'ACTIVE' || value === 'CHALLENGED' || value === 'SUPERSEDED'
+}
+
+function parseExperienceRecall(value: unknown): ExperienceRecall {
+	if (!isRecord(value) || typeof value.recall_id !== 'string' || typeof value.rank !== 'number' ||
+		!isRecord(value.score) || !isExperienceOutcome(value.outcome) || typeof value.recalled_at !== 'string') {
+		throw new ApiError('经验召回格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const score = value.score
+	if (typeof score.relevance_score !== 'number' || typeof score.utility_score !== 'number' ||
+		typeof score.scope_score !== 'number' || typeof score.freshness_score !== 'number' ||
+		typeof score.final_score !== 'number') {
+		throw new ApiError('经验召回评分格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		recall_id: value.recall_id, rank: value.rank, experience: parseExperience(value.experience),
+		score: {
+			relevance_score: score.relevance_score, utility_score: score.utility_score,
+			scope_score: score.scope_score, freshness_score: score.freshness_score, final_score: score.final_score,
+		},
+		outcome: value.outcome, recalled_at: value.recalled_at,
+	}
+}
+
+function isExperienceOutcome(value: unknown): value is ExperienceOutcome {
+	return value === 'PENDING' || value === 'HELPFUL' || value === 'HARMFUL' || value === 'IGNORED'
+}
+
+function isCIState(value: unknown): value is CIState {
+	return value === 'PENDING' || value === 'PASSED' || value === 'FAILED' || value === 'CANCELLED' || value === 'UNKNOWN'
+}
+
+function parseCISnapshot(value: unknown): CISnapshot {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'task_id', 'provider', 'commit_sha', 'observed_at', 'created_at']) ||
+		!isCIState(value.state) || !Array.isArray(value.checks)) {
+		throw new ApiError('CI 快照格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { id: string; task_id: string; provider: string; commit_sha: string; observed_at: string; created_at: string; state: CIState }
+	const checks = value.checks.map((check) => {
+		if (!isRecord(check) || typeof check.name !== 'string' || !isCIState(check.state)) {
+			throw new ApiError('CI 检查格式无效', 502, 'INVALID_RESPONSE')
+		}
+		return { name: check.name, state: check.state, ...(typeof check.details_url === 'string' ? { details_url: check.details_url } : {}) }
+	})
+	return {
+		id: item.id, task_id: item.task_id, provider: item.provider, commit_sha: item.commit_sha,
+		state: item.state, checks, observed_at: item.observed_at, created_at: item.created_at,
+		...(typeof value.source_url === 'string' ? { source_url: value.source_url } : {}),
+	}
+}
+
+function parseRunSummary(value: unknown): RunSummary {
+	if (!isRecord(value) || !hasStringFields(value, ['run_id', 'status', 'summary', 'created_at']) ||
+		typeof value.passed_tests !== 'number' || typeof value.failed_tests !== 'number') {
+		throw new ApiError('Run 摘要格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { run_id: string; status: string; summary: string; created_at: string; passed_tests: number; failed_tests: number }
+	return {
+		run_id: item.run_id, status: item.status, summary: item.summary,
+		passed_tests: item.passed_tests, failed_tests: item.failed_tests, created_at: item.created_at,
+	}
+}
+
+function parseMCPAuditEvent(value: unknown): MCPAuditEvent {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'call_id', 'client_name', 'tool_name', 'arguments_sha256', 'occurred_at']) ||
+		(value.direction !== 'INBOUND' && value.direction !== 'OUTBOUND') ||
+		(value.phase !== 'STARTED' && value.phase !== 'COMPLETED' && value.phase !== 'FAILED') || !isStringArray(value.argument_keys)) {
+		throw new ApiError('MCP 调用记录格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { id: string; call_id: string; client_name: string; tool_name: string; arguments_sha256: string; occurred_at: string; direction: MCPAuditEvent['direction']; phase: MCPAuditEvent['phase']; argument_keys: string[] }
+	return {
+		id: item.id, call_id: item.call_id, direction: item.direction, client_name: item.client_name,
+		tool_name: item.tool_name, phase: item.phase, argument_keys: item.argument_keys,
+		arguments_sha256: item.arguments_sha256, occurred_at: item.occurred_at,
+		...(typeof value.run_id === 'string' ? { run_id: value.run_id } : {}),
+		...(typeof value.server_name === 'string' ? { server_name: value.server_name } : {}),
+		...(typeof value.result_bytes === 'number' ? { result_bytes: value.result_bytes } : {}),
+		...(typeof value.error_message === 'string' ? { error_message: value.error_message } : {}),
+	}
+}
+
+function parseRunResourceLease(value: unknown): RunResourceLease {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'run_id', 'provider_name', 'opened_at']) ||
+		value.resource_kind !== 'BROWSER_SESSION' ||
+		(value.state !== 'ACTIVE' && value.state !== 'RELEASED' && value.state !== 'ABANDONED')) {
+		throw new ApiError('Run 资源记录格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value as typeof value & { id: string; run_id: string; provider_name: string; opened_at: string; resource_kind: 'BROWSER_SESSION'; state: RunResourceLease['state'] }
+	return {
+		id: item.id, run_id: item.run_id, resource_kind: item.resource_kind,
+		provider_name: item.provider_name, state: item.state, opened_at: item.opened_at,
+		...(typeof value.released_at === 'string' ? { released_at: value.released_at } : {}),
+		...(typeof value.cleanup_reason === 'string' ? { cleanup_reason: value.cleanup_reason } : {}),
+	}
 }
 
 function isMessageAuthorKind(value: unknown): value is MessageAuthorKind {

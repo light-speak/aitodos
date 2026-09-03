@@ -159,6 +159,10 @@ func TestTopicRoutesLinkTasksDirectlyAndFromMessages(t *testing.T) {
 	}
 
 	requestStatus(t, server.Client(), http.MethodDelete, server.URL+"/api/topics/"+createdTopic.ID+"/relations/"+firstTask.ID, "", http.StatusNoContent)
+	requestStatus(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+firstTask.ID+"/topics", `{"topic_id":"`+createdTopic.ID+`"}`, http.StatusNoContent)
+	requestStatus(t, server.Client(), http.MethodDelete, server.URL+"/api/tasks/"+firstTask.ID+"/topics/"+createdTopic.ID, "", http.StatusNoContent)
+	requestStatus(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+firstTask.ID+"/relations", `{"task_id":"`+secondTask.ID+`","type":"BLOCKS"}`, http.StatusNoContent)
+	requestStatus(t, server.Client(), http.MethodDelete, server.URL+"/api/tasks/"+secondTask.ID+"/relations/"+firstTask.ID+"?type=BLOCKS&direction=INCOMING", "", http.StatusNoContent)
 }
 
 func newTopicTestServer(t *testing.T) *httptest.Server {

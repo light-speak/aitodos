@@ -1,17 +1,56 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net"
 	"net/http"
+	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/project"
 )
+
+func TestLocalRequestGuardRejectsCrossSiteMutationAndForeignHost(t *testing.T) {
+	called := 0
+	handler := localRequestGuard(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		called++
+		response.WriteHeader(http.StatusNoContent)
+	}))
+
+	foreignHost := httptest.NewRequest(http.MethodGet, "http://127.0.0.1/api/health", nil)
+	foreignHost.Host = "attacker.example"
+	foreignHostResponse := httptest.NewRecorder()
+	handler.ServeHTTP(foreignHostResponse, foreignHost)
+	if foreignHostResponse.Code != http.StatusForbidden {
+		t.Fatalf("foreign host status = %d", foreignHostResponse.Code)
+	}
+
+	crossSite := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/project/workers", bytes.NewBufferString(`{"enabled":true}`))
+	crossSite.Host = "127.0.0.1"
+	crossSite.Header.Set("Origin", "https://attacker.example")
+	crossSite.Header.Set("Content-Type", "text/plain")
+	crossSiteResponse := httptest.NewRecorder()
+	handler.ServeHTTP(crossSiteResponse, crossSite)
+	if crossSiteResponse.Code != http.StatusForbidden {
+		t.Fatalf("cross-site status = %d", crossSiteResponse.Code)
+	}
+
+	sameOrigin := httptest.NewRequest(http.MethodPost, "http://127.0.0.1/api/project/workers", bytes.NewBufferString(`{"enabled":true}`))
+	sameOrigin.Host = "127.0.0.1"
+	sameOrigin.Header.Set("Origin", "http://127.0.0.1")
+	sameOriginResponse := httptest.NewRecorder()
+	handler.ServeHTTP(sameOriginResponse, sameOrigin)
+	if sameOriginResponse.Code != http.StatusNoContent || called != 1 {
+		t.Fatalf("same-origin status = %d, called = %d", sameOriginResponse.Code, called)
+	}
+}
 
 func TestServePublishesHealthAndStopsCleanly(t *testing.T) {
 	repoRoot := initProject(t)
@@ -126,6 +165,72 @@ func TestServeUsesConfiguredPort(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Serve() did not stop")
 	}
+}
+
+func TestStopSignalsRunningDaemonProcess(t *testing.T) {
+	repoRoot := initProject(t)
+	currentProject, err := project.Load(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestDaemonStopHelper$")
+	command.Env = append(os.Environ(), "ATS_DAEMON_STOP_HELPER=1")
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	var alive atomic.Bool
+	alive.Store(true)
+	waited := make(chan error, 1)
+	go func() {
+		waited <- command.Wait()
+		alive.Store(false)
+	}()
+	nonce := "stop-test"
+	server := httptest.NewServer(http.HandlerFunc(func(response http.ResponseWriter, _ *http.Request) {
+		if !alive.Load() {
+			response.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
+		_ = json.NewEncoder(response).Encode(Health{
+			Status: "ok", ProjectInstanceID: currentProject.InstanceID, Nonce: nonce, PID: command.Process.Pid,
+		})
+	}))
+	t.Cleanup(server.Close)
+	metadata := Metadata{
+		ProjectInstanceID: currentProject.InstanceID, PID: command.Process.Pid, URL: server.URL, Nonce: nonce,
+	}
+	if err := writeMetadata(currentProject.Paths.DaemonState, metadata); err != nil {
+		t.Fatal(err)
+	}
+
+	stopped, err := Stop(context.Background(), currentProject)
+	if err != nil || !stopped {
+		t.Fatalf("Stop() = %v, %v", stopped, err)
+	}
+	select {
+	case <-waited:
+	case <-time.After(3 * time.Second):
+		t.Fatal("daemon helper did not exit")
+	}
+}
+
+func TestStopReturnsFalseWhenDaemonIsNotRunning(t *testing.T) {
+	repoRoot := initProject(t)
+	currentProject, err := project.Load(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stopped, err := Stop(context.Background(), currentProject)
+	if err != nil || stopped {
+		t.Fatalf("Stop() = %v, %v", stopped, err)
+	}
+}
+
+func TestDaemonStopHelper(t *testing.T) {
+	if os.Getenv("ATS_DAEMON_STOP_HELPER") != "1" {
+		return
+	}
+	time.Sleep(time.Minute)
 }
 
 func initProject(t *testing.T) string {

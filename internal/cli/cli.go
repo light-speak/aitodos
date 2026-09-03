@@ -7,12 +7,18 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/light-speak/aitodos/internal/buildinfo"
 	"github.com/light-speak/aitodos/internal/daemon"
+	"github.com/light-speak/aitodos/internal/mcpserver"
 	"github.com/light-speak/aitodos/internal/project"
+	"github.com/light-speak/aitodos/internal/projectstate"
 	"github.com/light-speak/aitodos/internal/runner"
+	"github.com/light-speak/aitodos/internal/storage"
 )
 
 // Run 执行 ATS CLI 并返回进程退出码。
@@ -33,8 +39,19 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		err = runStop(ctx, args[1:], stdout, stderr)
 	case "open":
 		err = runOpen(ctx, args[1:], stdout, stderr)
+	case "mcp":
+		err = runMCP(ctx, args[1:], os.Stdin, stdout)
+	case "backup", "export":
+		err = runBackup(ctx, args[1:], stdout, stderr)
+	case "restore":
+		err = runRestore(ctx, args[1:], stdout, stderr)
+	case "doctor":
+		err = runDoctor(ctx, args[1:], stdout, stderr)
 	case "runner":
 		err = runRunner(ctx, args[1:], stderr)
+	case "version", "--version":
+		fmt.Fprintln(stdout, buildinfo.String())
+		return 0
 	case "help", "-h", "--help":
 		printUsage(stdout)
 		return 0
@@ -48,6 +65,106 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 		return 1
 	}
 	return 0
+}
+
+func runBackup(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("backup", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	output := flags.String("output", "", "备份 ZIP 输出路径")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("ats backup 不接受位置参数")
+	}
+	currentProject, err := loadCurrentProject(ctx)
+	if err != nil {
+		return err
+	}
+	if _, running := daemon.Status(ctx, currentProject); running {
+		return errors.New("备份前请在另一个终端执行 ats stop，确保没有数据库写入")
+	}
+	selected := strings.TrimSpace(*output)
+	if selected == "" {
+		selected = filepath.Join(currentProject.Paths.ATSRoot, "backups", "aitodos-"+time.Now().UTC().Format("20060102T150405Z")+".zip")
+	}
+	manifest, err := projectstate.Backup(ctx, currentProject, selected)
+	if err != nil {
+		return err
+	}
+	absolute, _ := filepath.Abs(selected)
+	fmt.Fprintf(stdout, "备份完成: %s\n文件数: %d\n", absolute, len(manifest.Files))
+	return nil
+}
+
+func runRestore(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("restore", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	input := flags.String("input", "", "备份 ZIP 路径")
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 || strings.TrimSpace(*input) == "" {
+		return errors.New("ats restore 需要 --input BACKUP.zip")
+	}
+	currentProject, err := loadCurrentProject(ctx)
+	if err != nil {
+		return err
+	}
+	if _, running := daemon.Status(ctx, currentProject); running {
+		return errors.New("恢复前必须停止当前项目 Daemon")
+	}
+	manifest, err := projectstate.Restore(ctx, currentProject, *input)
+	if err != nil {
+		return err
+	}
+	fmt.Fprintf(stdout, "恢复完成: %s\n备份时间: %s\n", currentProject.Root, manifest.CreatedAt.Format(time.RFC3339))
+	return nil
+}
+
+func runDoctor(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer) error {
+	flags := flag.NewFlagSet("doctor", flag.ContinueOnError)
+	flags.SetOutput(stderr)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("ats doctor 不接受位置参数")
+	}
+	currentProject, err := loadCurrentProject(ctx)
+	if err != nil {
+		return err
+	}
+	report, err := projectstate.CheckIntegrity(ctx, currentProject)
+	if err != nil {
+		return err
+	}
+	if !report.OK {
+		return fmt.Errorf("项目完整性检查失败: %s", strings.Join(report.Problems, "; "))
+	}
+	fmt.Fprintln(stdout, "项目完整性检查通过")
+	return nil
+}
+
+func runMCP(ctx context.Context, args []string, stdin io.Reader, stdout io.Writer) error {
+	flags := flag.NewFlagSet("mcp", flag.ContinueOnError)
+	flags.SetOutput(io.Discard)
+	if err := flags.Parse(args); err != nil {
+		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("ats mcp 不接受位置参数")
+	}
+	currentProject, err := loadCurrentProject(ctx)
+	if err != nil {
+		return err
+	}
+	database, err := storage.OpenExisting(ctx, currentProject.Paths.Database)
+	if err != nil {
+		return fmt.Errorf("open MCP project database: %w", err)
+	}
+	defer database.Close()
+	return mcpserver.New(database).Serve(ctx, stdin, stdout)
 }
 
 func runRunner(ctx context.Context, args []string, stderr io.Writer) error {
@@ -159,6 +276,9 @@ func runStatus(ctx context.Context, args []string, stdout io.Writer, stderr io.W
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if flags.NArg() != 0 {
+		return errors.New("ats status 不接受位置参数")
+	}
 	currentProject, err := loadCurrentProject(ctx)
 	if err != nil {
 		return err
@@ -182,6 +302,9 @@ func runStop(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	if err := flags.Parse(args); err != nil {
 		return err
 	}
+	if flags.NArg() != 0 {
+		return errors.New("ats stop 不接受位置参数")
+	}
 	currentProject, err := loadCurrentProject(ctx)
 	if err != nil {
 		return err
@@ -203,6 +326,9 @@ func runOpen(ctx context.Context, args []string, stdout io.Writer, stderr io.Wri
 	flags.SetOutput(stderr)
 	if err := flags.Parse(args); err != nil {
 		return err
+	}
+	if flags.NArg() != 0 {
+		return errors.New("ats open 不接受位置参数")
 	}
 	currentProject, err := loadCurrentProject(ctx)
 	if err != nil {
@@ -248,4 +374,9 @@ func printUsage(output io.Writer) {
   status                  查看当前项目运行状态
   open                    打开当前项目页面
   stop                    停止当前项目运行进程`)
+	fmt.Fprintln(output, "  mcp                     启动当前项目只读 MCP stdio Server")
+	fmt.Fprintln(output, "  backup [--output PATH]  备份项目事实数据（export 同义）")
+	fmt.Fprintln(output, "  restore --input PATH    校验并恢复项目事实数据")
+	fmt.Fprintln(output, "  doctor                  检查数据库、外键和 Artifact 完整性")
+	fmt.Fprintln(output, "  version                 显示二进制版本、Commit 和构建时间")
 }

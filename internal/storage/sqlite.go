@@ -12,7 +12,7 @@ import (
 	_ "modernc.org/sqlite"
 )
 
-const currentSchemaVersion = 33
+const currentSchemaVersion = 43
 
 // ProjectMetadata 保存当前项目实例的本地身份。
 type ProjectMetadata struct {
@@ -121,7 +121,7 @@ func applyMigration(ctx context.Context, database *sql.DB, version int) error {
 	if !ok {
 		return fmt.Errorf("unsupported schema migration: %d", version)
 	}
-	if version == 16 || version == 17 || version == 21 || version == 30 {
+	if version == 16 || version == 17 || version == 21 || version == 30 || version == 35 || version == 42 {
 		return applyRebuildMigration(ctx, database, version, statement)
 	}
 
@@ -1244,6 +1244,247 @@ ON task_integration_attempts(task_id, created_at DESC, id DESC);`, true
 		return searchMigrationV32, true
 	case 33:
 		return searchOptimizationMigrationV33, true
+	case 34:
+		return `CREATE TABLE mcp_call_events (
+    id TEXT PRIMARY KEY,
+    call_id TEXT NOT NULL CHECK (length(trim(call_id)) BETWEEN 1 AND 200),
+    client_name TEXT NOT NULL CHECK (length(trim(client_name)) BETWEEN 1 AND 200),
+    tool_name TEXT NOT NULL CHECK (length(trim(tool_name)) BETWEEN 1 AND 200),
+    phase TEXT NOT NULL CHECK (phase IN ('STARTED', 'COMPLETED', 'FAILED')),
+    argument_keys_json TEXT NOT NULL CHECK (json_valid(argument_keys_json)),
+    arguments_sha256 TEXT NOT NULL CHECK (length(arguments_sha256) = 64),
+    result_bytes INTEGER CHECK (result_bytes IS NULL OR result_bytes >= 0),
+    error_message TEXT NOT NULL DEFAULT '' CHECK (length(error_message) <= 2000),
+    occurred_at TEXT NOT NULL
+);
+CREATE INDEX mcp_call_events_call_idx ON mcp_call_events(call_id, occurred_at, id);
+CREATE INDEX mcp_call_events_recent_idx ON mcp_call_events(occurred_at DESC, id DESC);`, true
+	case 35:
+		return `ALTER TABLE clarifications RENAME TO clarifications_v34;
+CREATE TABLE clarifications (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    source_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_purpose TEXT NOT NULL CHECK (continuation_purpose IN ('TRIAGE', 'IMPLEMENTATION', 'REVISION')),
+    category TEXT NOT NULL CHECK (category IN ('REQUIREMENT', 'DECISION', 'ENVIRONMENT', 'VALIDATION')),
+    question TEXT NOT NULL CHECK (length(trim(question)) BETWEEN 1 AND 4000),
+    options_json TEXT NOT NULL,
+    recommended_option_id TEXT NOT NULL DEFAULT '',
+    allow_custom_answer INTEGER NOT NULL CHECK (allow_custom_answer IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('OPEN', 'ANSWERED')),
+    selected_option_id TEXT NOT NULL DEFAULT '',
+    custom_answer TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    answered_at TEXT,
+    CHECK (
+        (status = 'OPEN' AND selected_option_id = '' AND custom_answer = '' AND answered_at IS NULL) OR
+        (status = 'ANSWERED' AND ((selected_option_id != '' AND custom_answer = '') OR
+                                  (selected_option_id = '' AND custom_answer != '')) AND answered_at IS NOT NULL)
+    )
+);
+INSERT INTO clarifications SELECT * FROM clarifications_v34;
+DROP TABLE clarifications_v34;
+CREATE UNIQUE INDEX clarifications_one_open_task_idx
+ON clarifications(task_id) WHERE status = 'OPEN';
+CREATE INDEX clarifications_open_queue_idx ON clarifications(status, created_at);`, true
+	case 36:
+		return `ALTER TABLE task_links RENAME TO task_relations_v35;
+CREATE TABLE task_relations (
+    source_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    target_task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    relation_type TEXT NOT NULL CHECK (relation_type IN (
+        'RELATES_TO', 'BLOCKS', 'PARENT_OF', 'SUPERSEDES', 'DERIVED_FROM'
+    )),
+    source_message_id TEXT REFERENCES messages(id) ON DELETE SET NULL,
+    created_at TEXT NOT NULL,
+    CHECK(source_task_id != target_task_id),
+    CHECK(relation_type != 'RELATES_TO' OR source_task_id < target_task_id),
+    PRIMARY KEY(source_task_id, target_task_id, relation_type)
+);
+INSERT INTO task_relations(source_task_id, target_task_id, relation_type, source_message_id, created_at)
+SELECT task_a_id, task_b_id, 'RELATES_TO', source_message_id, created_at FROM task_relations_v35;
+DROP TABLE task_relations_v35;
+CREATE INDEX task_relations_target_idx ON task_relations(target_task_id, created_at);`, true
+	case 37:
+		return `ALTER TABLE tasks ADD COLUMN archived_at TEXT;
+ALTER TABLE task_events RENAME TO task_events_v36;
+CREATE TABLE task_events (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    sequence INTEGER NOT NULL CHECK (sequence >= 1),
+    event_type TEXT NOT NULL CHECK (event_type IN (
+        'TASK_CREATED', 'TASK_STATUS_CHANGED', 'TASK_TITLE_CHANGED',
+        'TASK_TARGET_BRANCH_CHANGED', 'TASK_DETAILS_CHANGED', 'TASK_ARCHIVED'
+    )),
+    payload_json TEXT NOT NULL,
+    occurred_at TEXT NOT NULL,
+    UNIQUE(task_id, sequence)
+);
+INSERT INTO task_events SELECT * FROM task_events_v36;
+DROP TABLE task_events_v36;
+CREATE INDEX task_events_timeline_idx ON task_events(task_id, sequence);
+CREATE INDEX tasks_active_board_idx ON tasks(archived_at, status, priority, created_at);`, true
+	case 38:
+		return `CREATE TABLE decisions (
+    id TEXT PRIMARY KEY,
+    decision_key TEXT NOT NULL UNIQUE,
+    topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+    title TEXT NOT NULL CHECK (length(trim(title)) BETWEEN 1 AND 200),
+    content TEXT NOT NULL CHECK (length(trim(content)) BETWEEN 1 AND 20000),
+    status TEXT NOT NULL CHECK (status IN ('ACTIVE', 'SUPERSEDED')),
+    supersedes_decision_id TEXT REFERENCES decisions(id) ON DELETE RESTRICT,
+    created_at TEXT NOT NULL,
+    CHECK ((topic_id IS NOT NULL AND task_id IS NULL) OR (topic_id IS NULL AND task_id IS NOT NULL)),
+    CHECK (supersedes_decision_id IS NULL OR supersedes_decision_id != id)
+);
+CREATE INDEX decisions_topic_idx ON decisions(topic_id, created_at DESC);
+CREATE INDEX decisions_task_idx ON decisions(task_id, created_at DESC);
+
+CREATE TABLE labels (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE CHECK (length(trim(name)) BETWEEN 1 AND 100),
+    color TEXT NOT NULL CHECK (color GLOB '#[0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f][0-9A-Fa-f]'),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE topic_labels (
+    topic_id TEXT NOT NULL REFERENCES topics(id) ON DELETE CASCADE,
+    label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(topic_id, label_id)
+);
+CREATE TABLE task_labels (
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    label_id TEXT NOT NULL REFERENCES labels(id) ON DELETE CASCADE,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY(task_id, label_id)
+);
+
+CREATE TABLE run_summaries (
+    run_id TEXT PRIMARY KEY REFERENCES runs(id) ON DELETE CASCADE,
+    status TEXT NOT NULL,
+    summary TEXT NOT NULL CHECK (length(trim(summary)) BETWEEN 1 AND 4000),
+    passed_tests INTEGER NOT NULL DEFAULT 0 CHECK (passed_tests >= 0),
+    failed_tests INTEGER NOT NULL DEFAULT 0 CHECK (failed_tests >= 0),
+    created_at TEXT NOT NULL
+);
+
+CREATE TABLE ci_check_snapshots (
+    id TEXT PRIMARY KEY,
+    task_id TEXT NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    provider TEXT NOT NULL CHECK (length(trim(provider)) BETWEEN 1 AND 100),
+    commit_sha TEXT NOT NULL CHECK (length(trim(commit_sha)) BETWEEN 7 AND 64),
+    state TEXT NOT NULL CHECK (state IN ('PENDING', 'PASSED', 'FAILED', 'CANCELLED', 'UNKNOWN')),
+    checks_json TEXT NOT NULL CHECK (json_valid(checks_json)),
+    source_url TEXT NOT NULL DEFAULT '' CHECK (length(source_url) <= 2000),
+    observed_at TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX ci_check_snapshots_task_idx ON ci_check_snapshots(task_id, observed_at DESC, id DESC);`, true
+	case 39:
+		return `DROP TRIGGER IF EXISTS search_clarifications_ai;
+DROP TRIGGER IF EXISTS search_clarifications_au;
+DROP TRIGGER IF EXISTS search_clarifications_ad;
+ALTER TABLE clarifications RENAME TO clarifications_v38;
+CREATE TABLE clarifications (
+    id TEXT PRIMARY KEY,
+    topic_id TEXT REFERENCES topics(id) ON DELETE CASCADE,
+    task_id TEXT REFERENCES tasks(id) ON DELETE CASCADE,
+    source_run_id TEXT NOT NULL UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_run_id TEXT UNIQUE REFERENCES runs(id) ON DELETE RESTRICT,
+    continuation_purpose TEXT NOT NULL CHECK (continuation_purpose IN ('PLANNING', 'TRIAGE', 'IMPLEMENTATION', 'REVISION')),
+    category TEXT NOT NULL CHECK (category IN ('REQUIREMENT', 'DECISION', 'ENVIRONMENT', 'VALIDATION')),
+    question TEXT NOT NULL CHECK (length(trim(question)) BETWEEN 1 AND 4000),
+    options_json TEXT NOT NULL CHECK (json_valid(options_json)),
+    recommended_option_id TEXT NOT NULL DEFAULT '',
+    allow_custom_answer INTEGER NOT NULL CHECK (allow_custom_answer IN (0, 1)),
+    status TEXT NOT NULL CHECK (status IN ('OPEN', 'ANSWERED')),
+    selected_option_id TEXT NOT NULL DEFAULT '',
+    custom_answer TEXT NOT NULL DEFAULT '',
+    version INTEGER NOT NULL CHECK (version >= 1),
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    answered_at TEXT,
+    CHECK ((topic_id IS NOT NULL AND task_id IS NULL) OR (topic_id IS NULL AND task_id IS NOT NULL)),
+    CHECK (
+        (status = 'OPEN' AND selected_option_id = '' AND custom_answer = '' AND answered_at IS NULL) OR
+        (status = 'ANSWERED' AND ((selected_option_id != '' AND custom_answer = '') OR
+                                  (selected_option_id = '' AND custom_answer != '')) AND answered_at IS NOT NULL)
+    )
+);
+INSERT INTO clarifications(
+    id, topic_id, task_id, source_run_id, continuation_run_id, continuation_purpose,
+    category, question, options_json, recommended_option_id, allow_custom_answer,
+    status, selected_option_id, custom_answer, version, created_at, updated_at, answered_at
+)
+SELECT id, NULL, task_id, source_run_id, continuation_run_id, continuation_purpose,
+       category, question, options_json, recommended_option_id, allow_custom_answer,
+       status, selected_option_id, custom_answer, version, created_at, updated_at, answered_at
+FROM clarifications_v38;
+DROP TABLE clarifications_v38;
+CREATE UNIQUE INDEX clarifications_one_open_topic_idx ON clarifications(topic_id) WHERE topic_id IS NOT NULL AND status = 'OPEN';
+CREATE UNIQUE INDEX clarifications_one_open_task_idx ON clarifications(task_id) WHERE task_id IS NOT NULL AND status = 'OPEN';
+CREATE INDEX clarifications_open_queue_idx ON clarifications(status, created_at);
+
+CREATE TRIGGER search_clarifications_ai AFTER INSERT ON clarifications BEGIN
+    INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+    VALUES ('CLARIFICATION:' || new.id, 'CLARIFICATION', new.id,
+            CASE WHEN new.topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END,
+            COALESCE(new.topic_id, new.task_id),
+            COALESCE((SELECT topic_key FROM topics WHERE id = new.topic_id),
+                     (SELECT task_key FROM tasks WHERE id = new.task_id)) || '#clarification-' || new.id,
+            COALESCE((SELECT topic_key FROM topics WHERE id = new.topic_id),
+                     (SELECT task_key FROM tasks WHERE id = new.task_id)) || ' · ' || new.category,
+            new.question || char(10) || new.options_json || char(10) || new.selected_option_id || char(10) || new.custom_answer,
+            new.status, 1, new.updated_at);
+END;
+CREATE TRIGGER search_clarifications_au AFTER UPDATE OF question, options_json, selected_option_id, custom_answer, status, updated_at ON clarifications BEGIN
+    UPDATE search_documents SET
+        body = new.question || char(10) || new.options_json || char(10) || new.selected_option_id || char(10) || new.custom_answer,
+        status = new.status, updated_at = new.updated_at
+    WHERE id = 'CLARIFICATION:' || new.id;
+END;
+CREATE TRIGGER search_clarifications_ad AFTER DELETE ON clarifications BEGIN
+    DELETE FROM search_documents WHERE id = 'CLARIFICATION:' || old.id;
+END;`, true
+	case 40:
+		return searchKnowledgeMigrationV40, true
+	case 41:
+		return `ALTER TABLE mcp_call_events ADD COLUMN direction TEXT NOT NULL DEFAULT 'INBOUND'
+    CHECK (direction IN ('INBOUND', 'OUTBOUND'));
+ALTER TABLE mcp_call_events ADD COLUMN run_id TEXT REFERENCES runs(id) ON DELETE CASCADE;
+ALTER TABLE mcp_call_events ADD COLUMN server_name TEXT NOT NULL DEFAULT '' CHECK (length(server_name) <= 200);
+CREATE INDEX mcp_call_events_run_idx ON mcp_call_events(run_id, occurred_at, id);
+
+ALTER TABLE runs ADD COLUMN agent_pid INTEGER;
+ALTER TABLE runs ADD COLUMN agent_started_at TEXT;
+ALTER TABLE runs ADD COLUMN agent_identity TEXT NOT NULL DEFAULT '';
+ALTER TABLE runs ADD COLUMN agent_process_released_at TEXT;
+
+CREATE TABLE run_resource_leases (
+    id TEXT PRIMARY KEY,
+    run_id TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    resource_kind TEXT NOT NULL CHECK (resource_kind IN ('BROWSER_SESSION')),
+    provider_name TEXT NOT NULL CHECK (length(trim(provider_name)) BETWEEN 1 AND 200),
+    state TEXT NOT NULL CHECK (state IN ('ACTIVE', 'RELEASED', 'ABANDONED')),
+    opened_at TEXT NOT NULL,
+    released_at TEXT,
+    cleanup_reason TEXT NOT NULL DEFAULT '' CHECK (length(cleanup_reason) <= 1000),
+    UNIQUE(run_id, resource_kind, provider_name),
+    CHECK ((state = 'ACTIVE' AND released_at IS NULL) OR (state != 'ACTIVE' AND released_at IS NOT NULL))
+);
+CREATE INDEX run_resource_leases_active_idx ON run_resource_leases(state, run_id);`, true
+	case 42:
+		return experienceMigrationV42, true
+	case 43:
+		return `ALTER TABLE task_test_results ADD COLUMN exit_code INTEGER;
+ALTER TABLE experience_records ADD COLUMN candidate_fingerprint TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX experience_records_run_candidate_idx
+ON experience_records(source_run_id, candidate_fingerprint)
+WHERE source_run_id IS NOT NULL AND candidate_fingerprint != '';`, true
 	default:
 		return "", false
 	}

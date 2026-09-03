@@ -64,6 +64,8 @@ type RecoveryRun struct {
 	Run            domainrun.Run
 	RunnerPID      int
 	RunnerIdentity string
+	AgentPID       int
+	AgentIdentity  string
 	RunNonce       string
 }
 
@@ -121,7 +123,8 @@ func (store *RunStore) FinishNeedsInput(
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
 	if (current.Status != domainrun.StatusRunning && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusFinalizing) ||
-		(current.Purpose != domainrun.PurposeImplementation && current.Purpose != domainrun.PurposeRevision) {
+		(current.Purpose != domainrun.PurposePlanning && current.Purpose != domainrun.PurposeTriage &&
+			current.Purpose != domainrun.PurposeImplementation && current.Purpose != domainrun.PurposeRevision) {
 		return domainrun.Run{}, clarification.Clarification{}, ErrRunStateConflict
 	}
 	created, err := buildClarification(current, request)
@@ -131,8 +134,10 @@ func (store *RunStore) FinishNeedsInput(
 	if err := insertClarification(ctx, transaction, created); err != nil {
 		return domainrun.Run{}, clarification.Clarification{}, err
 	}
-	if err := finishTaskRun(ctx, transaction, current, domainrun.StatusNeedsInput); err != nil {
-		return domainrun.Run{}, clarification.Clarification{}, err
+	if current.TaskID != "" && current.Purpose != domainrun.PurposeTriage {
+		if err := finishTaskRun(ctx, transaction, current, domainrun.StatusNeedsInput); err != nil {
+			return domainrun.Run{}, clarification.Clarification{}, err
+		}
 	}
 	now := time.Now().UTC()
 	result, err := transaction.ExecContext(ctx, `
@@ -178,16 +183,6 @@ func (store *RunStore) RequestCancel(ctx context.Context, runID string, reason s
 		return domainrun.Run{}, fmt.Errorf("begin request run cancel: %w", err)
 	}
 	defer transaction.Rollback()
-	current, err := getRun(ctx, transaction, runID)
-	if err != nil {
-		return domainrun.Run{}, err
-	}
-	if current.CancelRequestedAt != nil {
-		return current, nil
-	}
-	if current.Status != domainrun.StatusClaimed && current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusRunning {
-		return domainrun.Run{}, ErrRunStateConflict
-	}
 	now := time.Now().UTC()
 	result, err := transaction.ExecContext(ctx, `
 UPDATE runs SET cancel_requested_at = ?, cancel_reason = ?, updated_at = ?
@@ -196,17 +191,29 @@ WHERE id = ? AND status IN ('CLAIMED', 'STARTING', 'RUNNING') AND cancel_request
 	if err != nil {
 		return domainrun.Run{}, fmt.Errorf("request run cancel: %w", err)
 	}
-	if err := requireSingleChange(result); err != nil {
-		return domainrun.Run{}, err
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return domainrun.Run{}, fmt.Errorf("read run cancel result: %w", err)
+	}
+	if changed == 0 {
+		current, getErr := getRun(ctx, transaction, runID)
+		if getErr != nil {
+			return domainrun.Run{}, getErr
+		}
+		if current.CancelRequestedAt != nil {
+			return current, nil
+		}
+		return domainrun.Run{}, ErrRunStateConflict
 	}
 	if _, err := appendRunEvent(ctx, transaction, runID, domainrun.EventCancelRequested, map[string]any{
 		"schema_version": 1, "reason": reason,
 	}); err != nil {
 		return domainrun.Run{}, err
 	}
-	current.CancelRequestedAt = &now
-	current.CancelReason = reason
-	current.UpdatedAt = now
+	current, err := getRun(ctx, transaction, runID)
+	if err != nil {
+		return domainrun.Run{}, err
+	}
 	if err := transaction.Commit(); err != nil {
 		return domainrun.Run{}, fmt.Errorf("commit request run cancel: %w", err)
 	}
@@ -413,7 +420,8 @@ func (store *RunStore) Get(ctx context.Context, runID string) (domainrun.Run, er
 // ListRecoveryRuns 返回 Daemon 启动时仍处于非终态的 Run 及其 Runner 身份。
 func (store *RunStore) ListRecoveryRuns(ctx context.Context) ([]RecoveryRun, error) {
 	rows, err := store.database.QueryContext(ctx, `
-SELECT id, COALESCE(runner_pid, 0), runner_identity, run_nonce
+SELECT id, COALESCE(runner_pid, 0), runner_identity,
+       COALESCE(agent_pid, 0), agent_identity, run_nonce
 FROM runs WHERE status IN ('CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING')
 ORDER BY created_at, id`)
 	if err != nil {
@@ -423,7 +431,8 @@ ORDER BY created_at, id`)
 	result := make([]RecoveryRun, 0)
 	for rows.Next() {
 		var item RecoveryRun
-		if err := rows.Scan(&item.Run.ID, &item.RunnerPID, &item.RunnerIdentity, &item.RunNonce); err != nil {
+		if err := rows.Scan(&item.Run.ID, &item.RunnerPID, &item.RunnerIdentity,
+			&item.AgentPID, &item.AgentIdentity, &item.RunNonce); err != nil {
 			return nil, err
 		}
 		result = append(result, item)
@@ -441,6 +450,67 @@ ORDER BY created_at, id`)
 		}
 	}
 	return result, nil
+}
+
+// AttachAgentProcess 记录 Runner 实际启动且可验证的 Agent 进程组身份。
+func (store *RunStore) AttachAgentProcess(
+	ctx context.Context,
+	runID string,
+	claimToken string,
+	leaseGeneration int64,
+	agentPID int,
+	agentIdentity string,
+) error {
+	if agentPID < 1 || len(agentIdentity) != 64 {
+		return errors.New("invalid agent process identity")
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin attach agent process: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration)
+	if err != nil {
+		return err
+	}
+	if current.Status != domainrun.StatusStarting && current.Status != domainrun.StatusRunning {
+		return ErrRunStateConflict
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET agent_pid = ?, agent_started_at = ?, agent_identity = ?,
+                agent_process_released_at = NULL, updated_at = ?
+WHERE id = ? AND lease_generation = ? AND status IN ('STARTING', 'RUNNING')`,
+		agentPID, formatTime(time.Now().UTC()), agentIdentity, formatTime(time.Now().UTC()), runID, leaseGeneration)
+	if err != nil {
+		return fmt.Errorf("attach agent process: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return err
+	}
+	return transaction.Commit()
+}
+
+// ReleaseAgentProcess 清除活跃 Agent 身份，同时保留已释放时间用于审计。
+func (store *RunStore) ReleaseAgentProcess(ctx context.Context, runID, claimToken string, leaseGeneration int64) error {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin release agent process: %w", err)
+	}
+	defer transaction.Rollback()
+	if _, err := authorizeRun(ctx, transaction, runID, claimToken, leaseGeneration); err != nil {
+		return err
+	}
+	now := formatTime(time.Now().UTC())
+	result, err := transaction.ExecContext(ctx, `
+UPDATE runs SET agent_pid = NULL, agent_identity = '', agent_process_released_at = ?, updated_at = ?
+WHERE id = ? AND lease_generation = ?`, now, now, runID, leaseGeneration)
+	if err != nil {
+		return fmt.Errorf("release agent process: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return err
+	}
+	return transaction.Commit()
 }
 
 // RecoverLost 在 Recovery Manager 证明旧 Runner 不存在后，将不明确执行标为 LOST。
@@ -1118,6 +1188,9 @@ WHERE id = ? AND status = 'FINALIZING' AND lease_generation = ?`,
 	if _, err := appendRunStatusEvent(ctx, transaction, runID, domainrun.StatusFinalizing, intent.Status, intent.FailureCode); err != nil {
 		return domainrun.Run{}, err
 	}
+	if err := createRunSummary(ctx, transaction, string(intent.Status), runID, string(current.Purpose), now); err != nil {
+		return domainrun.Run{}, err
+	}
 	if _, err := transaction.ExecContext(ctx, `UPDATE run_finalization_intents SET completed_at = ? WHERE run_id = ? AND completed_at IS NULL`, formatTime(now), runID); err != nil {
 		return domainrun.Run{}, err
 	}
@@ -1183,9 +1256,6 @@ func validateFinalizationSubject(current domainrun.Run, intent FinalizationInten
 	if current.Purpose == domainrun.PurposePlanning {
 		if intent.Finish.Status == domainrun.StatusSucceeded && intent.Planning == nil {
 			return errors.New("successful planning finalization requires planning result")
-		}
-		if intent.Clarification != nil {
-			return errors.New("planning run writes questions as topic replies")
 		}
 		if strings.TrimSpace(intent.TaskReply) != "" {
 			return errors.New("planning run cannot write task reply")
@@ -1733,20 +1803,34 @@ ORDER BY t.updated_at ASC, t.created_at ASC, t.id ASC LIMIT 1`).Scan(
 
 func selectTriageTask(ctx context.Context, transaction *sql.Tx) (runnableWork, error) {
 	return selectTaskForPurpose(ctx, transaction, `
-SELECT t.id, r.id, 'TRIAGE', ''
+SELECT t.id, r.id, 'TRIAGE', COALESCE((
+    SELECT c.source_run_id FROM clarifications c
+    WHERE c.task_id = t.id AND c.status = 'ANSWERED'
+      AND c.continuation_purpose = 'TRIAGE' AND c.continuation_run_id IS NULL
+    ORDER BY c.answered_at ASC LIMIT 1
+), '')
 FROM tasks t
 JOIN project_agent_defaults d ON d.purpose = 'TRIAGE'
 JOIN agent_profiles p ON p.id = d.profile_id
 JOIN agent_profile_revisions r ON r.id = p.current_revision_id
 WHERE t.status = 'READY' AND length(trim(r.command)) > 0
-  AND NOT EXISTS (
-      SELECT 1 FROM task_assessments a
-      WHERE a.task_id = t.id AND a.task_assessment_version = t.assessment_input_version
-  )
-  AND NOT EXISTS (
-      SELECT 1 FROM runs attempted
-      WHERE attempted.task_id = t.id AND attempted.purpose = 'TRIAGE'
-        AND attempted.subject_version = t.assessment_input_version
+  AND (
+      EXISTS (
+          SELECT 1 FROM clarifications c
+          WHERE c.task_id = t.id AND c.status = 'ANSWERED'
+            AND c.continuation_purpose = 'TRIAGE' AND c.continuation_run_id IS NULL
+      )
+      OR (
+          NOT EXISTS (
+              SELECT 1 FROM task_assessments a
+              WHERE a.task_id = t.id AND a.task_assessment_version = t.assessment_input_version
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM runs attempted
+              WHERE attempted.task_id = t.id AND attempted.purpose = 'TRIAGE'
+                AND attempted.subject_version = t.assessment_input_version
+          )
+      )
   )
 ORDER BY t.priority ASC, t.created_at ASC, t.id ASC LIMIT 1`)
 }
@@ -1870,7 +1954,7 @@ INSERT INTO runs(
 	if err != nil {
 		return fmt.Errorf("insert claimed run: %w", err)
 	}
-	if claim.Run.TaskID != "" && claim.Run.ContinuationOfRunID != "" {
+	if claim.Run.ContinuationOfRunID != "" {
 		result, updateErr := transaction.ExecContext(ctx, `
 UPDATE clarifications SET continuation_run_id = ?, updated_at = ?
 WHERE source_run_id = ? AND status = 'ANSWERED' AND continuation_run_id IS NULL`,
@@ -1878,8 +1962,14 @@ WHERE source_run_id = ? AND status = 'ANSWERED' AND continuation_run_id IS NULL`
 		if updateErr != nil {
 			return fmt.Errorf("link continuation clarification: %w", updateErr)
 		}
-		if updateErr := requireClarificationChange(result); updateErr != nil {
-			return updateErr
+		if claim.Run.TaskID != "" {
+			if updateErr := requireClarificationChange(result); updateErr != nil {
+				return updateErr
+			}
+		} else if changed, changeErr := result.RowsAffected(); changeErr != nil {
+			return fmt.Errorf("read topic clarification link result: %w", changeErr)
+		} else if changed > 1 {
+			return errors.New("multiple topic clarifications matched one continuation")
 		}
 	}
 	return nil

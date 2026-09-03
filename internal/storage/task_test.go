@@ -159,6 +159,47 @@ func TestTaskStoreReturnsNotFound(t *testing.T) {
 	}
 }
 
+func TestTaskStoreUpdatesExecutionInputCancelsAndArchives(t *testing.T) {
+	ctx := context.Background()
+	store := NewTaskStore(openTaskTestDatabase(t))
+	created, err := store.Create(ctx, task.CreateInput{Title: "完善导出", Description: "旧范围", Priority: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	updated, err := store.UpdateDetails(ctx, created.ID, created.Version, task.UpdateDetailsInput{
+		Description: "导出当前项目", AcceptanceCriteria: "生成可恢复 ZIP", Priority: 0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Priority != 0 || updated.AcceptanceCriteria != "生成可恢复 ZIP" || updated.AssessmentInputVersion != 2 {
+		t.Fatalf("updated = %#v", updated)
+	}
+	cancelled, err := store.ApplyCommand(ctx, updated.ID, updated.Version, task.CommandCancelTask)
+	if err != nil {
+		t.Fatal(err)
+	}
+	archived, err := store.Archive(ctx, cancelled.ID, cancelled.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if archived.ArchivedAt == nil {
+		t.Fatalf("archived = %#v", archived)
+	}
+	listed, err := store.List(ctx)
+	if err != nil || len(listed) != 0 {
+		t.Fatalf("List() = %#v, %v", listed, err)
+	}
+	all, err := store.ListIncludingArchived(ctx)
+	if err != nil || len(all) != 1 {
+		t.Fatalf("ListIncludingArchived() = %#v, %v", all, err)
+	}
+	events, err := store.ListEvents(ctx, created.ID)
+	if err != nil || events[len(events)-1].Type != task.EventArchived {
+		t.Fatalf("events = %#v, %v", events, err)
+	}
+}
+
 func TestTaskStoreRecordsReviewWithStatusTransitionAtomically(t *testing.T) {
 	ctx := context.Background()
 	store := NewTaskStore(openTaskTestDatabase(t))

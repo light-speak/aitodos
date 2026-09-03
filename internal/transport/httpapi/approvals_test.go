@@ -72,6 +72,19 @@ func TestApprovalRoutesListAndResolveHumanDecision(t *testing.T) {
 	if len(open) != 1 || open[0].TaskID != createdTask.ID || open[0].Host != "example.com" {
 		t.Fatalf("open approvals = %#v", open)
 	}
+	runResponse, err := server.Client().Get(server.URL + "/api/runs/" + claim.Run.ID + "/approvals")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var runApprovals []approvalrequest.Request
+	if err := json.NewDecoder(runResponse.Body).Decode(&runApprovals); err != nil {
+		runResponse.Body.Close()
+		t.Fatal(err)
+	}
+	runResponse.Body.Close()
+	if len(runApprovals) != 1 || runApprovals[0].ID != created.ID {
+		t.Fatalf("run approvals = %#v", runApprovals)
+	}
 
 	body, err := json.Marshal(approvalDecisionInput{
 		Decision: approvalrequest.DecisionAcceptOnce, ExpectedVersion: created.Version,
@@ -95,5 +108,30 @@ func TestApprovalRoutesListAndResolveHumanDecision(t *testing.T) {
 	}
 	if resolved.Decision != approvalrequest.DecisionAcceptOnce || resolved.Status != approvalrequest.StatusResolved {
 		t.Fatalf("resolved approval = %#v", resolved)
+	}
+
+	for _, test := range []struct {
+		path   string
+		body   string
+		status int
+	}{
+		{path: "/api/approvals/" + created.ID + "/decision", body: `{`, status: http.StatusBadRequest},
+		{path: "/api/approvals/" + created.ID + "/decision", body: `{"decision":"DECLINE","expected_version":1}`, status: http.StatusConflict},
+		{path: "/api/approvals/missing/decision", body: `{"decision":"DECLINE","expected_version":1}`, status: http.StatusNotFound},
+		{path: "/api/approvals/missing/decision", body: `{"expected_version":0}`, status: http.StatusBadRequest},
+	} {
+		request, err := http.NewRequest(http.MethodPost, server.URL+test.path, bytes.NewBufferString(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != test.status {
+			t.Fatalf("POST %s status = %d, want %d", test.path, response.StatusCode, test.status)
+		}
 	}
 }

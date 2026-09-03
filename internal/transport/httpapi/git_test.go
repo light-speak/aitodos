@@ -139,16 +139,35 @@ func TestGitRoutesExposeChangesAndManualReview(t *testing.T) {
 	if !strings.Contains(string(changes), `"path":"README.md"`) {
 		t.Fatalf("changes = %s", changes)
 	}
+	patch := requestJSON(t, server.Client(), http.MethodGet,
+		server.URL+"/api/tasks/"+created.ID+"/changes/file?path=README.md", "", http.StatusOK)
+	if !strings.Contains(string(patch), `"patch":"diff --git`) || !strings.Contains(string(patch), `+# changed`) {
+		t.Fatalf("file diff = %s", patch)
+	}
 	current, err := store.Get(context.Background(), created.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/submit-review",
+	reviewingBody := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/submit-review",
 		fmt.Sprintf(`{"version":%d}`, current.Version), http.StatusOK)
+	var reviewing task.Task
+	if err := json.Unmarshal(reviewingBody, &reviewing); err != nil {
+		t.Fatal(err)
+	}
+	committed := requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/workspace/commit", `{"message":"test: prepare manual review"}`, http.StatusOK)
+	if !strings.Contains(string(committed), `"dirty":false`) {
+		t.Fatalf("committed workspace = %s", committed)
+	}
 	reviewed := requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/reviews",
-		fmt.Sprintf(`{"version":%d,"decision":"ACCEPTED"}`, current.Version+1), http.StatusOK)
+		fmt.Sprintf(`{"version":%d,"decision":"ACCEPTED"}`, reviewing.Version), http.StatusOK)
 	if !strings.Contains(string(reviewed), `"status":"ACCEPTED"`) || !strings.Contains(string(reviewed), `"commit_sha":"`) {
 		t.Fatalf("review = %s", reviewed)
+	}
+	reviews := requestJSON(t, server.Client(), http.MethodGet,
+		server.URL+"/api/tasks/"+created.ID+"/reviews", "", http.StatusOK)
+	if !strings.Contains(string(reviews), `"decision":"ACCEPTED"`) {
+		t.Fatalf("reviews = %s", reviews)
 	}
 	integratedBody := requestJSON(t, server.Client(), http.MethodPost,
 		server.URL+"/api/tasks/"+created.ID+"/integration", "", http.StatusOK)
@@ -163,6 +182,47 @@ func TestGitRoutesExposeChangesAndManualReview(t *testing.T) {
 		server.URL+"/api/tasks/"+created.ID+"/integration", "", http.StatusOK)
 	if !strings.Contains(string(latestBody), `"status":"SUCCEEDED"`) {
 		t.Fatalf("latest integration = %s", latestBody)
+	}
+}
+
+func TestGitRoutesSyncDivergedTarget(t *testing.T) {
+	server, database := newGitTestServer(t)
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(context.Background(), task.CreateInput{Title: "通过接口同步目标分支"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	workspaceBody := requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/workspace", "", http.StatusOK)
+	var item workspace.Workspace
+	if err := json.Unmarshal(workspaceBody, &item); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(item.Path, "feature.txt"), []byte("feature\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created, err = store.Get(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/submit-review",
+		fmt.Sprintf(`{"version":%d}`, created.Version), http.StatusOK)
+	requestJSON(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/reviews",
+		fmt.Sprintf(`{"version":%d,"decision":"ACCEPTED"}`, created.Version+1), http.StatusOK)
+
+	currentProjectRoot := filepath.Dir(filepath.Dir(item.Path))
+	currentProjectRoot = filepath.Dir(currentProjectRoot)
+	if err := os.WriteFile(filepath.Join(currentProjectRoot, "target.txt"), []byte("target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runHTTPGit(t, currentProjectRoot, "add", "target.txt")
+	runHTTPGit(t, currentProjectRoot, "commit", "--quiet", "-m", "advance target")
+	requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/integration", "", http.StatusConflict)
+	synced := requestJSON(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/integration/sync", "", http.StatusOK)
+	if !strings.Contains(string(synced), `"status":"CHANGES_REQUESTED"`) || !strings.Contains(string(synced), `"status":"SYNCED"`) {
+		t.Fatalf("sync response = %s", synced)
 	}
 }
 

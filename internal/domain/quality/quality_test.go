@@ -20,13 +20,54 @@ func TestEstimateInputValidate(t *testing.T) {
 }
 
 func TestTestResultInputValidate(t *testing.T) {
-	valid := TestResultInput{Outcome: OutcomePassed, EvidenceKind: EvidenceCommand, Summary: "go test 通过", Command: "go test ./..."}
+	exitCode := 0
+	valid := TestResultInput{
+		Outcome: OutcomePassed, EvidenceKind: EvidenceCommand, Summary: "go test 通过",
+		Command: "go test ./...", ArtifactRef: "runs/run-1/stdout.log", SourceRunID: "run-1", ExitCode: &exitCode,
+	}
 	if err := valid.Validate(); err != nil {
 		t.Fatalf("Validate() error = %v", err)
 	}
-	invalid := valid
-	invalid.Command = ""
-	if err := invalid.Validate(); err == nil {
-		t.Fatal("command evidence without command error = nil")
+	for name, mutate := range map[string]func(*TestResultInput){
+		"command":  func(input *TestResultInput) { input.Command = "" },
+		"artifact": func(input *TestResultInput) { input.ArtifactRef = "" },
+		"run":      func(input *TestResultInput) { input.SourceRunID = "" },
+		"exit":     func(input *TestResultInput) { input.ExitCode = nil },
+		"mismatch": func(input *TestResultInput) { code := 1; input.ExitCode = &code },
+		"blocked":  func(input *TestResultInput) { input.Outcome = OutcomeBlocked },
+	} {
+		t.Run(name, func(t *testing.T) {
+			invalid := valid
+			mutate(&invalid)
+			if err := invalid.Validate(); err == nil {
+				t.Fatalf("invalid command evidence = %#v", invalid)
+			}
+		})
+	}
+}
+
+func TestTestCaseAndResultRejectInvalidEvidence(t *testing.T) {
+	validCase := TestCaseInput{Title: " 回归 ", Required: true, CreatedBy: TestCreatorHuman}
+	if err := validCase.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, input := range []TestCaseInput{
+		{}, {Title: "测试", SortOrder: -1, CreatedBy: TestCreatorHuman},
+		{Title: "测试", CreatedBy: TestCreator("UNKNOWN")},
+		{Title: "测试", CreatedBy: TestCreatorAgent},
+	} {
+		if err := input.Validate(); err == nil {
+			t.Fatalf("test case %#v unexpectedly valid", input)
+		}
+	}
+	for _, input := range []TestResultInput{
+		{Outcome: TestOutcome("UNKNOWN"), EvidenceKind: EvidenceHuman, Summary: "结果"},
+		{Outcome: OutcomePassed, EvidenceKind: EvidenceKind("UNKNOWN"), Summary: "结果"},
+		{Outcome: OutcomePassed, EvidenceKind: EvidenceHuman},
+		{Outcome: OutcomePassed, EvidenceKind: EvidenceAgentReport, Summary: "通过"},
+	} {
+		if err := input.Validate(); err == nil {
+			t.Fatalf("test result %#v unexpectedly valid", input)
+		}
 	}
 }

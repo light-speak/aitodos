@@ -34,8 +34,7 @@ func TestQualityStoreKeepsEstimateHistoryAndLatestTestEvidence(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := store.AddTestResult(ctx, created.ID, testCase.ID, quality.TestResultInput{
-		Outcome: quality.OutcomePassed, EvidenceKind: quality.EvidenceCommand,
-		Summary: "全部通过", Command: "go test ./...",
+		Outcome: quality.OutcomePassed, EvidenceKind: quality.EvidenceHuman, Summary: "全部通过",
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -85,6 +84,43 @@ func TestRequiredTestEvidenceGatesTaskAcceptance(t *testing.T) {
 		Decision: task.ReviewAccepted, Comment: "通过",
 	}, "abc"); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestLegacyCommandWithoutExitCodeDoesNotPassVerification(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "旧版测试证据"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	testCase, err := NewQualityStore(database).CreateTestCase(ctx, created.ID, quality.TestCaseInput{
+		Title: "旧版命令", Required: true, CreatedBy: quality.TestCreatorHuman,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.ExecContext(ctx, `INSERT INTO task_test_results(
+id, test_case_id, task_id, outcome, evidence_kind, summary, command, artifact_ref, source_run_id, created_at, exit_code
+) VALUES ('legacy-result', ?, ?, 'PASSED', 'COMMAND', '旧记录', 'go test ./...', '', NULL, '2026-01-01T00:00:00Z', NULL)`,
+		testCase.ID, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	progress, err := NewQualityStore(database).ProjectProgress(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if progress.VerifiedPassedTests != 0 {
+		t.Fatalf("legacy command counted as verified: %#v", progress)
+	}
+	review, err := NewTaskStore(database).ApplyCommand(ctx, created.ID, created.Version, task.CommandSubmitReview)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := NewTaskStore(database).ApplyReview(ctx, review.ID, review.Version, task.ReviewInput{
+		Decision: task.ReviewAccepted, Comment: "通过",
+	}, "abc"); !errors.Is(err, ErrRequiredTestsNotPassed) {
+		t.Fatalf("legacy command acceptance error = %v", err)
 	}
 }
 

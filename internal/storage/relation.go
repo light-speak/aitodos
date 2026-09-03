@@ -19,7 +19,7 @@ tasks.status, tasks.priority, tasks.target_branch, tasks.base_commit_sha,
 tasks.current_workspace_id, tasks.latest_run_id,
 COALESCE(tasks.source_plan_revision_id, ''), COALESCE(tasks.source_plan_task_draft_id, ''),
 tasks.assessment_input_version, tasks.version,
-tasks.created_at, tasks.updated_at`
+tasks.created_at, tasks.updated_at, COALESCE(tasks.archived_at, '')`
 
 const relatedTopicColumns = `
 topics.id, topics.topic_key, topics.title, topics.description, topics.status,
@@ -105,18 +105,26 @@ ORDER BY topic_task_links.created_at, topics.topic_key`, taskID)
 
 // LinkTasks 幂等创建对称的 Task 关联。
 func (store *RelationStore) LinkTasks(ctx context.Context, taskID, relatedTaskID string) error {
+	return store.LinkTasksTyped(ctx, taskID, relatedTaskID, relation.TypeRelatesTo)
+}
+
+// LinkTasksTyped 幂等创建有明确语义和方向的 Task 关系。
+func (store *RelationStore) LinkTasksTyped(ctx context.Context, sourceTaskID, targetTaskID string, relationType relation.Type) error {
+	if !relationType.Valid() {
+		return errors.New("invalid task relation type")
+	}
 	transaction, err := store.database.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("begin task link: %w", err)
 	}
 	defer transaction.Rollback()
-	if err := requireTask(ctx, transaction, taskID); err != nil {
+	if err := requireTask(ctx, transaction, sourceTaskID); err != nil {
 		return err
 	}
-	if err := requireTask(ctx, transaction, relatedTaskID); err != nil {
+	if err := requireTask(ctx, transaction, targetTaskID); err != nil {
 		return err
 	}
-	if err := linkTasks(ctx, transaction, taskID, relatedTaskID, ""); err != nil {
+	if err := linkTasksTyped(ctx, transaction, sourceTaskID, targetTaskID, relationType, ""); err != nil {
 		return err
 	}
 	return commitRelation(transaction)
@@ -124,17 +132,25 @@ func (store *RelationStore) LinkTasks(ctx context.Context, taskID, relatedTaskID
 
 // UnlinkTasks 移除两个 Task 的直接关联，不删除历史消息引用。
 func (store *RelationStore) UnlinkTasks(ctx context.Context, taskID, relatedTaskID string) error {
-	first, second, err := orderedTaskPair(taskID, relatedTaskID)
+	return store.UnlinkTaskRelation(ctx, taskID, relatedTaskID, relation.TypeRelatesTo)
+}
+
+// UnlinkTaskRelation 删除指定方向和类型的 Task 关系。
+func (store *RelationStore) UnlinkTaskRelation(ctx context.Context, sourceTaskID, targetTaskID string, relationType relation.Type) error {
+	if !relationType.Valid() {
+		return errors.New("invalid task relation type")
+	}
+	source, target, err := normalizeTaskRelation(sourceTaskID, targetTaskID, relationType)
 	if err != nil {
 		return err
 	}
-	if err := requireTask(ctx, store.database, taskID); err != nil {
+	if err := requireTask(ctx, store.database, sourceTaskID); err != nil {
 		return err
 	}
-	if err := requireTask(ctx, store.database, relatedTaskID); err != nil {
+	if err := requireTask(ctx, store.database, targetTaskID); err != nil {
 		return err
 	}
-	if _, err := store.database.ExecContext(ctx, "DELETE FROM task_links WHERE task_a_id = ? AND task_b_id = ?", first, second); err != nil {
+	if _, err := store.database.ExecContext(ctx, "DELETE FROM task_relations WHERE source_task_id = ? AND target_task_id = ? AND relation_type = ?", source, target, relationType); err != nil {
 		return fmt.Errorf("unlink tasks: %w", err)
 	}
 	return nil
@@ -146,18 +162,21 @@ func (store *RelationStore) ListTaskRelations(ctx context.Context, taskID string
 		return nil, err
 	}
 	rows, err := store.database.QueryContext(ctx, `SELECT `+relatedTaskColumns+`,
-       task_links.source_message_id, task_links.created_at
-FROM task_links
+       task_relations.relation_type,
+       CASE WHEN task_relations.relation_type = 'RELATES_TO' THEN 'BIDIRECTIONAL'
+            WHEN task_relations.source_task_id = ? THEN 'OUTGOING' ELSE 'INCOMING' END,
+       task_relations.source_message_id, task_relations.created_at
+FROM task_relations
 JOIN tasks ON tasks.id = CASE
-    WHEN task_links.task_a_id = ? THEN task_links.task_b_id
-    ELSE task_links.task_a_id
+    WHEN task_relations.source_task_id = ? THEN task_relations.target_task_id
+    ELSE task_relations.source_task_id
 END
-WHERE task_links.task_a_id = ? OR task_links.task_b_id = ?
-ORDER BY task_links.created_at, tasks.task_key`, taskID, taskID, taskID)
+WHERE task_relations.source_task_id = ? OR task_relations.target_task_id = ?
+ORDER BY task_relations.created_at, tasks.task_key`, taskID, taskID, taskID, taskID)
 	if err != nil {
 		return nil, fmt.Errorf("list task links: %w", err)
 	}
-	return scanTaskAssociations(rows)
+	return scanTypedTaskAssociations(rows)
 }
 
 func linkTopicTask(ctx context.Context, transaction *sql.Tx, topicID, taskID, sourceMessageID string) error {
@@ -172,18 +191,32 @@ ON CONFLICT(topic_id, task_id) DO NOTHING`, topicID, taskID, sourceMessageID, fo
 }
 
 func linkTasks(ctx context.Context, transaction *sql.Tx, taskID, relatedTaskID, sourceMessageID string) error {
-	first, second, err := orderedTaskPair(taskID, relatedTaskID)
+	return linkTasksTyped(ctx, transaction, taskID, relatedTaskID, relation.TypeRelatesTo, sourceMessageID)
+}
+
+func linkTasksTyped(ctx context.Context, transaction *sql.Tx, taskID, relatedTaskID string, relationType relation.Type, sourceMessageID string) error {
+	first, second, err := normalizeTaskRelation(taskID, relatedTaskID, relationType)
 	if err != nil {
 		return err
 	}
 	_, err = transaction.ExecContext(ctx, `
-INSERT INTO task_links(task_a_id, task_b_id, source_message_id, created_at)
-VALUES (?, ?, NULLIF(?, ''), ?)
-ON CONFLICT(task_a_id, task_b_id) DO NOTHING`, first, second, sourceMessageID, formatTime(time.Now().UTC()))
+	INSERT INTO task_relations(source_task_id, target_task_id, relation_type, source_message_id, created_at)
+VALUES (?, ?, ?, NULLIF(?, ''), ?)
+ON CONFLICT(source_task_id, target_task_id, relation_type) DO NOTHING`, first, second, relationType, sourceMessageID, formatTime(time.Now().UTC()))
 	if err != nil {
 		return fmt.Errorf("link tasks: %w", err)
 	}
 	return nil
+}
+
+func normalizeTaskRelation(first, second string, relationType relation.Type) (string, string, error) {
+	if first == second {
+		return "", "", ErrSelfTaskLink
+	}
+	if relationType == relation.TypeRelatesTo {
+		return orderedTaskPair(first, second)
+	}
+	return first, second, nil
 }
 
 func orderedTaskPair(first, second string) (string, string, error) {
@@ -220,15 +253,68 @@ func scanTaskAssociations(rows *sql.Rows) ([]relation.TaskAssociation, error) {
 	return result, nil
 }
 
+func scanTypedTaskAssociations(rows *sql.Rows) ([]relation.TaskAssociation, error) {
+	defer rows.Close()
+	result := make([]relation.TaskAssociation, 0)
+	for rows.Next() {
+		var item relation.TaskAssociation
+		var sourceMessageID sql.NullString
+		var createdAt string
+		if err := scanTypedTaskAssociation(rows, &item, &sourceMessageID, &createdAt); err != nil {
+			return nil, err
+		}
+		item.SourceMessageID = sourceMessageID.String
+		parsed, err := parseTime(createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("parse task relation time: %w", err)
+		}
+		item.CreatedAt = parsed
+		result = append(result, item)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate typed task relations: %w", err)
+	}
+	return result, nil
+}
+
+func scanTypedTaskAssociation(scanner rowScanner, item *relation.TaskAssociation, sourceMessageID *sql.NullString, createdAt *string) error {
+	var taskCreatedAt, taskUpdatedAt, taskArchivedAt string
+	if err := scanner.Scan(
+		&item.Task.ID, &item.Task.Key, &item.Task.Title, &item.Task.TitleSource,
+		&item.Task.TitleLocked, &item.Task.Description, &item.Task.AcceptanceCriteria,
+		&item.Task.Status, &item.Task.Priority, &item.Task.TargetBranch, &item.Task.BaseCommitSHA,
+		&item.Task.CurrentWorkspaceID, &item.Task.LatestRunID, &item.Task.SourcePlanRevisionID,
+		&item.Task.SourcePlanTaskDraftID, &item.Task.AssessmentInputVersion, &item.Task.Version,
+		&taskCreatedAt, &taskUpdatedAt, &taskArchivedAt, &item.Type, &item.Direction, sourceMessageID, createdAt,
+	); err != nil {
+		return fmt.Errorf("scan typed task relation: %w", err)
+	}
+	var err error
+	if item.Task.CreatedAt, err = parseTime(taskCreatedAt); err != nil {
+		return err
+	}
+	if item.Task.UpdatedAt, err = parseTime(taskUpdatedAt); err != nil {
+		return err
+	}
+	if taskArchivedAt != "" {
+		parsed, parseErr := parseTime(taskArchivedAt)
+		if parseErr != nil {
+			return parseErr
+		}
+		item.Task.ArchivedAt = &parsed
+	}
+	return nil
+}
+
 func scanTaskAssociation(scanner rowScanner, item *relation.TaskAssociation, sourceMessageID *sql.NullString, createdAt *string) error {
-	var taskCreatedAt, taskUpdatedAt string
+	var taskCreatedAt, taskUpdatedAt, taskArchivedAt string
 	if err := scanner.Scan(
 		&item.Task.ID, &item.Task.Key, &item.Task.Title, &item.Task.TitleSource,
 		&item.Task.TitleLocked, &item.Task.Description,
 		&item.Task.AcceptanceCriteria, &item.Task.Status, &item.Task.Priority,
 		&item.Task.TargetBranch, &item.Task.BaseCommitSHA, &item.Task.CurrentWorkspaceID,
 		&item.Task.LatestRunID, &item.Task.SourcePlanRevisionID, &item.Task.SourcePlanTaskDraftID,
-		&item.Task.AssessmentInputVersion, &item.Task.Version, &taskCreatedAt, &taskUpdatedAt,
+		&item.Task.AssessmentInputVersion, &item.Task.Version, &taskCreatedAt, &taskUpdatedAt, &taskArchivedAt,
 		sourceMessageID, createdAt,
 	); err != nil {
 		return fmt.Errorf("scan task link: %w", err)
@@ -239,6 +325,13 @@ func scanTaskAssociation(scanner rowScanner, item *relation.TaskAssociation, sou
 	}
 	if item.Task.UpdatedAt, err = parseTime(taskUpdatedAt); err != nil {
 		return fmt.Errorf("parse linked task updated time: %w", err)
+	}
+	if taskArchivedAt != "" {
+		parsed, parseErr := parseTime(taskArchivedAt)
+		if parseErr != nil {
+			return fmt.Errorf("parse linked task archived time: %w", parseErr)
+		}
+		item.Task.ArchivedAt = &parsed
 	}
 	return nil
 }

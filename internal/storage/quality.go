@@ -133,15 +133,16 @@ SELECT 1 FROM task_test_cases WHERE id = ? AND task_id = ?`, testCaseID, taskID)
 	created := quality.TestResult{
 		ID: id, TestCaseID: testCaseID, TaskID: taskID, Outcome: input.Outcome,
 		EvidenceKind: input.EvidenceKind, Summary: input.Summary, Command: input.Command,
-		ArtifactRef: input.ArtifactRef, SourceRunID: input.SourceRunID, CreatedAt: time.Now().UTC(),
+		ExitCode: input.ExitCode, ArtifactRef: input.ArtifactRef, SourceRunID: input.SourceRunID,
+		CreatedAt: time.Now().UTC(),
 	}
 	_, err = store.database.ExecContext(ctx, `
 INSERT INTO task_test_results(
     id, test_case_id, task_id, outcome, evidence_kind, summary,
-    command, artifact_ref, source_run_id, created_at
-) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)`,
+    command, exit_code, artifact_ref, source_run_id, created_at
+) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?)`,
 		created.ID, created.TestCaseID, created.TaskID, created.Outcome, created.EvidenceKind,
-		created.Summary, created.Command, created.ArtifactRef, created.SourceRunID,
+		created.Summary, created.Command, created.ExitCode, created.ArtifactRef, created.SourceRunID,
 		formatTime(created.CreatedAt),
 	)
 	if err != nil {
@@ -257,7 +258,7 @@ func (store *QualityStore) listTestCases(ctx context.Context, taskID string) ([]
 SELECT c.id, c.task_id, c.title, c.description, c.required, c.sort_order,
        c.created_by, COALESCE(c.source_run_id, ''), c.created_at, c.updated_at,
        COALESCE(r.id, ''), COALESCE(r.outcome, ''), COALESCE(r.evidence_kind, ''),
-       COALESCE(r.summary, ''), COALESCE(r.command, ''), COALESCE(r.artifact_ref, ''),
+       COALESCE(r.summary, ''), COALESCE(r.command, ''), r.exit_code, COALESCE(r.artifact_ref, ''),
        COALESCE(r.source_run_id, ''), COALESCE(r.created_at, ''),
        CASE WHEN r.id IS NOT NULL AND r.created_at <= COALESCE((
            SELECT MAX(i.updated_at) FROM task_integration_attempts i
@@ -289,11 +290,12 @@ func scanTestCase(scanner rowScanner) (quality.TestCase, error) {
 	var item quality.TestCase
 	var createdAt, updatedAt string
 	var result quality.TestResult
+	var exitCode sql.NullInt64
 	var resultCreatedAt string
 	err := scanner.Scan(
 		&item.ID, &item.TaskID, &item.Title, &item.Description, &item.Required,
 		&item.SortOrder, &item.CreatedBy, &item.SourceRunID, &createdAt, &updatedAt,
-		&result.ID, &result.Outcome, &result.EvidenceKind, &result.Summary, &result.Command,
+		&result.ID, &result.Outcome, &result.EvidenceKind, &result.Summary, &result.Command, &exitCode,
 		&result.ArtifactRef, &result.SourceRunID, &resultCreatedAt,
 		&result.Stale,
 	)
@@ -309,6 +311,10 @@ func scanTestCase(scanner rowScanner) (quality.TestCase, error) {
 		return quality.TestCase{}, err
 	}
 	if result.ID != "" {
+		if exitCode.Valid {
+			value := int(exitCode.Int64)
+			result.ExitCode = &value
+		}
 		result.TestCaseID = item.ID
 		result.TaskID = item.TaskID
 		result.CreatedAt, err = parseTime(resultCreatedAt)
@@ -324,7 +330,8 @@ func (store *QualityStore) readTestProgress(ctx context.Context, progress *quali
 	return store.database.QueryRowContext(ctx, `
 SELECT
     COUNT(*),
-    COALESCE(SUM(CASE WHEN r.outcome = 'PASSED' AND r.evidence_kind IN ('COMMAND', 'HUMAN')
+    COALESCE(SUM(CASE WHEN r.outcome = 'PASSED'
+        AND (r.evidence_kind = 'HUMAN' OR (r.evidence_kind = 'COMMAND' AND r.exit_code = 0))
         AND r.created_at > COALESCE((SELECT MAX(i.updated_at) FROM task_integration_attempts i
             WHERE i.task_id = c.task_id AND i.operation = 'SYNC'
               AND i.status IN ('SYNCED', 'CONFLICT')), '') THEN 1 ELSE 0 END), 0),
@@ -348,7 +355,9 @@ LEFT JOIN task_test_results r ON r.id = (
     WHERE latest.test_case_id = c.id ORDER BY latest.created_at DESC, latest.id DESC LIMIT 1
 )
 WHERE c.task_id = ? AND c.required = 1
-  AND (r.outcome IS NULL OR r.outcome != 'PASSED' OR r.evidence_kind NOT IN ('COMMAND', 'HUMAN')
+  AND (r.outcome IS NULL OR r.outcome != 'PASSED'
+       OR (r.evidence_kind != 'HUMAN' AND
+           (r.evidence_kind != 'COMMAND' OR r.exit_code IS NULL OR r.exit_code != 0))
        OR r.created_at <= COALESCE((SELECT MAX(i.updated_at) FROM task_integration_attempts i
            WHERE i.task_id = c.task_id AND i.operation = 'SYNC'
              AND i.status IN ('SYNCED', 'CONFLICT')), ''))`, taskID).Scan(&missing)

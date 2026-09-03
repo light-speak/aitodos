@@ -17,6 +17,11 @@ const (
 	KindMessage       Kind = "MESSAGE"
 	KindPlanRevision  Kind = "PLAN_REVISION"
 	KindClarification Kind = "CLARIFICATION"
+	KindDecision      Kind = "DECISION"
+	KindRunSummary    Kind = "RUN_SUMMARY"
+	KindCICheck       Kind = "CI_CHECK"
+	KindLabel         Kind = "LABEL"
+	KindExperience    Kind = "EXPERIENCE"
 )
 
 // Query 是有界全文检索输入。
@@ -52,7 +57,7 @@ func (query Query) Validate() error {
 	if query.Limit < 1 || query.Limit > 50 {
 		return errors.New("搜索结果数必须为 1 到 50")
 	}
-	if len(query.Kinds) > 5 || len(query.Statuses) > 20 || len(query.Cursor) > 100 {
+	if len(query.Kinds) > 10 || len(query.Statuses) > 20 || len(query.Cursor) > 100 {
 		return errors.New("搜索过滤条件过多")
 	}
 	for _, kind := range query.Kinds {
@@ -74,7 +79,8 @@ func (query Query) Validate() error {
 // Valid 判断检索类型是否受支持。
 func (kind Kind) Valid() bool {
 	return kind == KindTopic || kind == KindTask || kind == KindMessage ||
-		kind == KindPlanRevision || kind == KindClarification
+		kind == KindPlanRevision || kind == KindClarification || kind == KindDecision ||
+		kind == KindRunSummary || kind == KindCICheck || kind == KindLabel || kind == KindExperience
 }
 
 // Item 是 Search Projection 返回的稳定检索结果。

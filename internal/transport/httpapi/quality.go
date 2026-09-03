@@ -26,6 +26,11 @@ type createHumanTestCaseRequest struct {
 	SortOrder   int    `json:"sort_order"`
 }
 
+type createHumanTestResultRequest struct {
+	Outcome quality.TestOutcome `json:"outcome"`
+	Summary string              `json:"summary"`
+}
+
 // RegisterQualityRoutes 注册 Task 估算、测试证据和项目进度端点。
 func RegisterQualityRoutes(mux *http.ServeMux, store *storage.QualityStore) {
 	handler := &qualityHandler{store: store}
@@ -89,17 +94,15 @@ func (handler *qualityHandler) createTestCase(response http.ResponseWriter, requ
 }
 
 func (handler *qualityHandler) addTestResult(response http.ResponseWriter, request *http.Request) {
-	var input quality.TestResultInput
-	if err := decodeJSON(response, request, &input); err != nil {
+	var body createHumanTestResultRequest
+	if err := decodeJSON(response, request, &body); err != nil {
 		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的测试结果")
 		return
 	}
-	if input.EvidenceKind == quality.EvidenceAgentReport {
-		writeError(response, http.StatusBadRequest, "INVALID_TEST_EVIDENCE", "Agent 报告只能由对应 Run 写入")
-		return
-	}
 	created, err := handler.store.AddTestResult(
-		request.Context(), request.PathValue("taskID"), request.PathValue("testCaseID"), input,
+		request.Context(), request.PathValue("taskID"), request.PathValue("testCaseID"), quality.TestResultInput{
+			Outcome: body.Outcome, EvidenceKind: quality.EvidenceHuman, Summary: body.Summary,
+		},
 	)
 	if err != nil {
 		writeQualityError(response, err)

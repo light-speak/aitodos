@@ -33,6 +33,7 @@ const (
 	CommandResumeRevision       Command = "RESUME_REVISION"
 	CommandRequestChanges       Command = "REQUEST_CHANGES"
 	CommandSyncTarget           Command = "SYNC_TARGET"
+	CommandCancelTask           Command = "CANCEL_TASK"
 )
 
 var transitions = map[Status]map[Command]Status{
@@ -40,6 +41,7 @@ var transitions = map[Status]map[Command]Status{
 		CommandClaimRun:       StatusRunning,
 		CommandSubmitReview:   StatusReview,
 		CommandRequestChanges: StatusChangesRequested,
+		CommandCancelTask:     StatusCancelled,
 	},
 	StatusRunning: {
 		CommandRunSucceeded: StatusReview,
@@ -51,19 +53,23 @@ var transitions = map[Status]map[Command]Status{
 		CommandAccept:         StatusAccepted,
 		CommandReject:         StatusChangesRequested,
 		CommandRequestChanges: StatusChangesRequested,
+		CommandCancelTask:     StatusCancelled,
 	},
 	StatusChangesRequested: {
 		CommandClaimRun:       StatusRunning,
 		CommandRequestChanges: StatusChangesRequested,
+		CommandCancelTask:     StatusCancelled,
 	},
 	StatusBlocked: {
 		CommandRetry:                StatusReady,
 		CommandResumeImplementation: StatusReady,
 		CommandResumeRevision:       StatusChangesRequested,
 		CommandRequestChanges:       StatusChangesRequested,
+		CommandCancelTask:           StatusCancelled,
 	},
 	StatusAccepted: {
-		CommandSyncTarget: StatusChangesRequested,
+		CommandSyncTarget:     StatusChangesRequested,
+		CommandRequestChanges: StatusChangesRequested,
 	},
 }
 
@@ -116,5 +122,6 @@ func AllCommands() []Command {
 		CommandResumeRevision,
 		CommandRequestChanges,
 		CommandSyncTarget,
+		CommandCancelTask,
 	}
 }

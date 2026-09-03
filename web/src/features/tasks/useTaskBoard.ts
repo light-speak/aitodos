@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { createTask, createTopic, getProject, getTasks, getTopics, updateTaskTargetBranch, updateWorkerSettings } from '../../api/client'
-import type { CreateTaskInput, CreateTopicInput, ProjectInfo, Task, Topic } from '../../types'
+import { archiveTask, cancelTask, createTask, createTopic, getProject, getTasks, getTopics, updateTaskDetails, updateTaskTargetBranch, updateWorkerSettings } from '../../api/client'
+import type { CreateTaskInput, CreateTopicInput, ProjectInfo, Task, Topic, UpdateTaskDetailsInput } from '../../types'
 
 interface BoardState {
   project: ProjectInfo | null
@@ -39,8 +39,8 @@ export function useTaskBoard() {
     const timer = window.setInterval(() => {
       if (loading) return
       loading = true
-		void Promise.all([getTopics(controller.signal), getTasks(controller.signal)]).then(
-			([topics, tasks]) => setState((current) => ({ ...current, topics, tasks })),
+		void Promise.all([getProject(controller.signal), getTopics(controller.signal), getTasks(controller.signal)]).then(
+			([project, topics, tasks]) => setState((current) => ({ ...current, project, topics, tasks })),
         (error: unknown) => {
           if (!controller.signal.aborted) {
             setState((current) => ({ ...current, error }))
@@ -94,6 +94,24 @@ export function useTaskBoard() {
 		return updated
 	}, [])
 
+	const changeTaskDetails = useCallback(async (current: Task, input: UpdateTaskDetailsInput) => {
+		const updated = await updateTaskDetails(current.id, input, current.version)
+		setState((state) => ({ ...state, tasks: replaceTask(state.tasks, updated) }))
+		return updated
+	}, [])
+
+	const cancelCurrentTask = useCallback(async (current: Task) => {
+		const updated = await cancelTask(current.id, current.version)
+		setState((state) => ({ ...state, tasks: replaceTask(state.tasks, updated) }))
+		return updated
+	}, [])
+
+	const archiveCurrentTask = useCallback(async (current: Task) => {
+		const updated = await archiveTask(current.id, current.version)
+		setState((state) => ({ ...state, tasks: replaceTask(state.tasks, updated) }))
+		return updated
+	}, [])
+
   return useMemo(
     () => ({
       ...state,
@@ -104,9 +122,12 @@ export function useTaskBoard() {
 			updateTask,
 			updateTopic,
 			updateTargetBranch: changeTargetBranch,
+			updateTaskDetails: changeTaskDetails,
+			cancelTask: cancelCurrentTask,
+			archiveTask: archiveCurrentTask,
       reload,
     }),
-		[changeTargetBranch, create, createNewTopic, reload, state, updateTask, updateTopic, updateWorkers, updatingWorkers],
+		[archiveCurrentTask, cancelCurrentTask, changeTargetBranch, changeTaskDetails, create, createNewTopic, reload, state, updateTask, updateTopic, updateWorkers, updatingWorkers],
   )
 }
 
@@ -120,6 +141,7 @@ async function loadBoard(signal: AbortSignal) {
 }
 
 function replaceTask(tasks: Task[], updated: Task): Task[] {
+	if (updated.archived_at) return tasks.filter((item) => item.id !== updated.id)
 	return tasks.map((item) => {
 		if (item.id !== updated.id) return item
 		return {

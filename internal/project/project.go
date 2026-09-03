@@ -16,6 +16,7 @@ import (
 const gitIgnoreContent = `state.db*
 local.toml
 artifacts/
+backups/
 runtime/
 worktrees/
 `

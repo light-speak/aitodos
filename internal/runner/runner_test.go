@@ -17,11 +17,13 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/experience"
 	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/topic"
 	"github.com/light-speak/aitodos/internal/domain/workspace"
+	"github.com/light-speak/aitodos/internal/gitworkflow"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/storage"
 )
@@ -33,6 +35,82 @@ func TestProcessResultKeepsLogTruncationSeparate(t *testing.T) {
 	}
 	if !result.StdoutTruncated || result.StderrTruncated || bytes.Equal(result.Stdout, result.Stderr) {
 		t.Fatalf("process result = %#v", result)
+	}
+}
+
+func TestRecoverFinalizationReplaysWorkspaceAndTerminalState(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RoleImplementer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		MaxInputTokens: revision.MaxInputTokens, ReservedOutputTokens: revision.ReservedOutputTokens,
+		RecentMessageLimit: revision.RecentMessageLimit, RetrievalLimit: revision.RetrievalLimit,
+		TimeoutSeconds: revision.TimeoutSeconds,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTaskStore(database).Create(context.Background(), task.CreateInput{
+		Title: "恢复执行收尾", AcceptanceCriteria: "恢复后进入人工验收",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := gitworkflow.New(currentProject, database)
+	item, err := manager.CreateTaskWorkspace(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(item.Path, "recovered.txt"), []byte("preserved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runs := storage.NewRunStore(database)
+	claim, err := runs.ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.Start(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.MarkRunning(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.BeginFinalization(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, storage.FinalizationIntent{
+		Finish: storage.RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRuns, err := runs.ListRecoveryRuns(context.Background())
+	if err != nil || len(recoveryRuns) != 1 {
+		t.Fatalf("ListRecoveryRuns() = %#v, %v", recoveryRuns, err)
+	}
+	if err := RecoverFinalization(context.Background(), currentProject, database, recoveryRuns[0]); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := runs.Get(context.Background(), claim.Run.ID)
+	if err != nil || finished.Status != run.StatusSucceeded {
+		t.Fatalf("run = %#v, %v", finished, err)
+	}
+	updated, err := storage.NewTaskStore(database).Get(context.Background(), created.ID)
+	if err != nil || updated.Status != task.StatusReview {
+		t.Fatalf("task = %#v, %v", updated, err)
+	}
+	snapshot, err := runs.GetWorkspaceSnapshot(context.Background(), claim.Run.ID)
+	if err != nil || !snapshot.DirtyAfter || snapshot.WorkspaceID != item.ID {
+		t.Fatalf("snapshot = %#v, %v", snapshot, err)
 	}
 }
 
@@ -64,6 +142,12 @@ func TestExecutePersistsClarificationAndRebuildsContinuationContext(t *testing.T
 		Title: "需要人工决定迁移策略", AcceptanceCriteria: "人工选择后继续",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.NewExperienceStore(database).CreateVerified(context.Background(), experience.Input{
+		TaskID: created.ID, Title: "迁移策略先澄清", Summary: "兼容策略必须由人类确认",
+		Guidance: "不确定时提出结构化问题", Applicability: "数据库迁移策略不明确时", Pinned: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := storage.NewRunStore(database).ClaimNextTask(context.Background(), 1, time.Minute)
@@ -116,7 +200,8 @@ func TestExecutePersistsClarificationAndRebuildsContinuationContext(t *testing.T
 	}
 	prompt, err := os.ReadFile(filepath.Join(currentProject.Paths.Artifacts, "runs", continuation.Run.ID, "prompt.md"))
 	if err != nil || !strings.Contains(string(prompt), "数据库迁移是否兼容旧版本") ||
-		!strings.Contains(string(prompt), "compatible") || !strings.Contains(string(prompt), "Current Workspace") {
+		!strings.Contains(string(prompt), "compatible") || !strings.Contains(string(prompt), "Current Workspace") ||
+		!strings.Contains(string(prompt), "Relevant Experience Summaries") || !strings.Contains(string(prompt), "EXP-") {
 		t.Fatalf("continuation prompt = %q, %v", prompt, err)
 	}
 }
@@ -128,6 +213,21 @@ func TestValidateAgentResultRejectsAllDataBeforePersistence(t *testing.T) {
 	}
 	if err := validateAgentResult("run-1", result); err == nil {
 		t.Fatal("validateAgentResult() error = nil")
+	}
+}
+
+func TestValidateAgentResultLimitsExperienceCandidates(t *testing.T) {
+	candidate := agentExperienceCandidate{
+		Title: "先跑回归", Summary: "修改前先验证", Guidance: "运行测试", Applicability: "修改状态机时",
+	}
+	result := agentResult{Experiences: []agentExperienceCandidate{candidate, candidate, candidate, candidate}}
+	if err := validateAgentResult("run-1", result); err == nil {
+		t.Fatal("four experience candidates must be rejected")
+	}
+	result.Experiences = result.Experiences[:1]
+	result.Experiences[0].Guidance = ""
+	if err := validateAgentResult("run-1", result); err == nil {
+		t.Fatal("invalid experience candidate must be rejected")
 	}
 }
 

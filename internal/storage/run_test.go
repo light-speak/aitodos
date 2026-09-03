@@ -65,6 +65,10 @@ func TestRunStoreClaimsTopicPlanningOncePerVersionAndFinalizesDraft(t *testing.T
 	if _, err := store.CompleteFinalization(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
 		t.Fatal(err)
 	}
+	summary, err := NewKnowledgeStore(database).GetRunSummary(ctx, claim.Run.ID)
+	if err != nil || summary.Status != string(run.StatusSucceeded) || summary.Summary == "" {
+		t.Fatalf("run summary = %#v, %v", summary, err)
+	}
 	view, err := NewPlanStore(database).GetByTopic(ctx, created.ID)
 	if err != nil || view.Revision.SourceRunID != claim.Run.ID || view.Revision.Summary != planning.Plan.Summary {
 		t.Fatalf("generated plan = %#v, %v", view, err)
@@ -355,6 +359,13 @@ INSERT INTO workspaces(
 	if err != nil || len(artifacts) != 1 || artifacts[0].ID != artifact.ID {
 		t.Fatalf("ListArtifacts() = %#v, %v", artifacts, err)
 	}
+	loadedArtifact, err := store.GetArtifact(ctx, claim.Run.ID, "PROMPT")
+	if err != nil || loadedArtifact.ID != artifact.ID {
+		t.Fatalf("GetArtifact() = %#v, %v", loadedArtifact, err)
+	}
+	if _, err := store.GetArtifact(ctx, claim.Run.ID, "STDOUT"); err != ErrRunArtifactNotFound {
+		t.Fatalf("missing GetArtifact() error = %v", err)
+	}
 	finished, err := store.Finish(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, RunFinish{
 		Status: run.StatusFailed, ExitCode: 7, FailureKind: "AGENT_PROCESS",
 		FailureCode: "NON_ZERO_EXIT", FailureMessage: "agent exited with status 7",
@@ -436,6 +447,38 @@ func TestRunStoreRenewsLeaseAndRecoversFrozenFinalization(t *testing.T) {
 	updated, err := NewTaskStore(database).Get(ctx, created.ID)
 	if err != nil || updated.Status != task.StatusReview {
 		t.Fatalf("task = %#v, %v", updated, err)
+	}
+}
+
+func TestRunStoreTracksAgentProcessForCrashRecovery(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureProfile(t, database, agentprofile.RolePlanner)
+	if _, err := NewTopicStore(database).Create(ctx, topic.CreateInput{Title: "Agent 进程恢复"}); err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	identity := strings.Repeat("b", 64)
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.AttachAgentProcess(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 456, identity); err != nil {
+		t.Fatal(err)
+	}
+	recoveryItems, err := store.ListRecoveryRuns(ctx)
+	if err != nil || len(recoveryItems) != 1 || recoveryItems[0].AgentPID != 456 || recoveryItems[0].AgentIdentity != identity {
+		t.Fatalf("recovery items = %#v, %v", recoveryItems, err)
+	}
+	if err := store.ReleaseAgentProcess(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	recoveryItems, err = store.ListRecoveryRuns(ctx)
+	if err != nil || recoveryItems[0].AgentPID != 0 || recoveryItems[0].AgentIdentity != "" {
+		t.Fatalf("released recovery items = %#v, %v", recoveryItems, err)
 	}
 }
 
@@ -587,6 +630,61 @@ func TestRunStoreRequestsCancellationAndBlocksTaskAfterRunnerFinalizes(t *testin
 	}
 }
 
+func TestRunStoreConcurrentCancellationDoesNotHitBusySnapshot(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "并发取消当前执行"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim, err := NewRunStore(database).ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunStore(database).Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewRunStore(database).MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	var sequence int
+	var databaseName, path string
+	if err := database.QueryRowContext(ctx, "PRAGMA database_list").Scan(&sequence, &databaseName, &path); err != nil {
+		t.Fatal(err)
+	}
+	second, err := OpenExisting(ctx, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	stores := []*RunStore{NewRunStore(database), NewRunStore(second)}
+	start := make(chan struct{})
+	errorsFound := make(chan error, 8)
+	var group sync.WaitGroup
+	for index := range 8 {
+		group.Add(1)
+		go func(index int) {
+			defer group.Done()
+			<-start
+			_, requestErr := stores[index%len(stores)].RequestCancel(ctx, claim.Run.ID, "并发停止")
+			errorsFound <- requestErr
+		}(index)
+	}
+	close(start)
+	group.Wait()
+	close(errorsFound)
+	for requestErr := range errorsFound {
+		if requestErr != nil {
+			t.Fatalf("concurrent RequestCancel() error = %v", requestErr)
+		}
+	}
+	current, err := NewRunStore(database).Get(ctx, claim.Run.ID)
+	if err != nil || current.CancelRequestedAt == nil || current.CancelReason != "并发停止" || current.TaskID != created.ID {
+		t.Fatalf("cancelled run = %#v, %v", current, err)
+	}
+}
+
 func TestRunStorePersistsCodexSessionAndBindsCompatibleRetry(t *testing.T) {
 	ctx := context.Background()
 	database := openTaskTestDatabase(t)
@@ -672,12 +770,95 @@ func TestRunStoreBridgesStructuredApprovalDecision(t *testing.T) {
 	if err != nil || len(open) != 1 || open[0].ID != created.ID {
 		t.Fatalf("open approvals = %#v, %v", open, err)
 	}
+	runApprovals, err := store.ListRunApprovalRequests(ctx, claim.Run.ID)
+	if err != nil || len(runApprovals) != 1 || runApprovals[0].ID != created.ID {
+		t.Fatalf("run approvals = %#v, %v", runApprovals, err)
+	}
+	loadedApproval, err := store.GetApprovalRequest(ctx, created.ID)
+	if err != nil || loadedApproval.ID != created.ID {
+		t.Fatalf("GetApprovalRequest() = %#v, %v", loadedApproval, err)
+	}
 	resolved, err := store.ResolveApprovalRequest(ctx, created.ID, created.Version, approvalrequest.DecisionAcceptSession)
 	if err != nil || resolved.Status != approvalrequest.StatusResolved || resolved.Decision != approvalrequest.DecisionAcceptSession {
 		t.Fatalf("resolved approval = %#v, %v", resolved, err)
 	}
 	if _, err := store.ResolveApprovalRequest(ctx, created.ID, created.Version, approvalrequest.DecisionDecline); !errors.Is(err, ErrApprovalRequestConflict) {
 		t.Fatalf("second decision error = %v", err)
+	}
+}
+
+func TestRunStoreClearsApprovalAndQueriesRuns(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	createdTask, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "查询执行记录"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	approval, err := store.CreateApprovalRequest(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, approvalrequest.CreateInput{
+		ExternalRequestID: "rpc-clear", Kind: approvalrequest.KindCommand, Command: "go test ./...",
+		Available: []approvalrequest.Decision{approvalrequest.DecisionAcceptOnce, approvalrequest.DecisionDecline},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ClearApprovalRequest(ctx, approval.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	cleared, err := store.GetApprovalRequest(ctx, approval.ID)
+	if err != nil || cleared.Status != approvalrequest.StatusCleared {
+		t.Fatalf("cleared approval = %#v, %v", cleared, err)
+	}
+	page, err := store.Query(ctx, RunQuery{TaskID: createdTask.ID, ActiveOnly: true, Limit: 1})
+	if err != nil || len(page.Items) != 1 || page.Items[0].ID != claim.Run.ID {
+		t.Fatalf("Query() = %#v, %v", page, err)
+	}
+	if _, err := store.Query(ctx, RunQuery{Limit: 0}); err == nil {
+		t.Fatal("Query() accepted zero limit")
+	}
+}
+
+func TestRunStoreRecoversLostRunAndBlocksTask(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	configureRunnableProfiles(t, database)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "恢复丢失执行"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewRunStore(database)
+	claim, err := store.ClaimNextTask(ctx, 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Start(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.MarkRunning(ctx, claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := store.RecoverLost(ctx, claim.Run.ID, claim.Run.LeaseGeneration, "RUNNER_LOST", "runner disappeared")
+	if err != nil || recovered.Status != run.StatusLost || recovered.FailureCode != "RUNNER_LOST" {
+		t.Fatalf("RecoverLost() = %#v, %v", recovered, err)
+	}
+	updated, err := NewTaskStore(database).Get(ctx, created.ID)
+	if err != nil || updated.Status != task.StatusBlocked {
+		t.Fatalf("task = %#v, %v", updated, err)
+	}
+	replayed, err := store.RecoverLost(ctx, claim.Run.ID, claim.Run.LeaseGeneration, "RUNNER_LOST", "runner disappeared")
+	if err != nil || replayed.Status != run.StatusLost {
+		t.Fatalf("replayed RecoverLost() = %#v, %v", replayed, err)
 	}
 }
 

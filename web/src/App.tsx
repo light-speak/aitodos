@@ -69,7 +69,7 @@ export default function App() {
   const workspace = useTaskWorkspace(selectedTaskID)
 	const quality = useTaskQuality(selectedTaskID)
 	const assessment = useTaskAssessment(selectedTaskID)
-	const clarifications = useClarifications(selectedTaskID, board.project?.workers_enabled ?? false)
+	const clarifications = useClarifications(selectedTaskID, selectedTopicID, board.project?.workers_enabled ?? false)
 	const approvals = useApprovals(board.project?.workers_enabled ?? false)
 	const notifications = useBrowserNotifications(board.project?.root, board.project?.workers_enabled ?? false, approvals.items, clarifications.open)
 	const progress = useProjectProgress(view === 'progress')
@@ -239,7 +239,7 @@ export default function App() {
 		) : view === 'progress' ? (
 			<ProgressPage {...progress} onReload={progress.reload} />
 		) : (
-			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} /></>
+			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} onConfigureDefaults={agents.configureDefaults} /></>
 		)}
       </main>
 		{showSearch ? <ProjectSearchDialog
@@ -318,7 +318,7 @@ export default function App() {
 		onReloadClarifications={clarifications.reload}
 		onAnswerClarification={async (item, input) => {
 			const updated = await clarifications.answer(item, input)
-			board.updateTask(updated)
+			if (updated.task) board.updateTask(updated.task)
 		}}
 		onUpdateTitle={async (title) => {
 			const updated = await assessment.updateTitle(selectedTask, title)
@@ -326,6 +326,16 @@ export default function App() {
 		}}
 		onUpdateTargetBranch={async (targetBranch) => {
 			await board.updateTargetBranch(selectedTask, targetBranch)
+		}}
+		onUpdateDetails={async (input) => {
+			await board.updateTaskDetails(selectedTask, input)
+		}}
+		onCancelTask={async () => {
+			await board.cancelTask(selectedTask)
+		}}
+		onArchiveTask={async () => {
+			await board.archiveTask(selectedTask)
+			setSelectedTaskID(null)
 		}}
 			onWorkspaceChanged={() => {
 			workspace.reload()
@@ -345,13 +355,21 @@ export default function App() {
           submitting={discussion.submitting}
           discussionError={discussion.error}
           relationError={associations.error}
-          pendingRelationTaskIDs={associations.pendingTaskIDs}
+		  pendingRelationTaskIDs={associations.pendingTaskIDs}
+		  clarifications={clarifications.history}
+		  clarificationError={clarifications.error}
+		  answeringClarificationID={clarifications.answeringID}
           onClose={() => setSelectedTopicID(null)}
           onReloadDiscussion={discussion.reload}
           onSendMessage={sendMessage}
           onAddRelation={associations.add}
           onRemoveRelation={associations.remove}
-          onOpenTask={openTask}
+		  onOpenTask={openTask}
+		  onReloadClarifications={clarifications.reload}
+		  onAnswerClarification={async (item, input) => {
+			  const updated = await clarifications.answer(item, input)
+			  if (updated.topic) board.updateTopic(updated.topic)
+		  }}
 			plan={topicPlan.plan}
 			planLoading={topicPlan.loading}
 			planSubmitting={topicPlan.submitting}
@@ -405,13 +423,16 @@ export default function App() {
 				items={clarifications.open}
 				approvals={approvals.items}
 				tasks={board.tasks}
+				topics={board.topics}
 				answeringID={clarifications.answeringID}
 				decidingApprovalID={approvals.decidingID}
 				onClose={() => setShowClarifications(false)}
 				onOpenTask={(taskID) => { setShowClarifications(false); openTask(taskID) }}
+				onOpenTopic={(topicID) => { setShowClarifications(false); openTopic(topicID) }}
 				onAnswer={async (item, input) => {
 					const updated = await clarifications.answer(item, input)
-					board.updateTask(updated)
+					if (updated.task) board.updateTask(updated.task)
+					if (updated.topic) board.updateTopic(updated.topic)
 				}}
 				onDecideApproval={approvals.decide}
 			/>

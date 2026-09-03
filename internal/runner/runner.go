@@ -27,6 +27,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/assessment"
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
+	"github.com/light-speak/aitodos/internal/domain/experience"
 	"github.com/light-speak/aitodos/internal/domain/plan"
 	"github.com/light-speak/aitodos/internal/domain/quality"
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
@@ -121,9 +122,10 @@ func Execute(
 		if revision.Adapter == "codex-app-server" {
 			result = invokeCodexAppServer(runCtx, currentProject, revision, claimedRuns.Purpose, workingDirectory,
 				runID, promptPath, prompt, toolArgs, externalSessionID,
-				appServerApprovalBridge{store: runs, runID: runID, claimToken: claimToken, leaseGeneration: leaseGeneration}, cancelCheck)
+				appServerApprovalBridge{store: runs, audit: storage.NewMCPAuditStore(database), runID: runID, claimToken: claimToken, leaseGeneration: leaseGeneration}, cancelCheck)
 		} else {
-			result = invokeAgent(runCtx, currentProject, revision, claimedRuns.Purpose, workingDirectory, runID, promptPath, prompt, toolArgs, externalSessionID, cancelCheck)
+			result = invokeAgent(runCtx, currentProject, revision, claimedRuns.Purpose, workingDirectory, runID, promptPath, prompt, toolArgs, externalSessionID,
+				agentProcessBridge{store: runs, runID: runID, claimToken: claimToken, leaseGeneration: leaseGeneration}, cancelCheck)
 		}
 	}
 	select {
@@ -451,6 +453,11 @@ func buildPlanningPrompt(
 			Source: "Project Instructions", Content: instructions, Required: true, Priority: 0,
 		})
 	}
+	experienceChunks, recallErr := recallTopicExperiences(ctx, database, revision, currentRun, currentTopic)
+	if recallErr != nil {
+		return "", contextbuilder.Manifest{}, recallErr
+	}
+	chunks = append(chunks, experienceChunks...)
 	if messages, messageErr := storage.NewDiscussionStore(database).ListTopicMessages(ctx, currentRun.TopicID); messageErr != nil {
 		return "", contextbuilder.Manifest{}, messageErr
 	} else if len(messages) > 0 {
@@ -467,6 +474,20 @@ func buildPlanningPrompt(
 		})
 	} else if !errors.Is(planErr, storage.ErrPlanNotFound) {
 		return "", contextbuilder.Manifest{}, planErr
+	}
+	if currentRun.ContinuationOfRunID != "" {
+		continued, continuationErr := storage.NewClarificationStore(database).GetForContinuationRun(ctx, currentRun.ID)
+		if continuationErr == nil {
+			encoded, marshalErr := json.MarshalIndent(continued, "", "  ")
+			if marshalErr != nil {
+				return "", contextbuilder.Manifest{}, fmt.Errorf("encode topic clarification context: %w", marshalErr)
+			}
+			chunks = append(chunks, contextbuilder.Chunk{
+				Source: "Continuation Clarification", Content: string(encoded), Required: true, Priority: 0,
+			})
+		} else if !errors.Is(continuationErr, storage.ErrClarificationNotFound) {
+			return "", contextbuilder.Manifest{}, fmt.Errorf("load topic clarification context: %w", continuationErr)
+		}
 	}
 	budget := revision.MaxInputTokens - revision.ReservedOutputTokens
 	return contextbuilder.Assemble(chunks, budget)
@@ -505,6 +526,11 @@ func buildTaskPrompt(
 	} else if instructions != "" {
 		chunks = append(chunks, contextbuilder.Chunk{Source: "Project Instructions", Content: instructions, Required: true, Priority: 0})
 	}
+	experienceChunks, recallErr := recallTaskExperiences(ctx, database, revision, currentRun, currentTask)
+	if recallErr != nil {
+		return "", contextbuilder.Manifest{}, recallErr
+	}
+	chunks = append(chunks, experienceChunks...)
 	if usesTaskWorkspace(currentRun.Purpose) {
 		currentWorkspace, workspaceErr := storage.NewWorkspaceStore(database).GetByTask(ctx, currentRun.TaskID)
 		if workspaceErr != nil {
@@ -574,6 +600,57 @@ func buildTaskPrompt(
 	return contextbuilder.Assemble(chunks, budget)
 }
 
+func recallTopicExperiences(
+	ctx context.Context,
+	database *sql.DB,
+	revision agentprofile.Revision,
+	currentRun domainrun.Run,
+	currentTopic topic.Topic,
+) ([]contextbuilder.Chunk, error) {
+	return recallExperienceChunks(ctx, database, storage.RecallQuery{
+		RunID: currentRun.ID, Purpose: currentRun.Purpose, TopicID: currentTopic.ID,
+		Text: currentTopic.Title + "\n" + currentTopic.Description, Limit: experienceRecallLimit(revision.RetrievalLimit),
+	})
+}
+
+func recallTaskExperiences(
+	ctx context.Context,
+	database *sql.DB,
+	revision agentprofile.Revision,
+	currentRun domainrun.Run,
+	currentTask task.Task,
+) ([]contextbuilder.Chunk, error) {
+	return recallExperienceChunks(ctx, database, storage.RecallQuery{
+		RunID: currentRun.ID, Purpose: currentRun.Purpose, TaskID: currentTask.ID,
+		Text:  strings.Join([]string{currentTask.Title, currentTask.Description, currentTask.AcceptanceCriteria}, "\n"),
+		Limit: experienceRecallLimit(revision.RetrievalLimit),
+	})
+}
+
+func recallExperienceChunks(ctx context.Context, database *sql.DB, query storage.RecallQuery) ([]contextbuilder.Chunk, error) {
+	items, err := storage.NewExperienceStore(database).Recall(ctx, query)
+	if err != nil {
+		return nil, fmt.Errorf("recall project experiences: %w", err)
+	}
+	chunks := make([]contextbuilder.Chunk, 0, len(items))
+	for _, item := range items {
+		content := fmt.Sprintf("Key: %s\nTitle: %s\nSummary: %s\nApplicability: %s\nRecall score: %.2f\nFull record: use read-only MCP get_experience with experience_id=%s",
+			item.Experience.Key, item.Experience.Title, item.Experience.Summary, item.Experience.Applicability,
+			item.Score.Final, item.Experience.ID)
+		chunks = append(chunks, contextbuilder.Chunk{
+			Source: "Relevant Experience Summaries · " + item.Experience.Key, Content: content, Priority: 15,
+		})
+	}
+	return chunks, nil
+}
+
+func experienceRecallLimit(configured int) int {
+	if configured < 1 {
+		return 3
+	}
+	return min(configured, 5)
+}
+
 func machineResultContract(purpose domainrun.Purpose) string {
 	if purpose == domainrun.PurposePlanning {
 		return `最终响应必须只包含下面结构的 JSON。Adapter 会将最终响应保存为 .ats-run-result.json；支持 ATS_RESULT_FILE 的 Agent 也可以直接写入该路径。
@@ -597,10 +674,20 @@ func machineResultContract(purpose domainrun.Purpose) string {
     }]
   }
 }
-不确定时只回复并提出最少的关键问题，不要生成空泛方案。Plan 只是草案，未经人工批准不得创建或执行正式 Task。`
+如果缺少一个会改变方案或验收结果的关键信息，只返回结构化阻塞问题：
+{
+  "clarification": {
+    "category": "REQUIREMENT|DECISION|ENVIRONMENT|VALIDATION",
+    "question": "一个最小且明确的阻塞问题",
+    "options": [{"id": "stable-id", "label": "选项", "description": "影响"}],
+    "recommended_option_id": "stable-id",
+    "allow_custom_answer": true
+  }
+}
+结构化问题不得与 reply 或 plan 同时返回。回答后系统会继续同一个 Topic 的规划职责。Plan 只是草案，未经人工批准不得创建或执行正式 Task。`
 	}
 	if purpose == domainrun.PurposeTriage {
-		return `完成评估后最终响应必须只包含下面的 JSON。Adapter 会将最终响应保存为 .ats-run-result.json；支持 ATS_RESULT_FILE 的 Agent 也可以直接写入该路径：
+		return `先判断 Current Task 是否具备明确范围、可验证验收标准和必要环境信息。信息充分时，最终响应必须只包含下面的 JSON。Adapter 会将最终响应保存为 .ats-run-result.json；支持 ATS_RESULT_FILE 的 Agent 也可以直接写入该路径：
 {
   "triage": {
     "suggested_title": "简洁动宾标题",
@@ -619,7 +706,18 @@ func machineResultContract(purpose domainrun.Purpose) string {
     "split_rationale": ""
   }
 }
-六个原始评分只能为 0 到 4。不要输出 complexity 或 autonomy，等级由系统固定算法计算。`
+六个原始评分只能为 0 到 4。不要输出 complexity 或 autonomy，等级由系统固定算法计算。
+如果缺少一个会改变实现或验收结果的关键信息，不得猜测或继续实现，改为只返回：
+{
+  "clarification": {
+    "category": "REQUIREMENT|DECISION|ENVIRONMENT|VALIDATION",
+    "question": "一个最小且明确的阻塞问题",
+    "options": [{"id": "stable-id", "label": "选项", "description": "影响"}],
+    "recommended_option_id": "stable-id",
+    "allow_custom_answer": true
+  }
+}
+回答后系统会续跑同一职责的 Triage；Clarification 不得请求 Secret。`
 	}
 	if purpose == domainrun.PurposeReview {
 		return `只读分析完成后，最终响应必须只包含下面的 JSON。Adapter 会将最终响应保存为 .ats-run-result.json；支持 ATS_RESULT_FILE 的 Agent 也可以直接写入该路径：
@@ -633,7 +731,8 @@ func machineResultContract(purpose domainrun.Purpose) string {
 {
   "estimate": {"points": 1|2|3|5|8|13, "remaining_points": 0..points, "confidence": 0..1, "rationale": "依据"},
   "new_test_cases": [{"title": "测试行为", "description": "预期", "required": true, "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据", "command": "实际执行的完整测试命令，可留空"}],
-  "test_results": [{"test_case_id": "已有测试项 ID", "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据", "command": "实际执行的完整测试命令，可留空"}]
+  "test_results": [{"test_case_id": "已有测试项 ID", "outcome": "PASSED|FAILED|BLOCKED", "summary": "结果依据", "command": "实际执行的完整测试命令，可留空"}],
+  "experience_candidates": [{"title": "可复用经验标题", "summary": "给未来 Context 的短摘要", "guidance": "完整做法", "applicability": "适用条件", "project_wide": false}]
 }
 如果缺少一个必须由人类决定的信息，可以改为只返回：
 {
@@ -645,7 +744,7 @@ func machineResultContract(purpose domainrun.Purpose) string {
     "allow_custom_answer": true
   }
 }
-Clarification 不得与 estimate、new_test_cases 或 test_results 同时返回，也不能用于请求 Secret 或绕过权限。不要伪造未执行的测试。填写 command 时必须与本 Run 实际执行的测试命令一致；Runner 只有在结构化命令事件和退出码与 outcome 一致时才记为 COMMAND，否则仍记为 AGENT_REPORT。`
+最多提出 3 条真正可复用的经验候选；候选需要人工确认后才会进入后续 Context。Clarification 不得与 estimate、new_test_cases、test_results 或 experience_candidates 同时返回，也不能用于请求 Secret 或绕过权限。不要伪造未执行的测试。填写 command 时必须与本 Run 实际执行的测试命令一致；Runner 只有在结构化命令事件和退出码与 outcome 一致时才记为 COMMAND，否则仍记为 AGENT_REPORT。`
 }
 
 func systemSafetyRules(purpose domainrun.Purpose) string {
@@ -905,6 +1004,25 @@ type processResult struct {
 	ExternalSessionID string
 }
 
+type agentProcessBridge struct {
+	store           *storage.RunStore
+	runID           string
+	claimToken      string
+	leaseGeneration int64
+}
+
+func (bridge agentProcessBridge) attach(ctx context.Context, command *exec.Cmd) error {
+	identity, err := processidentity.Read(ctx, command.Process.Pid)
+	if err != nil {
+		return fmt.Errorf("read agent process identity: %w", err)
+	}
+	return bridge.store.AttachAgentProcess(ctx, bridge.runID, bridge.claimToken, bridge.leaseGeneration, command.Process.Pid, identity)
+}
+
+func (bridge agentProcessBridge) release() error {
+	return bridge.store.ReleaseAgentProcess(context.Background(), bridge.runID, bridge.claimToken, bridge.leaseGeneration)
+}
+
 func invokeAgent(
 	ctx context.Context,
 	currentProject *project.Project,
@@ -916,6 +1034,7 @@ func invokeAgent(
 	prompt string,
 	toolArgs []string,
 	externalSessionID string,
+	processBridge agentProcessBridge,
 	cancelRequested func() (bool, error),
 ) processResult {
 	args, usesPromptFile := invocationArgs(revision, purpose, workspacePath, runID, promptPath, externalSessionID)
@@ -940,11 +1059,24 @@ func invokeAgent(
 	if err := command.Start(); err != nil {
 		return processResult{Status: domainrun.StatusFailed, ExitCode: -1, Code: "SPAWN_FAILED", Err: err}
 	}
+	if err := processBridge.attach(ctx, command); err != nil {
+		_ = terminateProcessGroup(command.Process.Pid)
+		_ = command.Wait()
+		return processResult{Status: domainrun.StatusFailed, ExitCode: processExitCode(command.ProcessState), Code: "AGENT_IDENTITY", Err: err}
+	}
 	wait := make(chan error, 1)
 	go func() { wait <- command.Wait() }()
 	timer := time.NewTimer(time.Duration(revision.TimeoutSeconds) * time.Second)
 	defer timer.Stop()
 	status, code, waitErr := waitForAgent(ctx, timer.C, command, wait, cancelRequested)
+	cleanupErr := terminateProcessGroup(command.Process.Pid)
+	releaseErr := processBridge.release()
+	if waitErr == nil {
+		waitErr = errors.Join(cleanupErr, releaseErr)
+	}
+	if waitErr != nil && status == domainrun.StatusSucceeded {
+		status, code = domainrun.StatusFailed, "AGENT_CLEANUP"
+	}
 	return processResult{
 		Status: status, ExitCode: processExitCode(command.ProcessState), Code: code, Err: waitErr,
 		Stdout: stdout.Bytes(), Stderr: stderr.Bytes(),
@@ -997,11 +1129,34 @@ func stopProcessGroup(command *exec.Cmd, wait <-chan error) error {
 	defer timer.Stop()
 	select {
 	case err := <-wait:
-		return err
+		return errors.Join(err, terminateProcessGroup(command.Process.Pid))
 	case <-timer.C:
 		_ = syscall.Kill(-command.Process.Pid, syscall.SIGKILL)
-		return <-wait
+		return errors.Join(<-wait, terminateProcessGroup(command.Process.Pid))
 	}
+}
+
+func terminateProcessGroup(pid int) error {
+	if pid < 1 {
+		return nil
+	}
+	if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+		return nil
+	} else if err != nil {
+		return fmt.Errorf("inspect agent process group: %w", err)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := syscall.Kill(-pid, 0); errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	if err := syscall.Kill(-pid, syscall.SIGKILL); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return fmt.Errorf("kill residual agent process group: %w", err)
+	}
+	return nil
 }
 
 func invocationArgs(
@@ -1344,13 +1499,14 @@ func validParsedUsage(usage domainrun.Usage) bool {
 }
 
 type agentResult struct {
-	Clarification *clarification.Request `json:"clarification"`
-	Triage        *assessment.Input      `json:"triage"`
-	Reply         string                 `json:"reply"`
-	Plan          *plan.RevisionInput    `json:"plan"`
-	Estimate      *agentEstimate         `json:"estimate"`
-	NewTestCases  []agentTestCase        `json:"new_test_cases"`
-	TestResults   []agentTestResult      `json:"test_results"`
+	Clarification *clarification.Request     `json:"clarification"`
+	Triage        *assessment.Input          `json:"triage"`
+	Reply         string                     `json:"reply"`
+	Plan          *plan.RevisionInput        `json:"plan"`
+	Estimate      *agentEstimate             `json:"estimate"`
+	NewTestCases  []agentTestCase            `json:"new_test_cases"`
+	TestResults   []agentTestResult          `json:"test_results"`
+	Experiences   []agentExperienceCandidate `json:"experience_candidates"`
 }
 
 type agentEstimate struct {
@@ -1374,6 +1530,14 @@ type agentTestResult struct {
 	Outcome    quality.TestOutcome `json:"outcome"`
 	Summary    string              `json:"summary"`
 	Command    string              `json:"command"`
+}
+
+type agentExperienceCandidate struct {
+	Title         string `json:"title"`
+	Summary       string `json:"summary"`
+	Guidance      string `json:"guidance"`
+	Applicability string `json:"applicability"`
+	ProjectWide   bool   `json:"project_wide"`
 }
 
 type collectedAgentResult struct {
@@ -1418,8 +1582,19 @@ func collectAgentResult(
 		return collectedAgentResult{}, errors.New("agent result must contain one JSON value")
 	}
 	if currentRun.Purpose == domainrun.PurposePlanning {
-		if result.Clarification != nil || result.Triage != nil || result.Estimate != nil ||
-			len(result.NewTestCases) > 0 || len(result.TestResults) > 0 {
+		if result.Clarification != nil {
+			if result.Reply != "" || result.Plan != nil || result.Triage != nil || result.Estimate != nil ||
+				len(result.NewTestCases) > 0 || len(result.TestResults) > 0 || len(result.Experiences) > 0 {
+				return collectedAgentResult{}, errors.New("planning clarification cannot be combined with other results")
+			}
+			request := result.Clarification.Normalized()
+			if err := request.Validate(); err != nil {
+				return collectedAgentResult{}, fmt.Errorf("validate planning clarification: %w", err)
+			}
+			return collectedAgentResult{Clarification: &request}, nil
+		}
+		if result.Triage != nil || result.Estimate != nil ||
+			len(result.NewTestCases) > 0 || len(result.TestResults) > 0 || len(result.Experiences) > 0 {
 			return collectedAgentResult{}, errors.New("planning run can only write reply and plan")
 		}
 		planning := plan.PlanningResult{Reply: result.Reply, Plan: result.Plan}.Normalized()
@@ -1429,14 +1604,25 @@ func collectAgentResult(
 		return collectedAgentResult{Planning: &planning}, nil
 	}
 	if currentRun.Purpose == domainrun.PurposeTriage {
-		if result.Clarification != nil || result.Reply != "" || result.Plan != nil {
+		if result.Reply != "" || result.Plan != nil {
 			return collectedAgentResult{}, errors.New("triage run cannot write discussion or plan")
+		}
+		if result.Clarification != nil {
+			if result.Triage != nil || result.Estimate != nil || len(result.NewTestCases) > 0 ||
+				len(result.TestResults) > 0 || len(result.Experiences) > 0 {
+				return collectedAgentResult{}, errors.New("triage clarification cannot be combined with assessment or quality results")
+			}
+			request := result.Clarification.Normalized()
+			if err := request.Validate(); err != nil {
+				return collectedAgentResult{}, fmt.Errorf("validate triage clarification: %w", err)
+			}
+			return collectedAgentResult{Clarification: &request}, nil
 		}
 		return collectedAgentResult{}, applyTriageResult(ctx, database, currentRun, result)
 	}
 	if currentRun.Purpose == domainrun.PurposeReview {
 		if result.Clarification != nil || result.Triage != nil || result.Plan != nil || result.Estimate != nil ||
-			len(result.NewTestCases) > 0 || len(result.TestResults) > 0 {
+			len(result.NewTestCases) > 0 || len(result.TestResults) > 0 || len(result.Experiences) > 0 {
 			return collectedAgentResult{}, errors.New("review run can only write task reply")
 		}
 		reply := strings.TrimSpace(result.Reply)
@@ -1449,7 +1635,7 @@ func collectAgentResult(
 		return collectedAgentResult{}, errors.New("task run cannot write triage or planning result")
 	}
 	if result.Clarification != nil {
-		if result.Estimate != nil || len(result.NewTestCases) > 0 || len(result.TestResults) > 0 {
+		if result.Estimate != nil || len(result.NewTestCases) > 0 || len(result.TestResults) > 0 || len(result.Experiences) > 0 {
 			return collectedAgentResult{}, errors.New("clarification cannot be combined with quality results")
 		}
 		request := result.Clarification.Normalized()
@@ -1459,7 +1645,7 @@ func collectAgentResult(
 		return collectedAgentResult{Clarification: &request}, nil
 	}
 	return collectedAgentResult{}, applyAgentResult(
-		ctx, storage.NewQualityStore(database), currentRun.ID, currentRun.TaskID,
+		ctx, storage.NewQualityStore(database), storage.NewExperienceStore(database), currentRun.ID, currentRun.TaskID,
 		result, executions,
 	)
 }
@@ -1468,7 +1654,7 @@ func applyTriageResult(ctx context.Context, database *sql.DB, currentRun domainr
 	if result.Triage == nil {
 		return errors.New("triage result is required")
 	}
-	if result.Estimate != nil || len(result.NewTestCases) > 0 || len(result.TestResults) > 0 {
+	if result.Estimate != nil || len(result.NewTestCases) > 0 || len(result.TestResults) > 0 || len(result.Experiences) > 0 {
 		return errors.New("triage run can only write triage assessment")
 	}
 	_, _, err := storage.NewAssessmentStore(database).ApplyTriageResult(ctx, currentRun.ID, *result.Triage)
@@ -1497,6 +1683,7 @@ func readOptionalResult(path string) ([]byte, error) {
 func applyAgentResult(
 	ctx context.Context,
 	store *storage.QualityStore,
+	experiences *storage.ExperienceStore,
 	runID string,
 	taskID string,
 	result agentResult,
@@ -1540,10 +1727,21 @@ func applyAgentResult(
 			return err
 		}
 	}
+	for _, proposed := range result.Experiences {
+		if _, err := experiences.CreateCandidate(ctx, experience.Input{
+			TaskID: taskID, SourceRunID: runID, Title: proposed.Title, Summary: proposed.Summary,
+			Guidance: proposed.Guidance, Applicability: proposed.Applicability, ProjectWide: proposed.ProjectWide,
+		}); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
 func validateAgentResult(runID string, result agentResult) error {
+	if len(result.Experiences) > 3 {
+		return errors.New("agent result cannot contain more than 3 experience candidates")
+	}
 	if result.Estimate != nil {
 		input := quality.EstimateInput{
 			Points: result.Estimate.Points, RemainingPoints: result.Estimate.RemainingPoints,
@@ -1574,6 +1772,14 @@ func validateAgentResult(runID string, result agentResult) error {
 		}
 		if err := agentReportedTestResultInput(runID, reported.Outcome, reported.Summary).Validate(); err != nil {
 			return fmt.Errorf("validate existing test result: %w", err)
+		}
+	}
+	for _, proposed := range result.Experiences {
+		if err := (experience.Input{
+			TaskID: "candidate-subject", SourceRunID: runID, Title: proposed.Title, Summary: proposed.Summary,
+			Guidance: proposed.Guidance, Applicability: proposed.Applicability, ProjectWide: proposed.ProjectWide,
+		}).Validate(); err != nil {
+			return fmt.Errorf("validate experience candidate: %w", err)
 		}
 	}
 	return nil
@@ -1616,6 +1822,7 @@ func agentTestResultInput(runID string, reported agentTestResult, executions com
 	if execution, ok := executions.match(reported.Command, reported.Outcome); ok {
 		input.EvidenceKind = quality.EvidenceCommand
 		input.Command = execution.Command
+		input.ExitCode = &execution.ExitCode
 		input.ArtifactRef = filepath.ToSlash(filepath.Join("runs", runID, "stdout.log"))
 	}
 	return input

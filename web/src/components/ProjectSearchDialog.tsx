@@ -39,7 +39,7 @@ export function ProjectSearchDialog(props: ProjectSearchDialogProps) {
 			<DialogContent className="max-h-[calc(100svh-2rem)] gap-0 overflow-hidden p-0 sm:max-w-3xl">
 				<DialogHeader className="border-b px-6 py-5">
 					<DialogTitle>搜索项目</DialogTitle>
-					<DialogDescription>搜索 Topic、Task、Plan、讨论消息和待确认问题。原始日志与完整 Diff 不在默认索引中。</DialogDescription>
+					<DialogDescription>搜索 Topic、Task、Plan、讨论、决策和项目经验。原始日志与完整 Diff 不在默认索引中。</DialogDescription>
 				</DialogHeader>
 				<form className="grid gap-3 border-b bg-muted/20 px-6 py-4" onSubmit={submit}>
 					<div className="flex gap-2">
@@ -48,7 +48,7 @@ export function ProjectSearchDialog(props: ProjectSearchDialogProps) {
 							<Input autoFocus aria-label="搜索项目内容" className="border-0 px-0 shadow-none focus-visible:ring-0" value={query} onChange={(event) => setQuery(event.currentTarget.value)} placeholder="输入编号、标题、需求、结论或讨论内容…" />
 						</label>
 						<select aria-label="内容类型" className="h-9 rounded-md border bg-background px-3 text-sm" value={kind} onChange={(event) => setKind(event.currentTarget.value as SearchKind | 'ALL')}>
-							<option value="ALL">全部类型</option><option value="TOPIC">Topic</option><option value="TASK">Task</option><option value="MESSAGE">讨论消息</option><option value="PLAN_REVISION">Plan</option><option value="CLARIFICATION">待确认问题</option>
+							<option value="ALL">全部类型</option><option value="TOPIC">Topic</option><option value="TASK">Task</option><option value="MESSAGE">讨论消息</option><option value="PLAN_REVISION">Plan</option><option value="CLARIFICATION">待确认问题</option><option value="DECISION">决策</option><option value="EXPERIENCE">经验</option>
 						</select>
 						<Button type="submit" disabled={props.loading || !query.trim()}>{props.loading ? <LoaderCircleIcon className="animate-spin" /> : <SearchIcon />}搜索</Button>
 					</div>
@@ -74,5 +74,8 @@ function SearchResult({ item, onOpen }: { item: SearchItem; onOpen: () => void }
 }
 
 function kindLabel(kind: SearchKind): string {
-	return ({ TOPIC: 'Topic', TASK: 'Task', MESSAGE: '消息', PLAN_REVISION: 'Plan', CLARIFICATION: '待确认' })[kind]
+	return ({
+		TOPIC: 'Topic', TASK: 'Task', MESSAGE: '消息', PLAN_REVISION: 'Plan', CLARIFICATION: '待确认',
+		DECISION: '决策', RUN_SUMMARY: 'Run 摘要', CI_CHECK: 'CI', LABEL: '标签', EXPERIENCE: '经验',
+	})[kind]
 }

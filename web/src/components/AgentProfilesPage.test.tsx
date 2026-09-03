@@ -34,6 +34,15 @@ const triagerProfile: AgentProfile = {
 }
 
 describe('AgentProfilesPage', () => {
+	it('可以一次配置所有未配置 Agent', async () => {
+		const user = userEvent.setup()
+		const onConfigureDefaults = vi.fn().mockResolvedValue(undefined)
+		render(<AgentProfilesPage profiles={[profile, triagerProfile]} capabilities={{ skills: [], mcp_servers: [] }} loading={false} error={null} saving={false} onReload={() => undefined} onSave={vi.fn()} onConfigureDefaults={onConfigureDefaults} />)
+
+		expect(screen.getByText('还有 2 个 Agent 未配置')).toBeInTheDocument()
+		await user.click(screen.getByRole('button', { name: '一键配置 Codex' }))
+		expect(onConfigureDefaults).toHaveBeenCalledOnce()
+	})
 	it('将上下文预算作为系统策略而不是人工配置项', async () => {
 		const user = userEvent.setup()
 		render(<AgentProfilesPage profiles={[profile]} capabilities={{ skills: [], mcp_servers: [] }} loading={false} error={null} saving={false} onReload={() => undefined} onSave={vi.fn()} />)

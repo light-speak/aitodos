@@ -22,13 +22,21 @@ interface AgentProfilesPageProps {
 	capabilities: ProjectCapabilityCatalog
 	onReload: () => void
 	onSave: (profileID: string, input: AgentProfileRevisionInput) => Promise<void>
+	onConfigureDefaults?: () => Promise<void>
 }
 
 export function AgentProfilesPage(props: AgentProfilesPageProps) {
 	const [editing, setEditing] = useState<AgentProfile | null>(null)
+	const [setupError, setSetupError] = useState('')
 	if (props.loading) return <div className="grid gap-4 px-4 sm:px-6 lg:grid-cols-2 lg:px-8">{[1, 2, 3, 4].map((item) => <Skeleton className="h-64 rounded-xl" key={item} />)}</div>
 	if (props.error) return <PageError error={props.error} onReload={props.onReload} />
-	return <><section className="grid gap-4 px-4 pb-8 sm:px-6 lg:grid-cols-2 lg:px-8" aria-label="Agent Profiles">{props.profiles.map((profile) => <ProfileCard profile={profile} onEdit={() => setEditing(profile)} key={profile.id} />)}</section>{editing ? <ProfileDialog profile={editing} capabilities={props.capabilities} saving={props.saving} onClose={() => setEditing(null)} onSave={async (input) => { await props.onSave(editing.id, input); setEditing(null) }} /> : null}</>
+	const unconfigured = props.profiles.filter((profile) => !profile.current_revision.command).length
+	async function configureDefaults() {
+		if (!props.onConfigureDefaults) return
+		setSetupError('')
+		try { await props.onConfigureDefaults() } catch (error: unknown) { setSetupError(errorMessage(error)) }
+	}
+	return <>{unconfigured > 0 && props.onConfigureDefaults ? <section className="mx-4 mb-4 flex items-center gap-4 rounded-xl border bg-muted/20 p-4 sm:mx-6 lg:mx-8" aria-label="Agent 初始化"><div className="min-w-0 flex-1"><p className="font-medium">还有 {unconfigured} 个 Agent 未配置</p><p className="text-sm text-muted-foreground">使用当前 PATH 中的 Codex，一次创建全部默认配置；模型沿用 CLI 默认值。</p>{setupError ? <p className="mt-1 text-sm text-destructive" role="alert">{setupError}</p> : null}</div><Button type="button" disabled={props.saving} onClick={() => { void configureDefaults() }}>{props.saving ? '配置中…' : '一键配置 Codex'}</Button></section> : null}<section className="grid gap-4 px-4 pb-8 sm:px-6 lg:grid-cols-2 lg:px-8" aria-label="Agent Profiles">{props.profiles.map((profile) => <ProfileCard profile={profile} onEdit={() => setEditing(profile)} key={profile.id} />)}</section>{editing ? <ProfileDialog profile={editing} capabilities={props.capabilities} saving={props.saving} onClose={() => setEditing(null)} onSave={async (input) => { await props.onSave(editing.id, input); setEditing(null) }} /> : null}</>
 }
 
 function ProfileCard({ profile, onEdit }: { profile: AgentProfile; onEdit: () => void }) {

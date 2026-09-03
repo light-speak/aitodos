@@ -18,3 +18,12 @@ func TestReviewInputValidation(t *testing.T) {
 		}
 	}
 }
+
+func TestReviewInputCommand(t *testing.T) {
+	if got := (ReviewInput{Decision: ReviewAccepted}).Command(); got != CommandAccept {
+		t.Fatalf("accepted command = %q", got)
+	}
+	if got := (ReviewInput{Decision: ReviewRejected}).Command(); got != CommandReject {
+		t.Fatalf("rejected command = %q", got)
+	}
+}

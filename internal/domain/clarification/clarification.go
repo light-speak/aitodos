@@ -94,7 +94,8 @@ func (request Request) Validate() error {
 // Clarification 是持久化的 Agent 阻塞问题及人工答案。
 type Clarification struct {
 	ID                  string            `json:"id"`
-	TaskID              string            `json:"task_id"`
+	TopicID             string            `json:"topic_id,omitempty"`
+	TaskID              string            `json:"task_id,omitempty"`
 	SourceRunID         string            `json:"source_run_id"`
 	ContinuationRunID   string            `json:"continuation_run_id,omitempty"`
 	ContinuationPurpose domainrun.Purpose `json:"continuation_purpose"`

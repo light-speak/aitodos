@@ -45,7 +45,9 @@ function TestCaseDetails({ label, items }: { label: string; items: TaskTestCase[
 }
 
 function isVerified(item: TaskTestCase): boolean {
-	return item.latest_result?.outcome === 'PASSED' && item.latest_result.evidence_kind !== 'AGENT_REPORT' && !item.latest_result.stale
+	const result = item.latest_result
+	return result?.outcome === 'PASSED' && !result.stale &&
+		(result.evidence_kind === 'HUMAN' || (result.evidence_kind === 'COMMAND' && result.exit_code === 0))
 }
 
 function EstimateSummary({ quality }: { quality: TaskQuality | null }) {
@@ -57,15 +59,16 @@ function EstimateSummary({ quality }: { quality: TaskQuality | null }) {
 function TestCaseRow({ item, busy, onRecord }: { item: TaskTestCase; busy: boolean; onRecord: TaskQualityPanelProps['onRecordResult'] }) {
 	const status = resultStatus(item)
 	const canConfirm = !isVerified(item) && item.latest_result?.outcome !== 'FAILED'
-	return <article className="rounded-xl border p-4"><div className="flex items-start gap-3"><span className={`mt-0.5 ${status.tone}`}>{status.icon}</span><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="font-medium">{item.title}</p>{item.required ? <Badge variant="secondary">必测</Badge> : <Badge variant="outline">可选</Badge>}</div>{item.description ? <p className="mt-1 text-sm text-muted-foreground">{item.description}</p> : null}<p className="mt-2 text-xs text-muted-foreground">{status.label}</p></div>{canConfirm ? <Button variant="outline" size="sm" disabled={busy} aria-label={`人工确认${item.title}通过`} onClick={() => { void onRecord(item.id, { outcome: 'PASSED', evidence_kind: 'HUMAN', summary: '人工确认通过' }) }}>人工确认通过</Button> : null}</div></article>
+	return <article className="rounded-xl border p-4"><div className="flex items-start gap-3"><span className={`mt-0.5 ${status.tone}`}>{status.icon}</span><div className="min-w-0 flex-1"><div className="flex flex-wrap items-center gap-2"><p className="font-medium">{item.title}</p>{item.required ? <Badge variant="secondary">必测</Badge> : <Badge variant="outline">可选</Badge>}</div>{item.description ? <p className="mt-1 text-sm text-muted-foreground">{item.description}</p> : null}<p className="mt-2 text-xs text-muted-foreground">{status.label}</p></div>{canConfirm ? <Button variant="outline" size="sm" disabled={busy} aria-label={`人工确认${item.title}通过`} onClick={() => { void onRecord(item.id, { outcome: 'PASSED', summary: '人工确认通过' }) }}>人工确认通过</Button> : null}</div></article>
 }
 
 function resultStatus(item: TaskTestCase): { label: string; tone: string; icon: React.ReactNode } {
 	const result = item.latest_result
 	if (!result) return { label: '尚未执行', tone: 'text-muted-foreground', icon: <CircleHelpIcon className="size-4" /> }
 	if (result.stale) return { label: `${result.summary} · 目标分支同步后需重新验证`, tone: 'text-amber-600', icon: <CircleHelpIcon className="size-4" /> }
+	if (result.outcome === 'PASSED' && result.evidence_kind === 'COMMAND' && result.exit_code === undefined) return { label: `${result.summary} · 旧版命令证据，需重新验证`, tone: 'text-amber-600', icon: <CircleHelpIcon className="size-4" /> }
 	if (result.outcome === 'PASSED' && result.evidence_kind === 'AGENT_REPORT') return { label: 'Agent 报告通过 · 未验证', tone: 'text-amber-600', icon: <CircleHelpIcon className="size-4" /> }
-	if (result.outcome === 'PASSED') return { label: `${result.summary} · ${result.evidence_kind === 'COMMAND' ? '命令已验证' : '人工已验证'}`, tone: 'text-emerald-600', icon: <CheckCircle2Icon className="size-4" /> }
+	if (result.outcome === 'PASSED') return { label: `${result.summary} · ${result.evidence_kind === 'COMMAND' ? `命令已验证${result.exit_code === undefined ? '' : ` · exit ${result.exit_code}`}` : '人工已验证'}`, tone: 'text-emerald-600', icon: <CheckCircle2Icon className="size-4" /> }
 	return { label: result.summary, tone: 'text-rose-600', icon: <XCircleIcon className="size-4" /> }
 }
 

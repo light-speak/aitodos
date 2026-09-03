@@ -1,7 +1,7 @@
 import { lazy, Suspense } from 'react'
 import { Clock3Icon, ListChecksIcon, LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
 
-import type { AgentRun, Clarification, ClarificationAnswerInput, CreateTaskEstimateInput, CreateTaskTestCaseInput, CreateTaskTestResultInput, DiscussionMessage, RepositoryInfo, RunPurpose, Task, TaskAssessmentState, TaskAssociation, TaskFeedback, TaskFeedbackIntent, TaskQuality, TaskStatus, Topic, TopicAssociation, Workspace } from '../types'
+import type { AgentRun, Clarification, ClarificationAnswerInput, CreateTaskEstimateInput, CreateTaskTestCaseInput, CreateTaskTestResultInput, DiscussionMessage, RepositoryInfo, RunPurpose, Task, TaskAssessmentState, TaskAssociation, TaskFeedback, TaskFeedbackIntent, TaskQuality, TaskRelationType, TaskStatus, Topic, TopicAssociation, UpdateTaskDetailsInput, Workspace } from '../types'
 import { TaskClarificationsPanel } from './ClarificationsPanel'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
@@ -11,6 +11,8 @@ import { TaskWorkspacePanel } from './TaskWorkspacePanel'
 import { TaskQualityPanel } from './TaskQualityPanel'
 import { TaskAssessmentPanel } from './TaskAssessmentPanel'
 import { TaskRunsPanel } from './TaskRunsPanel'
+import { TaskRequirementsEditor } from './TaskRequirementsEditor'
+import { SubjectKnowledgePanel } from './SubjectKnowledgePanel'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Separator } from './ui/separator'
@@ -59,8 +61,8 @@ interface TaskDetailsDialogProps {
   onReloadDiscussion: () => void
 	onRetryFeedback: (feedbackID: string) => Promise<void>
   onSendMessage: (content: string, linkedTaskIDs: string[], intent?: TaskFeedbackIntent) => Promise<void>
-  onAddRelation: (taskID: string) => Promise<void>
-  onRemoveRelation: (taskID: string) => Promise<void>
+  onAddRelation: (taskID: string, relationType?: TaskRelationType) => Promise<void>
+  onRemoveRelation: (association: TaskAssociation) => Promise<void>
   onOpenTask: (taskID: string) => void
   onAddTopicRelation: (topicID: string) => Promise<void>
   onRemoveTopicRelation: (topicID: string) => Promise<void>
@@ -74,6 +76,9 @@ interface TaskDetailsDialogProps {
 	onReloadAssessment: () => void
 	onUpdateTitle: (title: string) => Promise<void>
 	onUpdateTargetBranch: (targetBranch: string) => Promise<void>
+	onUpdateDetails: (input: UpdateTaskDetailsInput) => Promise<void>
+	onCancelTask: () => Promise<void>
+	onArchiveTask: () => Promise<void>
 	onReloadClarifications: () => void
 	onAnswerClarification: (item: Clarification, input: Omit<ClarificationAnswerInput, 'expected_version'>) => Promise<void>
 }
@@ -129,6 +134,7 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
 				</Badge>
 			) : null}
           </div>
+			<TaskRequirementsEditor task={task} onUpdate={props.onUpdateDetails} onCancel={props.onCancelTask} onArchive={props.onArchiveTask} />
         </SheetHeader>
 
 		<div className="grid min-h-0 flex-1 grid-cols-[minmax(0,5fr)_minmax(0,7fr)]">
@@ -138,6 +144,8 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
 					<DetailSection icon={<TextIcon />} title="Description" value={task.description} />
 					<Separator />
 					<DetailSection icon={<ListChecksIcon />} title="Acceptance Criteria" value={task.acceptance_criteria} />
+					<Separator />
+					<SubjectKnowledgePanel kind="tasks" id={task.id} />
 					<Separator />
 					<TaskClarificationsPanel
 						items={props.clarifications}
@@ -159,6 +167,7 @@ export function TaskDetailsDialog(props: TaskDetailsDialogProps) {
 					/>
 					<Separator />
 					<RelatedTasks
+						typed
 						tasks={tasks}
 						associations={associations}
 						excludedTaskID={task.id}
