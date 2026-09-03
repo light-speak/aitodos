@@ -69,6 +69,11 @@ INSERT INTO task_estimates(
 	return created, nil
 }
 
+// EnsureRequiredTestsPassed 校验 Task 的全部必测项都有当前可验证通过证据。
+func (store *QualityStore) EnsureRequiredTestsPassed(ctx context.Context, taskID string) error {
+	return ensureRequiredTestsPassed(ctx, store.database, taskID)
+}
+
 // CreateTestCase 创建一个长期测试项。
 func (store *QualityStore) CreateTestCase(ctx context.Context, taskID string, input quality.TestCaseInput) (quality.TestCase, error) {
 	input.Title = strings.TrimSpace(input.Title)
@@ -346,9 +351,9 @@ WHERE c.required = 1`).Scan(
 	)
 }
 
-func ensureRequiredTestsPassed(ctx context.Context, transaction *sql.Tx, taskID string) error {
+func ensureRequiredTestsPassed(ctx context.Context, queryer rowQueryer, taskID string) error {
 	var missing int
-	err := transaction.QueryRowContext(ctx, `
+	err := queryer.QueryRowContext(ctx, `
 SELECT COUNT(*) FROM task_test_cases c
 LEFT JOIN task_test_results r ON r.id = (
     SELECT latest.id FROM task_test_results latest

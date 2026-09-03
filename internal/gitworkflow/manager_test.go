@@ -257,6 +257,51 @@ func TestManagerCompletesManualReviewFlow(t *testing.T) {
 	}
 }
 
+func TestManagerDoesNotCommitWorkspaceWhenRequiredTestsAreMissing(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	store := storage.NewTaskStore(database)
+	created, err := store.Create(ctx, task.CreateInput{Title: "测试不足时拒绝验收"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := New(repository, database)
+	createdWorkspace, err := manager.CreateTaskWorkspace(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(createdWorkspace.Path, "unverified.txt"), []byte("pending\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	created, err = store.Get(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	created, err = manager.SubmitTaskReview(ctx, created.ID, created.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.NewQualityStore(database).CreateTestCase(ctx, created.ID, quality.TestCaseInput{
+		Title: "必须验证", Required: true, CreatedBy: quality.TestCreatorHuman,
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	headBefore := git(t, createdWorkspace.Path, "rev-parse", "HEAD")
+	if _, _, err := manager.ReviewTask(ctx, created.ID, created.Version, task.ReviewInput{
+		Decision: task.ReviewAccepted,
+	}); !errors.Is(err, storage.ErrRequiredTestsNotPassed) {
+		t.Fatalf("ReviewTask() error = %v", err)
+	}
+	currentWorkspace, err := manager.TaskWorkspace(ctx, created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if currentWorkspace == nil || !currentWorkspace.Dirty || currentWorkspace.HeadSHA != headBefore {
+		t.Fatalf("workspace changed after rejected review = %#v", currentWorkspace)
+	}
+}
+
 func TestManagerIntegratesAcceptedTaskFastForward(t *testing.T) {
 	ctx := context.Background()
 	repository, database := initializeRepository(t)
