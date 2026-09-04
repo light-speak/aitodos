@@ -12,6 +12,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
@@ -90,11 +91,42 @@ func TestClarificationRoutesListAndAnswer(t *testing.T) {
 	if err := json.NewDecoder(response.Body).Decode(&answered); err != nil {
 		t.Fatal(err)
 	}
-	if answered.Clarification.Status != clarification.StatusAnswered || answered.Task.Status != task.StatusReady {
+	if answered.Clarification.Status != clarification.StatusAnswered || answered.Task == nil || answered.Task.Status != task.StatusReady {
 		t.Fatalf("answer = %#v", answered)
 	}
 	if open = requestClarifications(t, server.Client(), server.URL+"/api/clarifications", http.StatusOK); len(open) != 0 {
 		t.Fatalf("remaining open = %#v", open)
+	}
+
+	createdTopic, err := storage.NewTopicStore(database).Create(t.Context(), topic.CreateInput{Title: "无待确认问题"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if topicHistory := requestClarifications(t, server.Client(), server.URL+"/api/topics/"+createdTopic.ID+"/clarifications", http.StatusOK); len(topicHistory) != 0 {
+		t.Fatalf("topic clarifications = %#v", topicHistory)
+	}
+	for _, test := range []struct {
+		path   string
+		body   string
+		status int
+	}{
+		{path: "/api/clarifications/" + question.ID + "/answer", body: `{`, status: http.StatusBadRequest},
+		{path: "/api/clarifications/" + question.ID + "/answer", body: `{"selected_option_id":"no","expected_version":1}`, status: http.StatusConflict},
+		{path: "/api/clarifications/missing/answer", body: `{"selected_option_id":"yes","expected_version":1}`, status: http.StatusNotFound},
+	} {
+		request, err := http.NewRequest(http.MethodPost, server.URL+test.path, bytes.NewBufferString(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Content-Type", "application/json")
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != test.status {
+			t.Fatalf("POST %s status = %d, want %d", test.path, response.StatusCode, test.status)
+		}
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
@@ -165,6 +166,130 @@ WHERE id = ? AND current_revision_id = ?`, revisionID, formatTime(now), profileI
 		return agentprofile.Profile{}, fmt.Errorf("commit agent profile revision: %w", err)
 	}
 	return store.Get(ctx, profileID)
+}
+
+type defaultProfileRevision struct {
+	ProfileID          string
+	Role               agentprofile.Role
+	CurrentRevisionID  string
+	Revision           int64
+	Instructions       string
+	MaxInputTokens     int
+	ReservedOutput     int
+	RecentMessageLimit int
+	RetrievalLimit     int
+	TimeoutSeconds     int
+}
+
+// ConfigureCodexDefaults 为所有尚未配置命令的职责原子创建 Codex App Server 修订。
+func (store *AgentProfileStore) ConfigureCodexDefaults(ctx context.Context, command string) ([]agentprofile.Profile, error) {
+	command = strings.TrimSpace(command)
+	if command == "" || len(command) > 1000 {
+		return nil, errors.New("codex command is required")
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("begin codex defaults: %w", err)
+	}
+	defer transaction.Rollback()
+	candidates, err := unconfiguredProfileRevisions(ctx, transaction)
+	if err != nil {
+		return nil, err
+	}
+	for _, candidate := range candidates {
+		if err := insertCodexDefaultRevision(ctx, transaction, candidate, command); err != nil {
+			return nil, err
+		}
+	}
+	if err := transaction.Commit(); err != nil {
+		return nil, fmt.Errorf("commit codex defaults: %w", err)
+	}
+	return store.List(ctx)
+}
+
+func unconfiguredProfileRevisions(ctx context.Context, transaction *sql.Tx) ([]defaultProfileRevision, error) {
+	rows, err := transaction.QueryContext(ctx, `
+SELECT p.id, p.role, p.current_revision_id, r.revision, r.instructions,
+       r.max_input_tokens, r.reserved_output_tokens, r.recent_message_limit,
+       r.retrieval_limit, r.timeout_seconds
+FROM agent_profiles p
+JOIN agent_profile_revisions r ON r.id = p.current_revision_id
+WHERE length(trim(r.command)) = 0
+ORDER BY p.id`)
+	if err != nil {
+		return nil, fmt.Errorf("list unconfigured agent profiles: %w", err)
+	}
+	defer rows.Close()
+	result := make([]defaultProfileRevision, 0, 5)
+	for rows.Next() {
+		var current defaultProfileRevision
+		if err := rows.Scan(&current.ProfileID, &current.Role, &current.CurrentRevisionID, &current.Revision,
+			&current.Instructions, &current.MaxInputTokens, &current.ReservedOutput,
+			&current.RecentMessageLimit, &current.RetrievalLimit, &current.TimeoutSeconds); err != nil {
+			return nil, fmt.Errorf("scan unconfigured agent profile: %w", err)
+		}
+		result = append(result, current)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate unconfigured agent profiles: %w", err)
+	}
+	return result, nil
+}
+
+func insertCodexDefaultRevision(ctx context.Context, transaction *sql.Tx, current defaultProfileRevision, command string) error {
+	workspacePolicy, approvalPolicy, err := agentprofile.PoliciesForRole(current.Role)
+	if err != nil {
+		return err
+	}
+	revisionID, err := newID()
+	if err != nil {
+		return err
+	}
+	now := formatTime(time.Now().UTC())
+	_, err = transaction.ExecContext(ctx, `
+INSERT INTO agent_profile_revisions(
+    id, profile_id, revision, instructions, adapter, command, args_json, model,
+    max_input_tokens, reserved_output_tokens, recent_message_limit, retrieval_limit,
+    workspace_policy, approval_policy, timeout_seconds, created_at
+) VALUES (?, ?, ?, ?, 'codex-app-server', ?, '[]', '', ?, ?, ?, ?, ?, ?, ?, ?)`,
+		revisionID, current.ProfileID, current.Revision+1, current.Instructions, command,
+		current.MaxInputTokens, current.ReservedOutput, current.RecentMessageLimit,
+		current.RetrievalLimit, workspacePolicy, approvalPolicy, current.TimeoutSeconds, now)
+	if err != nil {
+		return fmt.Errorf("insert codex default revision: %w", err)
+	}
+	if err := copyRevisionToolPolicy(ctx, transaction, current.CurrentRevisionID, revisionID); err != nil {
+		return err
+	}
+	result, err := transaction.ExecContext(ctx, `
+UPDATE agent_profiles SET current_revision_id = ?, updated_at = ?
+WHERE id = ? AND current_revision_id = ?`, revisionID, now, current.ProfileID, current.CurrentRevisionID)
+	if err != nil {
+		return fmt.Errorf("activate codex default revision: %w", err)
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("read codex default update: %w", err)
+	}
+	if changed != 1 {
+		return ErrAgentProfileRevisionConflict
+	}
+	return nil
+}
+
+func copyRevisionToolPolicy(ctx context.Context, transaction *sql.Tx, sourceID, targetID string) error {
+	if _, err := transaction.ExecContext(ctx, `
+INSERT INTO agent_profile_revision_skills(profile_revision_id, skill_id, required)
+SELECT ?, skill_id, required FROM agent_profile_revision_skills WHERE profile_revision_id = ?`, targetID, sourceID); err != nil {
+		return fmt.Errorf("copy revision skills: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+INSERT INTO agent_profile_revision_mcp_servers(profile_revision_id, mcp_server_id, required, enabled_tools_json)
+SELECT ?, mcp_server_id, required, enabled_tools_json
+FROM agent_profile_revision_mcp_servers WHERE profile_revision_id = ?`, targetID, sourceID); err != nil {
+		return fmt.Errorf("copy revision MCP servers: %w", err)
+	}
+	return nil
 }
 
 // ListRevisions 按新到旧返回完整修订历史。

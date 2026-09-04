@@ -6,6 +6,7 @@ import (
 
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/task"
+	"github.com/light-speak/aitodos/internal/domain/topic"
 	"github.com/light-speak/aitodos/internal/storage"
 )
 
@@ -15,7 +16,8 @@ type clarificationHandler struct {
 
 type clarificationAnswerResponse struct {
 	Clarification clarification.Clarification `json:"clarification"`
-	Task          task.Task                   `json:"task"`
+	Task          *task.Task                  `json:"task,omitempty"`
+	Topic         *topic.Topic                `json:"topic,omitempty"`
 }
 
 // RegisterClarificationRoutes 注册 Agent 阻塞问题的读取与人工回答命令。
@@ -23,7 +25,17 @@ func RegisterClarificationRoutes(mux *http.ServeMux, store *storage.Clarificatio
 	handler := &clarificationHandler{store: store}
 	mux.HandleFunc("GET /api/clarifications", handler.listOpen)
 	mux.HandleFunc("GET /api/tasks/{taskID}/clarifications", handler.listTask)
+	mux.HandleFunc("GET /api/topics/{topicID}/clarifications", handler.listTopic)
 	mux.HandleFunc("POST /api/clarifications/{clarificationID}/answer", handler.answer)
+}
+
+func (handler *clarificationHandler) listTopic(response http.ResponseWriter, request *http.Request) {
+	items, err := handler.store.ListTopic(request.Context(), request.PathValue("topicID"))
+	if err != nil {
+		writeClarificationError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, items)
 }
 
 func (handler *clarificationHandler) listOpen(response http.ResponseWriter, request *http.Request) {
@@ -50,12 +62,14 @@ func (handler *clarificationHandler) answer(response http.ResponseWriter, reques
 		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "请求内容不是有效的回答")
 		return
 	}
-	answered, resumedTask, err := handler.store.Answer(request.Context(), request.PathValue("clarificationID"), input)
+	result, err := handler.store.AnswerSubject(request.Context(), request.PathValue("clarificationID"), input)
 	if err != nil {
 		writeClarificationError(response, err)
 		return
 	}
-	writeJSON(response, http.StatusOK, clarificationAnswerResponse{Clarification: answered, Task: resumedTask})
+	writeJSON(response, http.StatusOK, clarificationAnswerResponse{
+		Clarification: result.Clarification, Task: result.Task, Topic: result.Topic,
+	})
 }
 
 func writeClarificationError(response http.ResponseWriter, err error) {
@@ -66,6 +80,8 @@ func writeClarificationError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusConflict, "CLARIFICATION_CONFLICT", "问题已被回答，请重新加载")
 	case errors.Is(err, storage.ErrTaskNotFound):
 		writeTaskError(response, err)
+	case errors.Is(err, storage.ErrTopicNotFound):
+		writeTopicError(response, err)
 	default:
 		writeError(response, http.StatusBadRequest, "INVALID_CLARIFICATION_ANSWER", err.Error())
 	}

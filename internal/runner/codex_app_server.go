@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,12 +12,14 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
 	"github.com/light-speak/aitodos/internal/domain/approvalrequest"
+	"github.com/light-speak/aitodos/internal/domain/mcpaudit"
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/storage"
@@ -28,6 +31,7 @@ var errApprovalRunCancelled = errors.New("run cancelled while waiting for approv
 
 type appServerApprovalBridge struct {
 	store           *storage.RunStore
+	audit           *storage.MCPAuditStore
 	runID           string
 	claimToken      string
 	leaseGeneration int64
@@ -72,14 +76,29 @@ func invokeCodexAppServer(
 	if err != nil {
 		return processResult{Status: domainrun.StatusFailed, ExitCode: -1, Code: "SPAWN_FAILED", Err: err}
 	}
+	processBridge := agentProcessBridge{
+		store: approvals.store, runID: runID, claimToken: approvals.claimToken, leaseGeneration: approvals.leaseGeneration,
+	}
+	if err := processBridge.attach(ctx, client.command); err != nil {
+		_ = closeAppServer(client)
+		return processResult{Status: domainrun.StatusFailed, ExitCode: processExitCode(client.command.ProcessState), Code: "AGENT_IDENTITY", Err: err}
+	}
 	runCtx, cancel := context.WithTimeout(ctx, time.Duration(revision.TimeoutSeconds)*time.Second)
 	defer cancel()
 	stopPolling := monitorAppServerCancellation(runCtx, cancel, cancelRequested)
 	defer stopPolling()
 	outcome := runAppServerTurn(runCtx, client, revision, purpose, workspacePath, prompt, externalSessionID, approvals)
 	closeErr := closeAppServer(client)
+	releaseErr := processBridge.release()
+	resourcesAbandoned := closeErr != nil
+	if err := approvals.audit.ReleaseRunResources(context.Background(), runID, resourcesAbandoned, appServerCleanupReason(closeErr)); outcome.Err == nil && err != nil {
+		outcome.Status, outcome.Code, outcome.Err = domainrun.StatusFailed, "MCP_RESOURCE_FINALIZATION", err
+	}
 	if outcome.Err == nil && closeErr != nil {
 		outcome.Status, outcome.Code, outcome.Err = domainrun.StatusFailed, "APP_SERVER_EXIT", closeErr
+	}
+	if outcome.Err == nil && releaseErr != nil {
+		outcome.Status, outcome.Code, outcome.Err = domainrun.StatusFailed, "AGENT_CLEANUP", releaseErr
 	}
 	outcome.ExitCode = processExitCode(client.command.ProcessState)
 	outcome.Stdout, outcome.Stderr = client.stdout.Bytes(), client.stderr.Bytes()
@@ -326,6 +345,11 @@ func waitForAppServerTurn(
 			}
 			continue
 		}
+		if message.Method == "item/started" || message.Method == "item/completed" {
+			if err := handleAppServerMCPEvent(ctx, approvals, message, threadID, turnID); err != nil {
+				return domainrun.StatusFailed, err
+			}
+		}
 		if message.Method != "turn/completed" {
 			continue
 		}
@@ -338,6 +362,111 @@ func waitForAppServerTurn(
 		}
 		return status, nil
 	}
+}
+
+type appServerMCPNotification struct {
+	ThreadID string `json:"threadId"`
+	TurnID   string `json:"turnId"`
+	Item     struct {
+		Type      string          `json:"type"`
+		ID        string          `json:"id"`
+		Server    string          `json:"server"`
+		Tool      string          `json:"tool"`
+		Arguments json.RawMessage `json:"arguments"`
+		Status    string          `json:"status"`
+		Result    json.RawMessage `json:"result"`
+		Error     *struct {
+			Message string `json:"message"`
+		} `json:"error"`
+	} `json:"item"`
+}
+
+func handleAppServerMCPEvent(
+	ctx context.Context,
+	bridge appServerApprovalBridge,
+	message appServerMessage,
+	threadID string,
+	turnID string,
+) error {
+	var notification appServerMCPNotification
+	if err := json.Unmarshal(message.Params, &notification); err != nil {
+		return fmt.Errorf("decode app server MCP event: %w", err)
+	}
+	if notification.Item.Type != "mcpToolCall" {
+		return nil
+	}
+	if notification.ThreadID != threadID || notification.TurnID != turnID {
+		return errors.New("app server MCP event subject mismatch")
+	}
+	keys, digest, err := summarizeAppServerArguments(notification.Item.Arguments)
+	if err != nil {
+		return err
+	}
+	phase := mcpaudit.PhaseStarted
+	if message.Method == "item/completed" {
+		phase = mcpaudit.PhaseCompleted
+		if notification.Item.Status == "failed" || notification.Item.Error != nil {
+			phase = mcpaudit.PhaseFailed
+		}
+	}
+	var resultBytes *int64
+	if phase == mcpaudit.PhaseCompleted && len(notification.Item.Result) > 0 && string(notification.Item.Result) != "null" {
+		size := int64(len(notification.Item.Result))
+		resultBytes = &size
+	}
+	errorMessage := ""
+	if notification.Item.Error != nil {
+		errorMessage = notification.Item.Error.Message
+	}
+	_, err = bridge.audit.Append(ctx, storage.MCPAuditInput{
+		CallID: notification.Item.ID, Direction: "OUTBOUND", RunID: bridge.runID,
+		ClientName: "codex-app-server", ServerName: notification.Item.Server, ToolName: notification.Item.Tool,
+		Phase: phase, ArgumentKeys: keys, ArgumentsSHA256: digest,
+		ResultBytes: resultBytes, ErrorMessage: errorMessage,
+	})
+	if err != nil {
+		return err
+	}
+	if phase == mcpaudit.PhaseStarted && isBrowserMCPCall(notification.Item.Server, notification.Item.Tool) {
+		_, err = bridge.audit.OpenResourceLease(ctx, bridge.runID, "BROWSER_SESSION", notification.Item.Server)
+	}
+	return err
+}
+
+func summarizeAppServerArguments(content json.RawMessage) ([]string, string, error) {
+	if len(content) == 0 {
+		content = json.RawMessage(`{}`)
+	}
+	var value any
+	if err := json.Unmarshal(content, &value); err != nil {
+		return nil, "", fmt.Errorf("decode app server MCP arguments: %w", err)
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return nil, "", fmt.Errorf("encode app server MCP arguments: %w", err)
+	}
+	keys := make([]string, 0)
+	if object, ok := value.(map[string]any); ok {
+		for key := range object {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+	}
+	digest := sha256.Sum256(canonical)
+	return keys, fmt.Sprintf("%x", digest), nil
+}
+
+func isBrowserMCPCall(server, tool string) bool {
+	value := strings.ToLower(server + " " + tool)
+	return strings.Contains(value, "browser") || strings.Contains(value, "playwright") ||
+		strings.Contains(value, "puppeteer") || strings.Contains(value, "chrome")
+}
+
+func appServerCleanupReason(cause error) string {
+	if cause != nil {
+		return "app server cleanup could not be confirmed: " + cause.Error()
+	}
+	return "app server process group exited"
 }
 
 func handleAppServerApproval(
@@ -558,7 +687,7 @@ func persistAppServerFinalResult(purpose domainrun.Purpose, workspacePath, final
 	}
 	content := []byte(strings.TrimSpace(finalMessage))
 	if !json.Valid(content) {
-		if purpose == domainrun.PurposeTriage || purpose == domainrun.PurposePlanning || purpose == domainrun.PurposeReview {
+		if requiresStructuredResult(purpose) {
 			return errors.New("structured final response is not valid JSON")
 		}
 		return nil
@@ -639,18 +768,18 @@ func closeAppServer(client *appServerClient) error {
 	defer timer.Stop()
 	select {
 	case err := <-client.wait:
-		return err
+		return errors.Join(err, terminateProcessGroup(client.command.Process.Pid))
 	case <-timer.C:
 		_ = syscall.Kill(-client.command.Process.Pid, syscall.SIGTERM)
 		killTimer := time.NewTimer(2 * time.Second)
 		defer killTimer.Stop()
 		select {
 		case <-client.wait:
-			return nil
+			return terminateProcessGroup(client.command.Process.Pid)
 		case <-killTimer.C:
 			_ = syscall.Kill(-client.command.Process.Pid, syscall.SIGKILL)
 			<-client.wait
-			return nil
+			return terminateProcessGroup(client.command.Process.Pid)
 		}
 	}
 }

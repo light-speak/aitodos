@@ -148,6 +148,7 @@ type TestResult struct {
 	EvidenceKind EvidenceKind `json:"evidence_kind"`
 	Summary      string       `json:"summary"`
 	Command      string       `json:"command,omitempty"`
+	ExitCode     *int         `json:"exit_code,omitempty"`
 	ArtifactRef  string       `json:"artifact_ref,omitempty"`
 	SourceRunID  string       `json:"source_run_id,omitempty"`
 	Stale        bool         `json:"stale"`
@@ -160,6 +161,7 @@ type TestResultInput struct {
 	EvidenceKind EvidenceKind `json:"evidence_kind"`
 	Summary      string       `json:"summary"`
 	Command      string       `json:"command,omitempty"`
+	ExitCode     *int         `json:"exit_code,omitempty"`
 	ArtifactRef  string       `json:"artifact_ref,omitempty"`
 	SourceRunID  string       `json:"source_run_id,omitempty"`
 }
@@ -175,8 +177,14 @@ func (input TestResultInput) Validate() error {
 	if len(strings.TrimSpace(input.Summary)) < 1 || len(strings.TrimSpace(input.Summary)) > 4000 {
 		return errors.New("summary 长度必须为 1 到 4000")
 	}
-	if input.EvidenceKind == EvidenceCommand && strings.TrimSpace(input.Command) == "" {
-		return errors.New("COMMAND evidence 必须记录 command")
+	if input.EvidenceKind == EvidenceCommand {
+		if strings.TrimSpace(input.Command) == "" || strings.TrimSpace(input.ArtifactRef) == "" ||
+			strings.TrimSpace(input.SourceRunID) == "" || input.ExitCode == nil {
+			return errors.New("COMMAND evidence 必须记录 command、exit_code、artifact_ref 和 source_run_id")
+		}
+		if input.Outcome == OutcomeBlocked || (input.Outcome == OutcomePassed) != (*input.ExitCode == 0) {
+			return errors.New("COMMAND evidence 的 outcome 与 exit_code 不一致")
+		}
 	}
 	if input.EvidenceKind == EvidenceAgentReport && strings.TrimSpace(input.SourceRunID) == "" {
 		return errors.New("AGENT_REPORT evidence 必须关联 source_run_id")

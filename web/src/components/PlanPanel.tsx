@@ -2,7 +2,7 @@ import { useMemo, useState } from 'react'
 import { BotIcon, CheckIcon, ClipboardListIcon, LoaderCircleIcon, PlusIcon, RefreshCwIcon, Trash2Icon, XIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
-import type { AgentRun, CreatePlanRevisionInput, PlanTaskDraftInput, PlanView, Topic } from '../types'
+import type { AgentRun, CreatePlanRevisionInput, PlanningReadiness, PlanTaskDraftInput, PlanView, Topic } from '../types'
 import { MarkdownContent } from './MarkdownContent'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -54,6 +54,7 @@ export function PlanPanel(props: PlanPanelProps) {
 			{props.plan === null ? null : (
 				<div className="grid gap-4 rounded-xl border bg-muted/20 p-4">
 					<div className="flex flex-wrap items-center gap-2"><Badge>{planStatus(props.plan)}</Badge><Badge variant="outline">Revision {props.plan.revision.revision}</Badge><span className="font-mono text-xs text-muted-foreground">{props.plan.plan.key}</span></div>
+					{props.plan.revision.readiness ? <ReadinessCard value={props.plan.revision.readiness} /> : null}
 					<div><p className="mb-1 text-xs text-muted-foreground">方案摘要</p><MarkdownContent content={props.plan.revision.summary} /></div>
 					{props.plan.revision.rationale ? <div><p className="mb-1 text-xs text-muted-foreground">取舍依据</p><MarkdownContent content={props.plan.revision.rationale} /></div> : null}
 					{props.plan.revision.risks ? <div><p className="mb-1 text-xs text-muted-foreground">风险</p><MarkdownContent content={props.plan.revision.risks} /></div> : null}
@@ -75,6 +76,23 @@ export function PlanPanel(props: PlanPanelProps) {
 			)}
 		</section>
 	)
+}
+
+function ReadinessCard({ value }: { value: PlanningReadiness }) {
+	const confidence = Math.round(value.confidence * 100)
+	const details = value.assumptions.length + value.open_questions.length + value.alternatives.length
+	return <div className="rounded-lg border border-emerald-200 bg-emerald-50/60 px-3 py-2 text-sm">
+		<div className="flex flex-wrap items-center gap-2"><Badge variant="outline">规划充分度 {confidence}%</Badge><span className="text-xs text-muted-foreground">Agent 判断可进入人工审核</span></div>
+		{details > 0 ? <details className="mt-2"><summary className="cursor-pointer text-xs font-medium">查看假设与取舍</summary><div className="mt-2 grid gap-2 text-xs">
+			{value.assumptions.length > 0 ? <ReadinessList label="关键假设" items={value.assumptions} /> : null}
+			{value.open_questions.length > 0 ? <ReadinessList label="未决问题" items={value.open_questions} /> : null}
+			{value.alternatives.length > 0 ? <div><p className="text-muted-foreground">考虑过的方向</p><ul className="mt-1 grid gap-1">{value.alternatives.map((item) => <li key={`${item.title}:${item.tradeoff}`}><span className="font-medium">{item.title}</span>：{item.tradeoff}</li>)}</ul></div> : null}
+		</div></details> : null}
+	</div>
+}
+
+function ReadinessList({ label, items }: { label: string; items: string[] }) {
+	return <div><p className="text-muted-foreground">{label}</p><ul className="mt-1 list-disc space-y-1 pl-4">{items.map((item) => <li key={item}>{item}</li>)}</ul></div>
 }
 
 function PlanningNotice(props: PlanPanelProps) {

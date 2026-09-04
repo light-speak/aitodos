@@ -107,6 +107,7 @@ const runningRun = {
 let openClarifications: unknown[] = []
 let openApprovals: unknown[] = []
 let activeRuns: unknown[] = []
+let schedulerError = ''
 
 const fetchMock = vi.fn<typeof fetch>((input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -119,12 +120,15 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
       agent: 'codex',
 		workers_enabled: false,
       max_workers: 2,
+		scheduler_failures: schedulerError ? 1 : 0,
+		scheduler_error: schedulerError,
     }))
   }
 	if (url === '/api/project/workers' && method === 'POST') {
 		return Promise.resolve(Response.json({
 			name: 'AiTodos', root: '/projects/aitodos', agent: 'codex',
 			workers_enabled: true, max_workers: 2,
+			scheduler_failures: 0, scheduler_error: '',
 		}))
 	}
   if (url === '/api/tasks' && method === 'GET') {
@@ -399,7 +403,16 @@ describe('App', () => {
 		openClarifications = []
 		openApprovals = []
 		activeRuns = []
+		schedulerError = ''
   })
+
+	it('在顶部暴露 Worker 调度异常', async () => {
+		schedulerError = 'database unavailable'
+		render(<App />)
+
+		const warning = await screen.findByRole('button', { name: 'Worker 调度异常' })
+		expect(warning).toHaveAttribute('title', 'database unavailable')
+	})
 
   afterEach(() => {
     vi.unstubAllGlobals()
@@ -638,7 +651,7 @@ describe('App', () => {
 		await screen.findByText('讨论 Agent 上下文')
 
 		await user.click(screen.getByRole('button', { name: '搜索项目' }))
-		const searchDialog = screen.getByRole('dialog', { name: '搜索项目' })
+		const searchDialog = await screen.findByRole('dialog', { name: '搜索项目' })
 		await user.type(within(searchDialog).getByLabelText('搜索项目内容'), 'Session')
 		await user.click(within(searchDialog).getByRole('button', { name: '搜索' }))
 		await user.click(await within(searchDialog).findByRole('button', { name: /你的消息/ }))

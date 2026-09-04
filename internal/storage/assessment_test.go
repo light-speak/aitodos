@@ -45,6 +45,22 @@ func TestAssessmentStoreCreatesRevisionAndAppliesUnlockedAITitle(t *testing.T) {
 	if updated.Status != task.StatusReady || updated.AssessmentInputVersion != created.AssessmentInputVersion {
 		t.Fatalf("triage changed execution state = %#v", updated)
 	}
+	assessmentStore := NewAssessmentStore(database)
+	current, err := assessmentStore.GetCurrent(ctx, created.ID)
+	if err != nil || current.ID != stored.ID {
+		t.Fatalf("GetCurrent() = %#v, %v", current, err)
+	}
+	history, err := assessmentStore.List(ctx, created.ID)
+	if err != nil || len(history) != 1 || history[0].ID != stored.ID {
+		t.Fatalf("List() = %#v, %v", history, err)
+	}
+	allCurrent, err := assessmentStore.ListCurrent(ctx)
+	if err != nil || allCurrent[created.ID].ID != stored.ID {
+		t.Fatalf("ListCurrent() = %#v, %v", allCurrent, err)
+	}
+	if _, err := assessmentStore.GetCurrent(ctx, "missing"); err != ErrAssessmentNotFound {
+		t.Fatalf("missing GetCurrent() error = %v", err)
+	}
 }
 
 func TestAssessmentStoreNeverOverwritesHumanTitle(t *testing.T) {

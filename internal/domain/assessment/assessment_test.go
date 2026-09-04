@@ -39,3 +39,29 @@ func TestInputRejectsInvalidDimensionScore(t *testing.T) {
 		t.Fatal("Validate() error = nil")
 	}
 }
+
+func TestInputNormalizesAndRejectsIncompleteAgentOutput(t *testing.T) {
+	valid := Input{SuggestedTitle: " 标题 ", Confidence: 1, Rationale: " 原因 ", Assumptions: []string{" 假设 ", " "}, SplitRecommended: true, SplitRationale: " 拆分 "}
+	if err := valid.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	normalized := valid.Normalized()
+	if normalized.SuggestedTitle != "标题" || len(normalized.Assumptions) != 1 || normalized.SplitRationale != "拆分" {
+		t.Fatalf("normalized = %#v", normalized)
+	}
+	tooManyAssumptions := make([]string, 21)
+	for index := range tooManyAssumptions {
+		tooManyAssumptions[index] = "假设"
+	}
+	for _, input := range []Input{
+		{SuggestedTitle: " ", Rationale: "原因"},
+		{SuggestedTitle: "标题", Confidence: -1, Rationale: "原因"},
+		{SuggestedTitle: "标题", Confidence: 1, Rationale: " "},
+		{SuggestedTitle: "标题", Confidence: 1, Rationale: "原因", Assumptions: tooManyAssumptions},
+		{SuggestedTitle: "标题", Confidence: 1, Rationale: "原因", SplitRecommended: true},
+	} {
+		if err := input.Validate(); err == nil {
+			t.Fatalf("input %#v unexpectedly valid", input)
+		}
+	}
+}

@@ -8,10 +8,13 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strconv"
+	"strings"
 	"time"
 
+	"github.com/light-speak/aitodos/internal/buildinfo"
 	"github.com/light-speak/aitodos/internal/capabilitycatalog"
 	"github.com/light-speak/aitodos/internal/gitworkflow"
 	"github.com/light-speak/aitodos/internal/project"
@@ -71,7 +74,7 @@ func Serve(
 	}
 	defer removeCurrentMetadata(currentProject, nonce)
 
-	handler, err := newHandler(currentProject, metadata, database)
+	handler, err := newHandler(currentProject, metadata, database, projectScheduler)
 	if err != nil {
 		return err
 	}
@@ -108,7 +111,7 @@ func Serve(
 	}
 }
 
-func newHandler(currentProject *project.Project, metadata Metadata, database *sql.DB) (http.Handler, error) {
+func newHandler(currentProject *project.Project, metadata Metadata, database *sql.DB, projectScheduler *scheduler.Scheduler) (http.Handler, error) {
 	mux := http.NewServeMux()
 	discussionStore := storage.NewDiscussionStore(database)
 	relationStore := storage.NewRelationStore(database)
@@ -121,14 +124,22 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	httpapi.RegisterAssessmentRoutes(mux, taskStore, assessmentStore)
 	httpapi.RegisterArtifactRoutes(mux, storage.NewArtifactStore(database, currentProject.Paths.Artifacts))
 	httpapi.RegisterGitWorkflowRoutes(mux, gitManager)
-	httpapi.RegisterProjectRoutes(mux, currentProject)
+	httpapi.RegisterProjectRoutes(mux, currentProject, func() httpapi.SchedulerStatus {
+		status := projectScheduler.Health()
+		return httpapi.SchedulerStatus{ConsecutiveFailures: status.ConsecutiveFailures, LastError: status.LastError}
+	})
 	httpapi.RegisterAgentProfileRoutes(mux, storage.NewAgentProfileStore(database))
 	httpapi.RegisterCapabilityRoutes(mux, capabilitycatalog.New(
 		currentProject.Root, "codex", storage.NewCapabilityStore(database),
 	))
 	httpapi.RegisterQualityRoutes(mux, storage.NewQualityStore(database))
 	httpapi.RegisterClarificationRoutes(mux, storage.NewClarificationStore(database))
-	httpapi.RegisterSearchRoutes(mux, storage.NewSearchStore(database))
+	searchStore := storage.NewSearchStore(database)
+	httpapi.RegisterSearchRoutes(mux, searchStore)
+	httpapi.RegisterRetrievalEvalRoutes(mux, storage.NewRetrievalEvalStore(database, searchStore))
+	httpapi.RegisterMCPRoutes(mux, storage.NewMCPAuditStore(database))
+	httpapi.RegisterKnowledgeRoutes(mux, storage.NewKnowledgeStore(database))
+	httpapi.RegisterExperienceRoutes(mux, storage.NewExperienceStore(database))
 	runStore := storage.NewRunStore(database)
 	httpapi.RegisterRunRoutes(mux, runStore, currentProject.Paths.Artifacts)
 	httpapi.RegisterApprovalRoutes(mux, runStore)
@@ -139,6 +150,8 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 			ProjectInstanceID: currentProject.InstanceID,
 			Nonce:             metadata.Nonce,
 			PID:               metadata.PID,
+			Version:           buildinfo.Version,
+			Commit:            buildinfo.Commit,
 		})
 	})
 	uiHandler, err := webui.NewHandler()
@@ -146,5 +159,47 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 		return nil, err
 	}
 	mux.Handle("GET /", uiHandler)
-	return mux, nil
+	return localRequestGuard(mux), nil
+}
+
+func localRequestGuard(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(response http.ResponseWriter, request *http.Request) {
+		if !isLoopbackHost(request.Host) || !isAllowedBrowserRequest(request) {
+			response.Header().Set("Content-Type", "application/json; charset=utf-8")
+			response.WriteHeader(http.StatusForbidden)
+			_ = json.NewEncoder(response).Encode(map[string]any{
+				"error": map[string]string{"code": "LOCAL_REQUEST_FORBIDDEN", "message": "仅允许当前本地页面访问"},
+			})
+			return
+		}
+		next.ServeHTTP(response, request)
+	})
+}
+
+func isLoopbackHost(value string) bool {
+	host := value
+	if parsed, _, err := net.SplitHostPort(value); err == nil {
+		host = parsed
+	}
+	host = strings.Trim(host, "[]")
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	address := net.ParseIP(host)
+	return address != nil && address.IsLoopback()
+}
+
+func isAllowedBrowserRequest(request *http.Request) bool {
+	if request.Method == http.MethodGet || request.Method == http.MethodHead || request.Method == http.MethodOptions {
+		return true
+	}
+	if strings.EqualFold(request.Header.Get("Sec-Fetch-Site"), "cross-site") {
+		return false
+	}
+	origin := request.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	parsed, err := url.Parse(origin)
+	return err == nil && parsed.Scheme == "http" && strings.EqualFold(parsed.Host, request.Host)
 }

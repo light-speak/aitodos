@@ -2,7 +2,7 @@ import { useState } from 'react'
 import { ChevronLeftIcon, ChevronRightIcon, CircleHelpIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from '../api/client'
-import type { ApprovalDecision, ApprovalRequest, Clarification, ClarificationAnswerInput, Task } from '../types'
+import type { ApprovalDecision, ApprovalRequest, Clarification, ClarificationAnswerInput, Task, Topic } from '../types'
 import { ApprovalInbox } from './ApprovalInbox'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
@@ -128,10 +128,12 @@ export function ClarificationInboxDialog(props: {
 	items: Clarification[]
 	approvals: ApprovalRequest[]
 	tasks: Task[]
+	topics: Topic[]
 	answeringID: string | null
 	decidingApprovalID: string | null
 	onClose: () => void
 	onOpenTask: (taskID: string) => void
+	onOpenTopic: (topicID: string) => void
 	onAnswer: (item: Clarification, input: AnswerValue) => Promise<void>
 	onDecideApproval: (item: ApprovalRequest, decision: ApprovalDecision) => Promise<void>
 }) {
@@ -164,8 +166,8 @@ export function ClarificationInboxDialog(props: {
 				) : current?.kind === 'clarification' ? (
 					<div className="grid gap-4">
 						<div className="grid gap-2" key={current.item.id}>
-							<Button variant="ghost" className="h-auto justify-start px-1 text-sm" onClick={() => props.onOpenTask(current.item.task_id)}>
-								{taskLabel(props.tasks, current.item.task_id)}
+							<Button variant="ghost" className="h-auto justify-start px-1 text-sm" onClick={() => openClarificationSubject(props, current.item)}>
+								{clarificationSubjectLabel(props.tasks, props.topics, current.item)}
 							</Button>
 							<ClarificationAnswerCard item={current.item} compact answering={props.answeringID === current.item.id} onAnswer={(input) => props.onAnswer(current.item, input)} />
 						</div>
@@ -188,4 +190,20 @@ function answeredText(item: Clarification): string {
 function taskLabel(tasks: Task[], taskID: string): string {
 	const task = tasks.find((candidate) => candidate.id === taskID)
 	return task ? `${task.key} · ${task.title}` : taskID
+}
+
+function clarificationSubjectLabel(tasks: Task[], topics: Topic[], item: Clarification): string {
+	if (item.topic_id) {
+		const topic = topics.find((candidate) => candidate.id === item.topic_id)
+		return topic ? `${topic.key} · ${topic.title}` : item.topic_id
+	}
+	return taskLabel(tasks, item.task_id ?? '')
+}
+
+function openClarificationSubject(
+	props: { onOpenTask: (taskID: string) => void; onOpenTopic: (topicID: string) => void },
+	item: Clarification,
+) {
+	if (item.topic_id) props.onOpenTopic(item.topic_id)
+	else if (item.task_id) props.onOpenTask(item.task_id)
 }

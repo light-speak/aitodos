@@ -1,11 +1,13 @@
 import type { ComponentProps } from 'react'
 import { LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
 
-import type { DiscussionMessage, Task, TaskAssociation, TaskFeedbackIntent, Topic, TopicStatus } from '../types'
+import type { Clarification, ClarificationAnswerInput, DiscussionMessage, Task, TaskAssociation, TaskFeedbackIntent, TaskRelationType, Topic, TopicStatus } from '../types'
+import { TaskClarificationsPanel } from './ClarificationsPanel'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
 import { MarkdownContent } from './MarkdownContent'
 import { PlanPanel } from './PlanPanel'
 import { RelatedTasks } from './RelatedTasks'
+import { SubjectKnowledgePanel } from './SubjectKnowledgePanel'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Separator } from './ui/separator'
@@ -21,13 +23,18 @@ interface TopicDetailsDialogProps {
   submitting: boolean
   discussionError: unknown
   relationError: unknown
-  pendingRelationTaskIDs: Set<string>
+	pendingRelationTaskIDs: Set<string>
+	clarifications: Clarification[]
+	clarificationError: unknown
+	answeringClarificationID: string | null
   onClose: () => void
   onReloadDiscussion: () => void
   onSendMessage: (content: string, linkedTaskIDs: string[], intent?: TaskFeedbackIntent) => Promise<void>
-  onAddRelation: (taskID: string) => Promise<void>
-  onRemoveRelation: (taskID: string) => Promise<void>
-  onOpenTask: (taskID: string) => void
+  onAddRelation: (taskID: string, relationType?: TaskRelationType) => Promise<void>
+  onRemoveRelation: (association: TaskAssociation) => Promise<void>
+	onOpenTask: (taskID: string) => void
+	onReloadClarifications: () => void
+	onAnswerClarification: (item: Clarification, input: Omit<ClarificationAnswerInput, 'expected_version'>) => Promise<void>
 	plan: ComponentProps<typeof PlanPanel>['plan']
 	planLoading: boolean
 	planSubmitting: boolean
@@ -86,6 +93,16 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
 						<MarkdownContent content={topic.description} emptyText="未填写描述" />
 					</section>
 					<Separator />
+					<SubjectKnowledgePanel kind="topics" id={topic.id} />
+					<Separator />
+					<TaskClarificationsPanel
+						items={props.clarifications}
+						error={props.clarificationError}
+						answeringID={props.answeringClarificationID}
+						onReload={props.onReloadClarifications}
+						onAnswer={props.onAnswerClarification}
+					/>
+					{props.clarifications.length > 0 || props.clarificationError ? <Separator /> : null}
 					<DiscussionMessages
 						messages={messages}
 						tasks={tasks}

@@ -25,13 +25,17 @@ var (
 	ErrTaskWorkspaceExists = errors.New("task workspace already exists")
 	// ErrTaskRetryRequiresAnswer 表示 Task 正等待结构化 Clarification，不能绕过回答直接重试。
 	ErrTaskRetryRequiresAnswer = errors.New("task retry requires clarification answer")
+	// ErrTaskArchiveState 表示只有已验收或已取消的 Task 可以归档。
+	ErrTaskArchiveState = errors.New("task must be accepted or cancelled before archive")
+	// ErrTaskEditState 表示当前执行状态不允许修改需求。
+	ErrTaskEditState = errors.New("task cannot be edited in current state")
 )
 
 const taskColumns = `
 id, task_key, title, title_source, title_locked, description, acceptance_criteria, status, priority,
 target_branch, base_commit_sha, current_workspace_id, latest_run_id,
 COALESCE(source_plan_revision_id, ''), COALESCE(source_plan_task_draft_id, ''),
-assessment_input_version, version, created_at, updated_at`
+assessment_input_version, version, created_at, updated_at, COALESCE(archived_at, '')`
 
 // TaskStore 使用 SQLite 持久化 Task 当前状态和审计事件。
 type TaskStore struct {
@@ -116,6 +120,84 @@ func (store *TaskStore) UpdateTitle(
 	return updated, nil
 }
 
+// UpdateDetails 原子修订描述、验收标准和优先级，并使旧评估失效。
+func (store *TaskStore) UpdateDetails(ctx context.Context, id string, expectedVersion int64, input task.UpdateDetailsInput) (task.Task, error) {
+	input = input.Normalized()
+	if err := input.Validate(); err != nil {
+		return task.Task{}, err
+	}
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("begin task details update: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	if current.Status == task.StatusRunning || current.Status == task.StatusCancelled {
+		return task.Task{}, ErrTaskEditState
+	}
+	updated, event, err := prepareDetailsUpdate(current, input)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if err := updateTaskDetails(ctx, transaction, current, updated); err != nil {
+		return task.Task{}, err
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, fmt.Errorf("commit task details update: %w", err)
+	}
+	return updated, nil
+}
+
+// Archive 将已验收或已取消的 Task 从默认工作视图隐藏，保留全部历史。
+func (store *TaskStore) Archive(ctx context.Context, id string, expectedVersion int64) (task.Task, error) {
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("begin task archive: %w", err)
+	}
+	defer transaction.Rollback()
+	current, err := getTask(ctx, transaction, id)
+	if err != nil {
+		return task.Task{}, err
+	}
+	if current.Version != expectedVersion {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	if current.ArchivedAt != nil {
+		return current, nil
+	}
+	if current.Status != task.StatusAccepted && current.Status != task.StatusCancelled {
+		return task.Task{}, ErrTaskArchiveState
+	}
+	updated, event, err := prepareArchive(current)
+	if err != nil {
+		return task.Task{}, err
+	}
+	result, err := transaction.ExecContext(ctx, `UPDATE tasks SET archived_at = ?, version = ?, updated_at = ? WHERE id = ? AND version = ? AND archived_at IS NULL`,
+		formatTime(*updated.ArchivedAt), updated.Version, formatTime(updated.UpdatedAt), current.ID, current.Version)
+	if err != nil {
+		return task.Task{}, fmt.Errorf("archive task: %w", err)
+	}
+	if err := requireSingleChange(result); err != nil {
+		return task.Task{}, ErrTaskVersionConflict
+	}
+	if err := insertTaskEvent(ctx, transaction, event); err != nil {
+		return task.Task{}, err
+	}
+	if err := transaction.Commit(); err != nil {
+		return task.Task{}, fmt.Errorf("commit task archive: %w", err)
+	}
+	return updated, nil
+}
+
 // UpdateTargetBranch 在 Workspace 创建前原子更新 Task 目标分支。
 func (store *TaskStore) UpdateTargetBranch(
 	ctx context.Context,
@@ -163,7 +245,20 @@ func (store *TaskStore) UpdateTargetBranch(
 
 // List 按优先级和创建时间返回当前项目的全部 Task。
 func (store *TaskStore) List(ctx context.Context) ([]task.Task, error) {
-	rows, err := store.database.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks ORDER BY priority ASC, created_at ASC")
+	return store.list(ctx, false)
+}
+
+// ListIncludingArchived 返回包含已归档项的全部 Task。
+func (store *TaskStore) ListIncludingArchived(ctx context.Context) ([]task.Task, error) {
+	return store.list(ctx, true)
+}
+
+func (store *TaskStore) list(ctx context.Context, includeArchived bool) ([]task.Task, error) {
+	where := " WHERE archived_at IS NULL"
+	if includeArchived {
+		where = ""
+	}
+	rows, err := store.database.QueryContext(ctx, "SELECT "+taskColumns+" FROM tasks"+where+" ORDER BY priority ASC, created_at ASC")
 	if err != nil {
 		return nil, fmt.Errorf("list tasks: %w", err)
 	}
@@ -375,14 +470,11 @@ FROM task_reviews WHERE task_id = ? ORDER BY created_at DESC, id DESC`, taskID)
 }
 
 func prepareReviewTransition(current task.Task, input task.ReviewInput) (task.Task, task.Event, error) {
-	return prepareTransition(current, mustReviewStatus(input), input.Command())
-}
-
-func mustReviewStatus(input task.ReviewInput) task.Status {
-	if input.Decision == task.ReviewAccepted {
-		return task.StatusAccepted
+	next, err := task.Transition(current.Status, input.Command())
+	if err != nil {
+		return task.Task{}, task.Event{}, err
 	}
-	return task.StatusChangesRequested
+	return prepareTransition(current, next, input.Command())
 }
 
 func newReview(taskID string, input task.ReviewInput, commitSHA string, createdAt time.Time) (task.Review, error) {
@@ -505,6 +597,50 @@ func prepareTargetBranchUpdate(current task.Task, targetBranch string) (task.Tas
 	}, nil
 }
 
+func prepareDetailsUpdate(current task.Task, input task.UpdateDetailsInput) (task.Task, task.Event, error) {
+	eventID, err := newID()
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	now := time.Now().UTC()
+	updated := current
+	updated.Description = input.Description
+	updated.AcceptanceCriteria = input.AcceptanceCriteria
+	updated.Priority = input.Priority
+	if current.Status == task.StatusReview || current.Status == task.StatusAccepted || current.Status == task.StatusBlocked {
+		updated.Status = task.StatusChangesRequested
+	}
+	updated.AssessmentInputVersion++
+	updated.Version++
+	updated.UpdatedAt = now
+	payload, err := json.Marshal(map[string]any{
+		"schema_version": 1,
+		"from":           map[string]any{"description": current.Description, "acceptance_criteria": current.AcceptanceCriteria, "priority": current.Priority, "status": current.Status},
+		"to":             map[string]any{"description": updated.Description, "acceptance_criteria": updated.AcceptanceCriteria, "priority": updated.Priority, "status": updated.Status},
+	})
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	return updated, task.Event{ID: eventID, TaskID: current.ID, Sequence: updated.Version, Type: task.EventDetailsChanged, Payload: payload, OccurredAt: now}, nil
+}
+
+func prepareArchive(current task.Task) (task.Task, task.Event, error) {
+	eventID, err := newID()
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	now := time.Now().UTC()
+	updated := current
+	updated.ArchivedAt = &now
+	updated.Version++
+	updated.UpdatedAt = now
+	payload, err := json.Marshal(map[string]any{"schema_version": 1, "archived_at": formatTime(now)})
+	if err != nil {
+		return task.Task{}, task.Event{}, err
+	}
+	return updated, task.Event{ID: eventID, TaskID: current.ID, Sequence: updated.Version, Type: task.EventArchived, Payload: payload, OccurredAt: now}, nil
+}
+
 func prepareTransition(current task.Task, next task.Status, command task.Command) (task.Task, task.Event, error) {
 	eventID, err := newID()
 	if err != nil {
@@ -578,6 +714,19 @@ WHERE id = ? AND version = ? AND current_workspace_id = ''`,
 	return requireSingleChange(result)
 }
 
+func updateTaskDetails(ctx context.Context, transaction *sql.Tx, current, updated task.Task) error {
+	result, err := transaction.ExecContext(ctx, `
+UPDATE tasks SET description = ?, acceptance_criteria = ?, priority = ?, status = ?,
+                 assessment_input_version = ?, version = ?, updated_at = ?
+WHERE id = ? AND version = ? AND status != 'RUNNING' AND status != 'CANCELLED' AND archived_at IS NULL`,
+		updated.Description, updated.AcceptanceCriteria, updated.Priority, updated.Status,
+		updated.AssessmentInputVersion, updated.Version, formatTime(updated.UpdatedAt), current.ID, current.Version)
+	if err != nil {
+		return fmt.Errorf("update task details: %w", err)
+	}
+	return requireSingleChange(result)
+}
+
 func updateTaskStatus(ctx context.Context, transaction *sql.Tx, current, updated task.Task) error {
 	result, err := transaction.ExecContext(ctx, `
 UPDATE tasks
@@ -629,14 +778,14 @@ func getTask(ctx context.Context, queryer rowQueryer, id string) (task.Task, err
 
 func scanTask(scanner rowScanner) (task.Task, error) {
 	var item task.Task
-	var createdAt, updatedAt string
+	var createdAt, updatedAt, archivedAt string
 	err := scanner.Scan(
 		&item.ID, &item.Key, &item.Title, &item.TitleSource, &item.TitleLocked,
 		&item.Description, &item.AcceptanceCriteria,
 		&item.Status, &item.Priority, &item.TargetBranch, &item.BaseCommitSHA,
 		&item.CurrentWorkspaceID, &item.LatestRunID, &item.SourcePlanRevisionID,
 		&item.SourcePlanTaskDraftID, &item.AssessmentInputVersion,
-		&item.Version, &createdAt, &updatedAt,
+		&item.Version, &createdAt, &updatedAt, &archivedAt,
 	)
 	if err != nil {
 		return task.Task{}, err
@@ -648,6 +797,13 @@ func scanTask(scanner rowScanner) (task.Task, error) {
 	item.UpdatedAt, err = parseTime(updatedAt)
 	if err != nil {
 		return task.Task{}, fmt.Errorf("parse task updated time: %w", err)
+	}
+	if archivedAt != "" {
+		parsed, parseErr := parseTime(archivedAt)
+		if parseErr != nil {
+			return task.Task{}, fmt.Errorf("parse task archived time: %w", parseErr)
+		}
+		item.ArchivedAt = &parsed
 	}
 	return item, nil
 }

@@ -68,4 +68,7 @@ func TestCapabilityRoutesCreateAndListProjectCatalog(t *testing.T) {
 	if len(service.catalog.Skills) != 1 || service.catalog.Skills[0].Version != 2 || len(service.catalog.MCPServers) != 1 {
 		t.Fatalf("catalog = %#v", service.catalog)
 	}
+	requestJSONResponse(t, server.Client(), http.MethodPost, server.URL+"/api/project/capabilities/skills", `{`, http.StatusBadRequest).Body.Close()
+	requestJSONResponse(t, server.Client(), http.MethodPost, server.URL+"/api/project/capabilities/mcp-servers", `{`, http.StatusBadRequest).Body.Close()
+	requestJSONResponse(t, server.Client(), http.MethodPost, server.URL+"/api/project/capabilities/skills/skill-1/refresh", `{"version":0}`, http.StatusBadRequest).Body.Close()
 }

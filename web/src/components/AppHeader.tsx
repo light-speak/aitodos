@@ -71,6 +71,11 @@ export function AppHeader(props: AppHeaderProps) {
 				<AlertCircleIcon />Agent 状态未知
 			</Button>
 		) : null}
+		{project && project.scheduler_failures > 0 ? (
+			<Button variant="destructive" size="lg" type="button" aria-label="Worker 调度异常" title={project.scheduler_error} onClick={onOpenRuns}>
+				<AlertCircleIcon />Worker 调度异常
+			</Button>
+		) : null}
 		<Button variant="outline" size="lg" type="button" aria-label="搜索项目" onClick={onOpenSearch}>
 			<SearchIcon />搜索<kbd className="ml-1 rounded border px-1 py-0.5 font-mono text-[10px] leading-none text-muted-foreground" aria-hidden="true">/</kbd>
 		</Button>

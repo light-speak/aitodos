@@ -17,11 +17,13 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
+	"github.com/light-speak/aitodos/internal/domain/experience"
 	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/topic"
 	"github.com/light-speak/aitodos/internal/domain/workspace"
+	"github.com/light-speak/aitodos/internal/gitworkflow"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/storage"
 )
@@ -33,6 +35,84 @@ func TestProcessResultKeepsLogTruncationSeparate(t *testing.T) {
 	}
 	if !result.StdoutTruncated || result.StderrTruncated || bytes.Equal(result.Stdout, result.Stderr) {
 		t.Fatalf("process result = %#v", result)
+	}
+}
+
+func TestRecoverFinalizationReplaysWorkspaceAndTerminalState(t *testing.T) {
+	repoRoot := initializeRunnerRepository(t)
+	currentProject, _, err := project.Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), currentProject.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer database.Close()
+	profiles := storage.NewAgentProfileStore(database)
+	profile, err := profiles.GetByRole(context.Background(), agentprofile.RoleImplementer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	revision := profile.CurrentRevision
+	if _, err := profiles.CreateRevision(context.Background(), profile.ID, agentprofile.RevisionInput{
+		Instructions: revision.Instructions, Adapter: "generic", Command: os.Args[0],
+		MaxInputTokens: revision.MaxInputTokens, ReservedOutputTokens: revision.ReservedOutputTokens,
+		RecentMessageLimit: revision.RecentMessageLimit, RetrievalLimit: revision.RetrievalLimit,
+		TimeoutSeconds: revision.TimeoutSeconds,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewTaskStore(database).Create(context.Background(), task.CreateInput{
+		Title: "恢复执行收尾", AcceptanceCriteria: "恢复后进入人工验收",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	manager := gitworkflow.New(currentProject, database)
+	item, err := manager.CreateTaskWorkspace(context.Background(), created.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(item.Path, "recovered.txt"), []byte("preserved\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runs := storage.NewRunStore(database)
+	claim, err := runs.ClaimNextTask(context.Background(), 1, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.Start(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 123, strings.Repeat("a", 64), time.Minute); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.MarkRunning(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := runs.BeginFinalization(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, storage.FinalizationIntent{
+		Finish: storage.RunFinish{Status: run.StatusSucceeded, ExitCode: 0},
+		Closure: &run.Closure{StopReason: run.StopReasonGoalReached, Summary: "恢复前已完成",
+			Completed: []string{"完成 Workspace 修改"}},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	recoveryRuns, err := runs.ListRecoveryRuns(context.Background())
+	if err != nil || len(recoveryRuns) != 1 {
+		t.Fatalf("ListRecoveryRuns() = %#v, %v", recoveryRuns, err)
+	}
+	if err := RecoverFinalization(context.Background(), currentProject, database, recoveryRuns[0]); err != nil {
+		t.Fatal(err)
+	}
+	finished, err := runs.Get(context.Background(), claim.Run.ID)
+	if err != nil || finished.Status != run.StatusSucceeded {
+		t.Fatalf("run = %#v, %v", finished, err)
+	}
+	updated, err := storage.NewTaskStore(database).Get(context.Background(), created.ID)
+	if err != nil || updated.Status != task.StatusReview {
+		t.Fatalf("task = %#v, %v", updated, err)
+	}
+	snapshot, err := runs.GetWorkspaceSnapshot(context.Background(), claim.Run.ID)
+	if err != nil || !snapshot.DirtyAfter || snapshot.WorkspaceID != item.ID {
+		t.Fatalf("snapshot = %#v, %v", snapshot, err)
 	}
 }
 
@@ -64,6 +144,12 @@ func TestExecutePersistsClarificationAndRebuildsContinuationContext(t *testing.T
 		Title: "需要人工决定迁移策略", AcceptanceCriteria: "人工选择后继续",
 	})
 	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := storage.NewExperienceStore(database).CreateVerified(context.Background(), experience.Input{
+		TaskID: created.ID, Title: "迁移策略先澄清", Summary: "兼容策略必须由人类确认",
+		Guidance: "不确定时提出结构化问题", Applicability: "数据库迁移策略不明确时", Pinned: true,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	claim, err := storage.NewRunStore(database).ClaimNextTask(context.Background(), 1, time.Minute)
@@ -116,7 +202,8 @@ func TestExecutePersistsClarificationAndRebuildsContinuationContext(t *testing.T
 	}
 	prompt, err := os.ReadFile(filepath.Join(currentProject.Paths.Artifacts, "runs", continuation.Run.ID, "prompt.md"))
 	if err != nil || !strings.Contains(string(prompt), "数据库迁移是否兼容旧版本") ||
-		!strings.Contains(string(prompt), "compatible") || !strings.Contains(string(prompt), "Current Workspace") {
+		!strings.Contains(string(prompt), "compatible") || !strings.Contains(string(prompt), "Current Workspace") ||
+		!strings.Contains(string(prompt), "Relevant Experience Summaries") || !strings.Contains(string(prompt), "EXP-") {
 		t.Fatalf("continuation prompt = %q, %v", prompt, err)
 	}
 }
@@ -128,6 +215,132 @@ func TestValidateAgentResultRejectsAllDataBeforePersistence(t *testing.T) {
 	}
 	if err := validateAgentResult("run-1", result); err == nil {
 		t.Fatal("validateAgentResult() error = nil")
+	}
+}
+
+func TestValidateAgentResultLimitsExperienceCandidates(t *testing.T) {
+	candidate := agentExperienceCandidate{
+		Title: "先跑回归", Summary: "修改前先验证", Guidance: "运行测试", Applicability: "修改状态机时",
+	}
+	result := agentResult{Experiences: []agentExperienceCandidate{candidate, candidate, candidate, candidate}}
+	if err := validateAgentResult("run-1", result); err == nil {
+		t.Fatal("four experience candidates must be rejected")
+	}
+	result.Experiences = result.Experiences[:1]
+	result.Experiences[0].Guidance = ""
+	if err := validateAgentResult("run-1", result); err == nil {
+		t.Fatal("invalid experience candidate must be rejected")
+	}
+}
+
+func TestValidateAgentResultEnforcesStructuredTaskBoundaries(t *testing.T) {
+	validClosure := &run.Closure{
+		StopReason: run.StopReasonGoalReached,
+		Summary:    "实现完成",
+		Completed:  []string{"完成实现"},
+	}
+	validResult := agentResult{
+		Closure: validClosure,
+		Estimate: &agentEstimate{
+			Points: 3, RemainingPoints: 0, Confidence: 0.9, Rationale: "范围明确",
+		},
+		NewTestCases: []agentTestCase{{Title: "回归测试", Required: true, Outcome: quality.OutcomePassed, Summary: "测试通过"}},
+		TestResults:  []agentTestResult{{TestCaseID: "test-case", Outcome: quality.OutcomePassed, Summary: "测试通过"}},
+		Experiences: []agentExperienceCandidate{{
+			Title: "先跑测试", Summary: "修改前建立基线", Guidance: "运行回归测试", Applicability: "修改状态机时",
+		}},
+	}
+	if err := validateAgentResult("run-1", validResult); err != nil {
+		t.Fatalf("valid result error = %v", err)
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(*agentResult)
+	}{
+		{name: "missing closure", mutate: func(result *agentResult) { result.Closure = nil }},
+		{name: "invalid closure", mutate: func(result *agentResult) { result.Closure = &run.Closure{} }},
+		{name: "disallowed task stop", mutate: func(result *agentResult) {
+			result.Closure = &run.Closure{StopReason: run.StopReasonNeedsInput, Summary: "需要输入", NextAction: "发起结构化问题"}
+		}},
+		{name: "invalid estimate", mutate: func(result *agentResult) { result.Estimate.Points = 4 }},
+		{name: "invalid new test", mutate: func(result *agentResult) { result.NewTestCases[0].Title = "" }},
+		{name: "invalid new test result", mutate: func(result *agentResult) { result.NewTestCases[0].Outcome = "UNKNOWN" }},
+		{name: "missing existing test id", mutate: func(result *agentResult) { result.TestResults[0].TestCaseID = "" }},
+		{name: "invalid existing test result", mutate: func(result *agentResult) { result.TestResults[0].Outcome = "UNKNOWN" }},
+		{name: "invalid experience", mutate: func(result *agentResult) { result.Experiences[0].Guidance = "" }},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			result := validResult
+			result.Estimate = &agentEstimate{
+				Points: validResult.Estimate.Points, RemainingPoints: validResult.Estimate.RemainingPoints,
+				Confidence: validResult.Estimate.Confidence, Rationale: validResult.Estimate.Rationale,
+			}
+			result.NewTestCases = append([]agentTestCase(nil), validResult.NewTestCases...)
+			result.TestResults = append([]agentTestResult(nil), validResult.TestResults...)
+			result.Experiences = append([]agentExperienceCandidate(nil), validResult.Experiences...)
+			test.mutate(&result)
+			if err := validateAgentResult("run-1", result); err == nil {
+				t.Fatal("validateAgentResult() unexpectedly succeeded")
+			}
+		})
+	}
+}
+
+func TestValidateReportedTestCasesRejectsForeignAndMissingTasks(t *testing.T) {
+	database, err := storage.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"), storage.ProjectMetadata{
+		InstanceID: "runner-quality", Name: "runner-quality", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { database.Close() })
+	createdTask, err := storage.NewTaskStore(database).Create(t.Context(), task.CreateInput{Title: "验证测试归属"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qualityStore := storage.NewQualityStore(database)
+	testCase, err := qualityStore.CreateTestCase(t.Context(), createdTask.ID, quality.TestCaseInput{
+		Title: "已有测试", Required: true, CreatedBy: quality.TestCreatorHuman,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, []agentTestResult{{TestCaseID: testCase.ID}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, createdTask.ID, []agentTestResult{{TestCaseID: "foreign"}}); err == nil {
+		t.Fatal("foreign test case was accepted")
+	}
+	if err := validateReportedTestCases(t.Context(), qualityStore, "missing", []agentTestResult{{TestCaseID: testCase.ID}}); !errors.Is(err, storage.ErrTaskNotFound) {
+		t.Fatalf("missing task error = %v", err)
+	}
+}
+
+func TestResultAndCommandHelpersCoverSafeBoundaries(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "missing.json")
+	if content, err := readOptionalResult(missing); err != nil || content != nil {
+		t.Fatalf("missing result = %q, %v", content, err)
+	}
+	oversized := filepath.Join(t.TempDir(), "oversized.json")
+	if err := os.WriteFile(oversized, bytes.Repeat([]byte("x"), (256<<10)+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := readOptionalResult(oversized); err == nil {
+		t.Fatal("oversized result was accepted")
+	}
+	if value, ok := unwrapShellCommand(`"go test ./..."`); !ok || value != "go test ./..." {
+		t.Fatalf("double quoted command = %q, %v", value, ok)
+	}
+	if _, ok := unwrapShellCommand(`"unterminated`); ok {
+		t.Fatal("unterminated command was accepted")
+	}
+	if keys := commandEvidenceKeys("go test ./..."); len(keys) != 1 || keys[0] != "go test ./..." {
+		t.Fatalf("plain command keys = %#v", keys)
 	}
 }
 
@@ -198,7 +411,8 @@ func TestInvocationArgsInjectsCodexResumeBeforePrompt(t *testing.T) {
 		revision, run.PurposeImplementation, "/runtime/run-2", "run-2", "/artifacts/prompt.md",
 		"019c8b9f-c6d5-7020-a5ed-e3a92c861e5d",
 	)
-	if usesPromptFile || strings.Join(args, " ") != "exec --json --model gpt-5.3-codex --sandbox workspace-write resume 019c8b9f-c6d5-7020-a5ed-e3a92c861e5d -" {
+	want := "exec --json --model gpt-5.3-codex --sandbox workspace-write --output-last-message /runtime/run-2/.ats-run-result.json resume 019c8b9f-c6d5-7020-a5ed-e3a92c861e5d -"
+	if usesPromptFile || strings.Join(args, " ") != want {
 		t.Fatalf("invocation args = %#v", args)
 	}
 }
@@ -225,10 +439,28 @@ func TestInvocationArgsAddsManagedReviewResultForLegacyCodexProfile(t *testing.T
 	}
 }
 
+func TestInvocationArgsAddsManagedClosureResultForLegacyCodexProfile(t *testing.T) {
+	revision := agentprofile.Revision{
+		Adapter: "codex", Args: []string{"exec", "--json", "--sandbox", "workspace-write", "-"},
+	}
+	args, _ := invocationArgs(revision, run.PurposeImplementation, "/runtime/run-implementation", "run-implementation", "/artifacts/prompt.md", "")
+	want := "exec --json --sandbox workspace-write --output-last-message /runtime/run-implementation/.ats-run-result.json -"
+	if strings.Join(args, " ") != want {
+		t.Fatalf("invocation args = %#v, want %q", args, want)
+	}
+}
+
 func TestPersistAppServerReviewRejectsUnstructuredFinalMessage(t *testing.T) {
 	err := persistAppServerFinalResult(run.PurposeReview, t.TempDir(), "普通文本回答")
 	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
 		t.Fatalf("persist review result error = %v", err)
+	}
+}
+
+func TestPersistAppServerImplementationRejectsUnstructuredFinalMessage(t *testing.T) {
+	err := persistAppServerFinalResult(run.PurposeImplementation, t.TempDir(), "普通文本回答")
+	if err == nil || !strings.Contains(err.Error(), "not valid JSON") {
+		t.Fatalf("persist implementation result error = %v", err)
 	}
 }
 
@@ -788,7 +1020,7 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 		t.Fatal("claim token leaked to agent")
 	}
 	if os.Getenv("ATS_RUN_PURPOSE") == "PLANNING" {
-		result := `{"reply":"需求已经足够明确，我整理了一版可审核方案。","plan":{"summary":"实现最小文本社区","rationale":"先完成发布和列表闭环","risks":"暂不包含账户体系","drafts":[{"title":"实现帖子发布与列表","description":"支持发布并查看文本帖子","acceptance_criteria":"发布后帖子出现在列表中","priority":1,"test_cases":[{"title":"发布文本帖子","description":"提交后列表展示内容","required":true}]}]}}`
+		result := `{"reply":"需求已经足够明确，我整理了一版可审核方案。","readiness":{"status":"READY_FOR_REVIEW","confidence":0.9,"assumptions":["先实现纯文本帖子"],"open_questions":[],"alternatives":[{"title":"先做单体闭环","tradeoff":"范围最小且容易验证"}]},"plan":{"summary":"实现最小文本社区","rationale":"先完成发布和列表闭环","risks":"暂不包含账户体系","drafts":[{"title":"实现帖子发布与列表","description":"支持发布并查看文本帖子","acceptance_criteria":"发布后帖子出现在列表中","priority":1,"test_cases":[{"title":"发布文本帖子","description":"提交后列表展示内容","required":true}]}]}}`
 		if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 			t.Fatal(err)
 		}
@@ -837,7 +1069,7 @@ func TestRunnerFakeAgentProcess(t *testing.T) {
 	if err := os.WriteFile("runner-output.txt", []byte("agent wrote this\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	result := `{"estimate":{"points":5,"remaining_points":1,"confidence":0.8,"rationale":"实现已完成，剩余人工验收"},"new_test_cases":[{"title":"Runner 输出文件","description":"文件内容正确","required":true,"outcome":"PASSED","summary":"Agent 检查通过"}]}`
+	result := `{"closure":{"stop_reason":"GOAL_REACHED","summary":"实现与自动测试已经完成","completed":["写入 Runner 输出文件"],"verified":[{"claim":"输出文件内容正确","evidence":"Agent 已读取生成文件"}],"unverified":["仍需人工验收"],"remaining_risks":[],"next_action":"进入人工审核"},"estimate":{"points":5,"remaining_points":1,"confidence":0.8,"rationale":"实现已完成，剩余人工验收"},"new_test_cases":[{"title":"Runner 输出文件","description":"文件内容正确","required":true,"outcome":"PASSED","summary":"Agent 检查通过"}]}`
 	if err := os.WriteFile(".ats-run-result.json", []byte(result), 0o600); err != nil {
 		t.Fatal(err)
 	}

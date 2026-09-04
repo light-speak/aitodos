@@ -19,6 +19,10 @@ const current: PlanView = {
 	revision: {
 		id: 'revision-1', plan_id: 'plan-1', revision: 1,
 		summary: '建立索引并增加搜索 UI', rationale: '先做本地搜索', risks: '索引过期',
+		readiness: {
+			status: 'READY_FOR_REVIEW', confidence: 0.86, assumptions: ['数据量适合本地索引'], open_questions: [],
+			alternatives: [{ title: '远程搜索服务', tradeoff: '扩展性更强，但增加部署复杂度' }],
+		},
 		created_at: topic.created_at,
 		drafts: [{
 			id: 'draft-1', plan_revision_id: 'revision-1', key: 'T1', title: '建立索引',
@@ -53,6 +57,8 @@ describe('PlanPanel', () => {
 			{...planningProps} onReload={() => undefined} onSubmit={vi.fn()} onReject={vi.fn()} onApprove={onApprove} />)
 
 		expect(screen.getByText('Revision 1')).toBeInTheDocument()
+		expect(screen.getByText('规划充分度 86%')).toBeInTheDocument()
+		expect(screen.getByText('数据量适合本地索引')).toBeInTheDocument()
 		expect(screen.getByText('Topic 可检索')).toBeInTheDocument()
 		await user.type(screen.getByPlaceholderText('审核意见（要求修改时必填）'), '批准执行')
 		await user.click(screen.getByRole('button', { name: '批准并创建 1 个 Task' }))

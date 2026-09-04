@@ -23,7 +23,11 @@ export const topicStatuses = [
 
 export type TopicStatus = (typeof topicStatuses)[number]
 
-export const searchKinds = ['TOPIC', 'TASK', 'MESSAGE', 'PLAN_REVISION', 'CLARIFICATION'] as const
+export const searchKinds = [
+	'TOPIC', 'TASK', 'MESSAGE', 'PLAN_REVISION', 'CLARIFICATION',
+	'DECISION', 'RUN_SUMMARY', 'CI_CHECK', 'LABEL',
+	'EXPERIENCE',
+] as const
 
 export type SearchKind = (typeof searchKinds)[number]
 
@@ -57,6 +61,54 @@ export interface SearchQueryInput {
 	cursor?: string
 }
 
+export interface RetrievalEvalRelevance {
+	document_id: string
+	stable_key: string
+	title: string
+	available: boolean
+}
+
+export interface RetrievalEvalCase {
+	id: string
+	query: string
+	kinds: SearchKind[]
+	only_current: boolean
+	note: string
+	active: boolean
+	relevances: RetrievalEvalRelevance[]
+	created_at: string
+	updated_at: string
+}
+
+export interface CreateRetrievalEvalCaseInput {
+	query: string
+	kinds: SearchKind[]
+	only_current: boolean
+	document_id: string
+	note?: string
+}
+
+export interface RetrievalEvalResult {
+	case_id: string
+	document_id: string
+	rank: number
+}
+
+export interface RetrievalEvalRun {
+	id: string
+	engine: string
+	k: number
+	case_count: number
+	relevant_count: number
+	recalled_count: number
+	hit_cases: number
+	recall_at_k: number
+	hit_at_k: number
+	mrr: number
+	results: RetrievalEvalResult[]
+	created_at: string
+}
+
 export const messageAuthorKinds = ['HUMAN', 'AGENT', 'SYSTEM'] as const
 
 export type MessageAuthorKind = (typeof messageAuthorKinds)[number]
@@ -83,6 +135,7 @@ export interface Task {
   version: number
   created_at: string
   updated_at: string
+  archived_at?: string
 }
 
 export interface Topic {
@@ -128,10 +181,24 @@ export interface PlanRevision {
 	summary: string
 	rationale: string
 	risks: string
+	readiness?: PlanningReadiness
 	source_run_id?: string
 	previous_revision_id?: string
 	drafts: PlanTaskDraft[]
 	created_at: string
+}
+
+export interface PlanningAlternative {
+	title: string
+	tradeoff: string
+}
+
+export interface PlanningReadiness {
+	status: 'NEEDS_DISCUSSION' | 'READY_FOR_REVIEW'
+	confidence: number
+	assumptions: string[]
+	open_questions: string[]
+	alternatives: PlanningAlternative[]
 }
 
 export interface Plan {
@@ -229,8 +296,19 @@ export interface TaskFeedbackResponse {
 
 export interface TaskAssociation {
   task: Task
+  type?: TaskRelationType
+  direction?: TaskRelationDirection
   source_message_id?: string
   created_at: string
+}
+
+export type TaskRelationType = 'RELATES_TO' | 'BLOCKS' | 'PARENT_OF' | 'SUPERSEDES' | 'DERIVED_FROM'
+export type TaskRelationDirection = 'BIDIRECTIONAL' | 'OUTGOING' | 'INCOMING'
+
+export interface UpdateTaskDetailsInput {
+	description: string
+	acceptance_criteria: string
+	priority: number
 }
 
 export interface TopicAssociation {
@@ -239,12 +317,140 @@ export interface TopicAssociation {
   created_at: string
 }
 
+export interface KnowledgeLabel {
+	id: string
+	name: string
+	color: string
+	created_at: string
+}
+
+export interface Decision {
+	id: string
+	key: string
+	topic_id?: string
+	task_id?: string
+	title: string
+	content: string
+	status: 'ACTIVE' | 'SUPERSEDED'
+	supersedes_decision_id?: string
+	created_at: string
+}
+
+export type ExperienceStatus = 'CANDIDATE' | 'ACTIVE' | 'CHALLENGED' | 'SUPERSEDED'
+
+export interface ExperienceRecord {
+	id: string
+	key: string
+	topic_id?: string
+	task_id?: string
+	title: string
+	summary: string
+	guidance: string
+	applicability: string
+	project_wide: boolean
+	status: ExperienceStatus
+	pinned: boolean
+	verification_count: number
+	successful_applications: number
+	failed_applications: number
+	recall_count: number
+	source_run_id?: string
+	supersedes_experience_id?: string
+	created_at: string
+	updated_at: string
+}
+
+export interface CreateExperienceInput {
+	title: string
+	summary: string
+	guidance: string
+	applicability: string
+	project_wide: boolean
+	pinned: boolean
+	supersedes_experience_id?: string
+}
+
+export type ExperienceOutcome = 'PENDING' | 'HELPFUL' | 'HARMFUL' | 'IGNORED'
+
+export interface ExperienceRecall {
+	recall_id: string
+	rank: number
+	experience: ExperienceRecord
+	score: {
+		relevance_score: number
+		utility_score: number
+		scope_score: number
+		freshness_score: number
+		final_score: number
+	}
+	outcome: ExperienceOutcome
+	recalled_at: string
+}
+
+export type CIState = 'PENDING' | 'PASSED' | 'FAILED' | 'CANCELLED' | 'UNKNOWN'
+
+export interface CICheck {
+	name: string
+	state: CIState
+	details_url?: string
+}
+
+export interface CISnapshot {
+	id: string
+	task_id: string
+	provider: string
+	commit_sha: string
+	state: CIState
+	checks: CICheck[]
+	source_url?: string
+	observed_at: string
+	created_at: string
+}
+
+export interface RunSummary {
+	run_id: string
+	status: string
+	summary: string
+	passed_tests: number
+	failed_tests: number
+	created_at: string
+}
+
+export interface MCPAuditEvent {
+	id: string
+	call_id: string
+	direction: 'INBOUND' | 'OUTBOUND'
+	run_id?: string
+	client_name: string
+	server_name?: string
+	tool_name: string
+	phase: 'STARTED' | 'COMPLETED' | 'FAILED'
+	argument_keys: string[]
+	arguments_sha256: string
+	result_bytes?: number
+	error_message?: string
+	occurred_at: string
+}
+
+export interface RunResourceLease {
+	id: string
+	run_id: string
+	resource_kind: 'BROWSER_SESSION'
+	provider_name: string
+	state: 'ACTIVE' | 'RELEASED' | 'ABANDONED'
+	opened_at: string
+	released_at?: string
+	cleanup_reason?: string
+}
+
 export interface ProjectInfo {
   name: string
   root: string
   agent: string
 	workers_enabled: boolean
   max_workers: number
+	scheduler_failures: number
+	scheduler_error: string
 }
 
 export const runPurposes = ['PLANNING', 'TRIAGE', 'IMPLEMENTATION', 'REVISION', 'REVIEW'] as const
@@ -369,8 +575,30 @@ export interface RunWorkspaceSnapshot {
 export interface RunDetail {
 	run: AgentRun
 	usage?: RunUsage
+	closure?: RunClosure
 	artifacts: RunArtifact[]
 	workspace_snapshot?: RunWorkspaceSnapshot
+}
+
+export type RunStopReason = 'GOAL_REACHED' | 'DISCUSSION_REQUIRED' | 'NEEDS_INPUT' |
+	'ENVIRONMENT_BLOCKED' | 'POLICY_BLOCKED' | 'LIMIT_REACHED' | 'PROCESS_FAILED' |
+	'CANCELLED' | 'TIMED_OUT' | 'LOST'
+
+export interface RunVerification {
+	claim: string
+	evidence: string
+}
+
+export interface RunClosure {
+	run_id: string
+	stop_reason: RunStopReason
+	summary: string
+	completed: string[]
+	verified: RunVerification[]
+	unverified: string[]
+	remaining_risks: string[]
+	next_action: string
+	created_at: string
 }
 
 export interface RunLog {
@@ -471,10 +699,11 @@ export interface ClarificationOption {
 
 export interface Clarification {
 	id: string
-	task_id: string
+	topic_id?: string
+	task_id?: string
 	source_run_id: string
 	continuation_run_id?: string
-	continuation_purpose: 'IMPLEMENTATION' | 'REVISION'
+	continuation_purpose: 'PLANNING' | 'TRIAGE' | 'IMPLEMENTATION' | 'REVISION'
 	category: ClarificationCategory
 	question: string
 	options: ClarificationOption[]
@@ -602,6 +831,7 @@ export interface TaskTestResult {
 	evidence_kind: TestEvidenceKind
 	summary: string
 	command?: string
+	exit_code?: number
 	artifact_ref?: string
 	source_run_id?: string
 	stale?: boolean
@@ -644,9 +874,7 @@ export interface CreateTaskTestCaseInput {
 
 export interface CreateTaskTestResultInput {
 	outcome: TestOutcome
-	evidence_kind: Exclude<TestEvidenceKind, 'AGENT_REPORT'>
 	summary: string
-	command?: string
 }
 
 export const workspaceStates = ['PROVISIONING', 'READY', 'DIRTY', 'QUARANTINED', 'ERROR'] as const

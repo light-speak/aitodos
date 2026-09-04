@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
 import { getTaskAssociations, linkTask, unlinkTask } from '../../api/client'
-import type { DiscussionSubjectKind, Task, TaskAssociation } from '../../types'
+import type { DiscussionSubjectKind, Task, TaskAssociation, TaskRelationType } from '../../types'
 
 interface AssociationState {
   key: string | null
@@ -39,25 +39,26 @@ export function useTaskAssociations(
     return () => controller.abort()
   }, [key, reloadToken, subjectID, subjectKind])
 
-  const add = useCallback(async (taskID: string) => {
+  const add = useCallback(async (taskID: string, relationType: TaskRelationType = 'RELATES_TO') => {
     if (subjectKind === null || subjectID === null || key === null) return
     setPendingTaskIDs((current) => withTaskID(current, taskID, true))
     try {
-      await linkTask(subjectKind, subjectID, taskID)
+      await linkTask(subjectKind, subjectID, taskID, relationType)
       const linkedTask = tasks.find((task) => task.id === taskID)
       if (linkedTask !== undefined) {
-        includeAssociations(setState, key, [linkedTask])
+        includeAssociations(setState, key, [linkedTask], subjectKind === 'tasks' ? relationType : undefined)
       }
     } finally {
       setPendingTaskIDs((current) => withTaskID(current, taskID, false))
     }
   }, [key, subjectID, subjectKind, tasks])
 
-  const remove = useCallback(async (taskID: string) => {
+  const remove = useCallback(async (association: TaskAssociation) => {
     if (subjectKind === null || subjectID === null || key === null) return
+		const taskID = association.task.id
     setPendingTaskIDs((current) => withTaskID(current, taskID, true))
     try {
-      await unlinkTask(subjectKind, subjectID, taskID)
+      await unlinkTask(subjectKind, subjectID, association)
       setState((current) => ({
         ...current,
         associations: current.key === key
@@ -100,6 +101,7 @@ function includeAssociations(
   setState: React.Dispatch<React.SetStateAction<AssociationState>>,
   key: string,
   tasks: Task[],
+	relationType?: TaskRelationType,
 ) {
   setState((current) => {
     if (current.key !== key) return current
@@ -107,7 +109,7 @@ function includeAssociations(
     const createdAt = new Date().toISOString()
     const additions = tasks
       .filter((task) => !existing.has(task.id))
-      .map((task) => ({ task, created_at: createdAt }))
+		.map((task) => ({ task, created_at: createdAt, ...(relationType ? { type: relationType, direction: relationType === 'RELATES_TO' ? 'BIDIRECTIONAL' as const : 'OUTGOING' as const } : {}) }))
     return { ...current, associations: [...current.associations, ...additions] }
   })
 }

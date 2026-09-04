@@ -238,11 +238,42 @@ SELECT 'PLAN_REVISION:' || revisions.id, 'PLAN_REVISION', revisions.id, 'TOPIC',
        plans.status, CASE WHEN plans.current_revision_id = revisions.id THEN 1 ELSE 0 END, plans.updated_at
 FROM plan_revisions AS revisions JOIN plans ON plans.id = revisions.plan_id`,
 	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
-SELECT 'CLARIFICATION:' || clarifications.id, 'CLARIFICATION', clarifications.id, 'TASK', clarifications.task_id,
-       tasks.task_key || '#clarification-' || clarifications.id,
-       tasks.task_key || ' · ' || clarifications.category,
+SELECT 'CLARIFICATION:' || clarifications.id, 'CLARIFICATION', clarifications.id,
+       CASE WHEN clarifications.topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END,
+       COALESCE(clarifications.topic_id, clarifications.task_id),
+       COALESCE(topics.topic_key, tasks.task_key) || '#clarification-' || clarifications.id,
+       COALESCE(topics.topic_key, tasks.task_key) || ' · ' || clarifications.category,
        clarifications.question || char(10) || clarifications.options_json || char(10) ||
        clarifications.selected_option_id || char(10) || clarifications.custom_answer,
        clarifications.status, 1, clarifications.updated_at
-FROM clarifications JOIN tasks ON tasks.id = clarifications.task_id`,
+FROM clarifications LEFT JOIN topics ON topics.id = clarifications.topic_id
+LEFT JOIN tasks ON tasks.id = clarifications.task_id`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'DECISION:' || id, 'DECISION', id,
+       CASE WHEN topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END,
+       COALESCE(topic_id, task_id), decision_key, title, content, status,
+       CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END, created_at FROM decisions`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'RUN_SUMMARY:' || summaries.run_id, 'RUN_SUMMARY', summaries.run_id,
+       CASE WHEN runs.topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END,
+       COALESCE(runs.topic_id, runs.task_id), runs.id,
+       runs.purpose || ' Run 摘要', summaries.summary, summaries.status, 1, summaries.created_at
+FROM run_summaries summaries JOIN runs ON runs.id = summaries.run_id`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'CI_CHECK:' || snapshots.id, 'CI_CHECK', snapshots.id, 'TASK', snapshots.task_id,
+       snapshots.commit_sha, snapshots.provider || ' CI', snapshots.checks_json,
+       snapshots.state, 1, snapshots.observed_at FROM ci_check_snapshots snapshots`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'LABEL:TOPIC:' || bindings.topic_id || ':' || labels.id, 'LABEL', bindings.topic_id || ':' || labels.id,
+       'TOPIC', bindings.topic_id, labels.name, labels.name, labels.color, 'ATTACHED', 1, bindings.created_at
+FROM topic_labels bindings JOIN labels ON labels.id = bindings.label_id`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'LABEL:TASK:' || bindings.task_id || ':' || labels.id, 'LABEL', bindings.task_id || ':' || labels.id,
+       'TASK', bindings.task_id, labels.name, labels.name, labels.color, 'ATTACHED', 1, bindings.created_at
+FROM task_labels bindings JOIN labels ON labels.id = bindings.label_id`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'EXPERIENCE:' || id, 'EXPERIENCE', id,
+       CASE WHEN topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END, COALESCE(topic_id, task_id),
+       experience_key, title, summary || char(10) || guidance || char(10) || applicability,
+       status, CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END, updated_at FROM experience_records`,
 }

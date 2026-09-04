@@ -35,7 +35,7 @@ describe('TaskQualityPanel', () => {
 		expect(screen.getByText('Agent 报告通过 · 未验证')).toBeInTheDocument()
 		await user.click(screen.getByRole('button', { name: '人工确认浏览器创建流程通过' }))
 		expect(onRecordResult).toHaveBeenCalledWith('test-1', expect.objectContaining({
-			outcome: 'PASSED', evidence_kind: 'HUMAN',
+			outcome: 'PASSED', summary: '人工确认通过',
 		}))
 	})
 
@@ -58,6 +58,21 @@ describe('TaskQualityPanel', () => {
 		expect(screen.queryByRole('button', { name: '人工确认浏览器创建流程通过' })).not.toBeInTheDocument()
 	})
 
+	it('旧版命令记录缺少退出码时仍要求重新验证', () => {
+		const testCase = taskQuality.test_cases[0]!
+		const legacyQuality: TaskQuality = {
+			...taskQuality,
+			test_cases: [{
+				...testCase,
+				latest_result: { ...testCase.latest_result!, evidence_kind: 'COMMAND', command: 'pnpm test', summary: '旧测试通过' },
+			}],
+		}
+		render(<TaskQualityPanel quality={legacyQuality} loading={false} error={null} busy={false} onReload={() => undefined} onCreateEstimate={vi.fn()} onCreateTestCase={vi.fn()} onRecordResult={vi.fn()} />)
+
+		expect(screen.getByText('旧测试通过 · 旧版命令证据，需重新验证')).toBeInTheDocument()
+		expect(screen.getByRole('button', { name: '人工确认浏览器创建流程通过' })).toBeInTheDocument()
+	})
+
 	it('默认只展开待处理必测项，并折叠 Runner 命令验证通过的项目', () => {
 		const testCase = taskQuality.test_cases[0]!
 		const commandQuality: TaskQuality = {
@@ -67,7 +82,7 @@ describe('TaskQualityPanel', () => {
 					...testCase,
 					latest_result: {
 						...testCase.latest_result!, evidence_kind: 'COMMAND', summary: 'vitest 通过',
-						command: 'pnpm test', artifact_ref: 'runs/run-1/stdout.log',
+						command: 'pnpm test', exit_code: 0, artifact_ref: 'runs/run-1/stdout.log',
 					},
 				},
 				{ ...testCase, id: 'test-2', title: '浏览器人工检查', latest_result: undefined },
@@ -77,7 +92,7 @@ describe('TaskQualityPanel', () => {
 
 		expect(screen.getByText('需要你处理 1 项')).toBeInTheDocument()
 		expect(screen.getByText('已验证 1 项')).toBeInTheDocument()
-		expect(screen.getByText('vitest 通过 · 命令已验证')).toBeInTheDocument()
+		expect(screen.getByText('vitest 通过 · 命令已验证 · exit 0')).toBeInTheDocument()
 		expect(screen.queryByRole('button', { name: '人工确认浏览器创建流程通过' })).not.toBeInTheDocument()
 	})
 })

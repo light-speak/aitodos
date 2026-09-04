@@ -10,10 +10,12 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
+	"github.com/light-speak/aitodos/internal/processidentity"
 	"github.com/light-speak/aitodos/internal/project"
 	"github.com/light-speak/aitodos/internal/runner"
 	"github.com/light-speak/aitodos/internal/storage"
@@ -28,12 +30,23 @@ type launchClaim struct {
 
 // Scheduler 只调度当前项目，不创建跨项目全局队列。
 type Scheduler struct {
-	project    *project.Project
-	database   *sql.DB
-	runs       *storage.RunStore
-	executable string
-	execError  error
-	launch     func(context.Context, launchClaim) error
+	project         *project.Project
+	database        *sql.DB
+	runs            *storage.RunStore
+	executable      string
+	execError       error
+	launch          func(context.Context, launchClaim) error
+	dispatch        func(context.Context) error
+	pollInterval    time.Duration
+	maxErrorBackoff time.Duration
+	healthMu        sync.RWMutex
+	health          Health
+}
+
+// Health 描述 Scheduler 最近一次可观测的调度错误。
+type Health struct {
+	ConsecutiveFailures int
+	LastError           string
 }
 
 // New 创建当前项目 Scheduler。
@@ -41,24 +54,66 @@ func New(currentProject *project.Project, database *sql.DB) *Scheduler {
 	executable, err := os.Executable()
 	scheduler := &Scheduler{
 		project: currentProject, database: database, runs: storage.NewRunStore(database),
-		executable: executable, execError: err,
+		executable: executable, execError: err, pollInterval: 300 * time.Millisecond,
+		maxErrorBackoff: 10 * time.Second,
 	}
 	scheduler.launch = scheduler.launchRunner
+	scheduler.dispatch = scheduler.DispatchOnce
 	return scheduler
 }
 
 // Run 持续响应 Worker 配置，直到 Daemon 上下文取消。
 func (scheduler *Scheduler) Run(ctx context.Context) {
-	ticker := time.NewTicker(300 * time.Millisecond)
-	defer ticker.Stop()
 	for {
-		_ = scheduler.DispatchOnce(ctx)
+		err := scheduler.dispatch(ctx)
+		scheduler.recordDispatch(err)
+		delay := scheduler.nextDelay(err)
+		timer := time.NewTimer(delay)
 		select {
 		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			return
-		case <-ticker.C:
+		case <-timer.C:
 		}
 	}
+}
+
+// Health 返回不会暴露内部错误类型的 Scheduler 状态快照。
+func (scheduler *Scheduler) Health() Health {
+	scheduler.healthMu.RLock()
+	defer scheduler.healthMu.RUnlock()
+	return scheduler.health
+}
+
+func (scheduler *Scheduler) recordDispatch(err error) {
+	scheduler.healthMu.Lock()
+	defer scheduler.healthMu.Unlock()
+	if err == nil {
+		scheduler.health = Health{}
+		return
+	}
+	scheduler.health.ConsecutiveFailures++
+	scheduler.health.LastError = err.Error()
+}
+
+func (scheduler *Scheduler) nextDelay(err error) time.Duration {
+	if err == nil {
+		return scheduler.pollInterval
+	}
+	failures := scheduler.Health().ConsecutiveFailures
+	delay := scheduler.pollInterval
+	for index := 1; index < failures && delay < scheduler.maxErrorBackoff; index++ {
+		delay *= 2
+	}
+	if delay > scheduler.maxErrorBackoff {
+		return scheduler.maxErrorBackoff
+	}
+	return delay
 }
 
 // DispatchOnce 至多领取并启动一个 Run。
@@ -128,6 +183,7 @@ func (scheduler *Scheduler) waitAndReconcile(command *exec.Cmd, claim launchClai
 	if err != nil || !activeRunStatus(current.Status) {
 		return
 	}
+	scheduler.cleanupAgentResources(claim.RunID)
 	if current.Status == domainrun.StatusFinalizing {
 		recovery := storage.RecoveryRun{Run: current, RunNonce: current.RunNonce}
 		if err := runner.RecoverFinalization(context.Background(), scheduler.project, scheduler.database, recovery); err == nil {
@@ -139,6 +195,28 @@ func (scheduler *Scheduler) waitAndReconcile(command *exec.Cmd, claim launchClai
 		message = waitErr.Error()
 	}
 	_, _ = scheduler.runs.RecoverLost(context.Background(), claim.RunID, claim.LeaseGeneration, "RUNNER_LOST", message)
+}
+
+func (scheduler *Scheduler) cleanupAgentResources(runID string) {
+	items, err := scheduler.runs.ListRecoveryRuns(context.Background())
+	if err != nil {
+		return
+	}
+	for _, item := range items {
+		if item.Run.ID != runID {
+			continue
+		}
+		abandoned := false
+		reason := "Runner 异常退出，Agent 进程组已关闭"
+		if item.AgentPID > 0 {
+			if err := processidentity.TerminateGroup(context.Background(), item.AgentPID, item.AgentIdentity); err != nil {
+				abandoned = true
+				reason = "Runner 异常退出，Agent 进程组无法确认关闭"
+			}
+		}
+		_ = storage.NewMCPAuditStore(scheduler.database).ReleaseRunResources(context.Background(), runID, abandoned, reason)
+		return
+	}
 }
 
 func (scheduler *Scheduler) failUnstartedRun(claim launchClaim, code string, cause error) {

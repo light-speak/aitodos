@@ -1,7 +1,9 @@
 import { afterEach, describe, expect, it, vi } from 'vitest'
 
 import {
+	addRetrievalEvalResult,
 	getProjectProgress,
+	getRetrievalEvalCases,
 	getRepositoryInfo,
 	getRunDetail,
 	getRunLog,
@@ -12,6 +14,7 @@ import {
 	getTaskReviews,
 	requestRunCancellation,
 	requestTopicPlanning,
+	runRetrievalEval,
 	retryTask,
 	searchProject,
 } from './client'
@@ -40,6 +43,44 @@ describe('searchProject', () => {
 			'/api/search?q=%E6%8C%81%E4%B9%85%E4%B8%8A%E4%B8%8B%E6%96%87&kind=MESSAGE&status=AGENT&only_current=true&limit=10',
 			expect.objectContaining({ signal: undefined }),
 		)
+	})
+})
+
+describe('retrieval evaluation', () => {
+	afterEach(() => vi.unstubAllGlobals())
+
+	it('解析评测集并发送真实搜索标注', async () => {
+		const payload = {
+			id: 'case-1', query: 'worktree', kinds: ['TASK'], only_current: true, note: '', active: true,
+			relevances: [{ document_id: 'TASK:task-1', stable_key: 'ATS-1', title: '恢复 Worktree', available: true }],
+			created_at: '2026-09-03T00:00:00Z', updated_at: '2026-09-03T00:00:00Z',
+		}
+		const fetchMock = vi.fn<typeof fetch>()
+			.mockResolvedValueOnce(Response.json([payload]))
+			.mockResolvedValueOnce(Response.json(payload, { status: 201 }))
+		vi.stubGlobal('fetch', fetchMock)
+
+		const cases = await getRetrievalEvalCases()
+		const created = await addRetrievalEvalResult({ query: 'worktree', kinds: ['TASK'], only_current: true, document_id: 'TASK:task-1' })
+
+		expect(cases[0]?.relevances[0]?.stable_key).toBe('ATS-1')
+		expect(created.id).toBe('case-1')
+		expect(fetchMock).toHaveBeenLastCalledWith('/api/retrieval-evals/cases', expect.objectContaining({
+			method: 'POST', body: JSON.stringify({ query: 'worktree', kinds: ['TASK'], only_current: true, document_id: 'TASK:task-1' }),
+		}))
+	})
+
+	it('解析 Recall、Hit 和 MRR 运行结果', async () => {
+		vi.stubGlobal('fetch', vi.fn<typeof fetch>(() => Promise.resolve(Response.json({
+			id: 'run-1', engine: 'LEXICAL_V1', k: 10, case_count: 1, relevant_count: 1,
+			recalled_count: 1, hit_cases: 1, recall_at_k: 1, hit_at_k: 1, mrr: 1,
+			results: [{ case_id: 'case-1', document_id: 'TASK:task-1', rank: 1 }],
+			created_at: '2026-09-03T00:00:00Z',
+		}, { status: 201 }))))
+
+		const run = await runRetrievalEval(10)
+		expect(run.engine).toBe('LEXICAL_V1')
+		expect(run.recall_at_k).toBe(1)
 	})
 })
 

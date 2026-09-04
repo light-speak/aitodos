@@ -46,6 +46,7 @@ func (handler *approvalHandler) listRun(response http.ResponseWriter, request *h
 func (handler *approvalHandler) resolve(response http.ResponseWriter, request *http.Request) {
 	var input approvalDecisionInput
 	if err := decodeJSON(response, request, &input); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "权限决定请求格式无效")
 		return
 	}
 	if input.ExpectedVersion < 1 || input.Decision == "" {

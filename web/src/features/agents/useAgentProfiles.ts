@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react'
 
-import { createAgentProfileRevision, getAgentProfiles } from '../../api/client'
+import { configureCodexAgentDefaults, createAgentProfileRevision, getAgentProfiles } from '../../api/client'
 import type { AgentProfile, AgentProfileRevisionInput } from '../../types'
 
 export function useAgentProfiles(active: boolean) {
@@ -33,8 +33,15 @@ export function useAgentProfiles(active: boolean) {
 		} finally { setSaving(false) }
 	}, [])
 	const reload = useCallback(() => setReloadToken((current) => current + 1), [])
+	const configureDefaults = useCallback(async () => {
+		setSaving(true)
+		try {
+			const profiles = await configureCodexAgentDefaults()
+			setState((current) => ({ ...current, profiles, error: null }))
+		} finally { setSaving(false) }
+	}, [])
 	return {
 		profiles: state.profiles, loading: active && state.loadedToken !== reloadToken,
-		saving, error: state.error, save, reload,
+		saving, error: state.error, save, reload, configureDefaults,
 	}
 }

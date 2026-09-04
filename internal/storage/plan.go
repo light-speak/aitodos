@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -360,12 +361,16 @@ WHERE id = ? AND status = 'CHANGES_REQUESTED' AND version = ?`, revisionID, form
 }
 
 func insertPlanRevision(ctx context.Context, transaction *sql.Tx, revision plan.Revision) error {
-	_, err := transaction.ExecContext(ctx, `
+	readinessJSON, err := marshalPlanReadiness(revision.Readiness)
+	if err != nil {
+		return err
+	}
+	_, err = transaction.ExecContext(ctx, `
 INSERT INTO plan_revisions(id, plan_id, revision_number, summary, rationale, risks,
-                           source_run_id, previous_revision_id, created_at)
-VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)`, revision.ID, revision.PlanID,
+                           readiness_json, source_run_id, previous_revision_id, created_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''), ?)`, revision.ID, revision.PlanID,
 		revision.Revision, revision.Summary, revision.Rationale, revision.Risks,
-		revision.SourceRunID, revision.PreviousRevisionID, formatTime(revision.CreatedAt))
+		readinessJSON, revision.SourceRunID, revision.PreviousRevisionID, formatTime(revision.CreatedAt))
 	if err != nil {
 		return err
 	}
@@ -387,6 +392,21 @@ VALUES (?, ?, ?, ?, ?, ?)`, testCase.ID, testCase.TaskDraftID, testCase.Title,
 		}
 	}
 	return nil
+}
+
+func marshalPlanReadiness(readiness *plan.ReadinessAssessment) (any, error) {
+	if readiness == nil {
+		return nil, nil
+	}
+	normalized := readiness.Normalized()
+	if err := normalized.Validate(); err != nil {
+		return nil, err
+	}
+	encoded, err := json.Marshal(normalized)
+	if err != nil {
+		return nil, fmt.Errorf("encode plan readiness: %w", err)
+	}
+	return string(encoded), nil
 }
 
 func updateTopicForPlan(ctx context.Context, transaction *sql.Tx, current, updated topic.Topic) error {
@@ -469,15 +489,22 @@ func scanPlan(scanner rowScanner) (plan.Plan, error) {
 
 func loadPlanRevision(ctx context.Context, queryer rowQueryer, revisionID string) (plan.Revision, error) {
 	var revision plan.Revision
+	var readinessJSON sql.NullString
 	var createdAt string
 	err := queryer.QueryRowContext(ctx, `
 SELECT id, plan_id, revision_number, summary, rationale, risks,
-       COALESCE(source_run_id, ''), COALESCE(previous_revision_id, ''), created_at
+       readiness_json, COALESCE(source_run_id, ''), COALESCE(previous_revision_id, ''), created_at
 FROM plan_revisions WHERE id = ?`, revisionID).Scan(&revision.ID, &revision.PlanID,
 		&revision.Revision, &revision.Summary, &revision.Rationale, &revision.Risks,
-		&revision.SourceRunID, &revision.PreviousRevisionID, &createdAt)
+		&readinessJSON, &revision.SourceRunID, &revision.PreviousRevisionID, &createdAt)
 	if err != nil {
 		return plan.Revision{}, err
+	}
+	if readinessJSON.Valid {
+		revision.Readiness = &plan.ReadinessAssessment{}
+		if err := json.Unmarshal([]byte(readinessJSON.String), revision.Readiness); err != nil {
+			return plan.Revision{}, fmt.Errorf("decode plan readiness: %w", err)
+		}
 	}
 	revision.CreatedAt, err = parseTime(createdAt)
 	if err != nil {

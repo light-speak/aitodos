@@ -7,7 +7,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/light-speak/aitodos/internal/domain/assessment"
@@ -45,6 +47,13 @@ type createTaskRequest struct {
 type updateTaskTitleRequest struct {
 	Title           string `json:"title"`
 	ExpectedVersion int64  `json:"expected_version"`
+}
+
+type updateTaskDetailsRequest struct {
+	Description        string `json:"description"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	Priority           int    `json:"priority"`
+	ExpectedVersion    int64  `json:"expected_version"`
 }
 
 type retryTaskRequest struct {
@@ -98,6 +107,9 @@ func RegisterTaskRoutes(
 	mux.HandleFunc("GET /api/tasks", handler.list)
 	mux.HandleFunc("GET /api/tasks/{taskID}", handler.get)
 	mux.HandleFunc("PUT /api/tasks/{taskID}/title", handler.updateTitle)
+	mux.HandleFunc("PUT /api/tasks/{taskID}/details", handler.updateDetails)
+	mux.HandleFunc("POST /api/tasks/{taskID}/cancel", handler.cancelTask)
+	mux.HandleFunc("POST /api/tasks/{taskID}/archive", handler.archiveTask)
 	mux.HandleFunc("POST /api/tasks/{taskID}/retry", handler.retry)
 	mux.HandleFunc("GET /api/tasks/{taskID}/messages", handler.listMessages)
 	mux.HandleFunc("POST /api/tasks/{taskID}/messages", handler.createMessage)
@@ -283,6 +295,50 @@ func (handler *taskHandler) updateTitle(response http.ResponseWriter, request *h
 	writeJSON(response, http.StatusOK, updated)
 }
 
+func (handler *taskHandler) updateDetails(response http.ResponseWriter, request *http.Request) {
+	var body updateTaskDetailsRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "Task 修改请求无效")
+		return
+	}
+	updated, err := handler.store.UpdateDetails(request.Context(), request.PathValue("taskID"), body.ExpectedVersion, task.UpdateDetailsInput{
+		Description: body.Description, AcceptanceCriteria: body.AcceptanceCriteria, Priority: body.Priority,
+	})
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
+}
+
+func (handler *taskHandler) cancelTask(response http.ResponseWriter, request *http.Request) {
+	var body retryTaskRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "Task 取消请求无效")
+		return
+	}
+	updated, err := handler.store.ApplyCommand(request.Context(), request.PathValue("taskID"), body.ExpectedVersion, task.CommandCancelTask)
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
+}
+
+func (handler *taskHandler) archiveTask(response http.ResponseWriter, request *http.Request) {
+	var body retryTaskRequest
+	if err := decodeJSON(response, request, &body); err != nil {
+		writeError(response, http.StatusBadRequest, "INVALID_REQUEST", "Task 归档请求无效")
+		return
+	}
+	updated, err := handler.store.Archive(request.Context(), request.PathValue("taskID"), body.ExpectedVersion)
+	if err != nil {
+		writeTaskError(response, err)
+		return
+	}
+	writeJSON(response, http.StatusOK, updated)
+}
+
 func (handler *taskHandler) listTopics(response http.ResponseWriter, request *http.Request) {
 	linked, err := handler.relations.ListTaskTopics(request.Context(), request.PathValue("taskID"))
 	if err != nil {
@@ -369,7 +425,7 @@ func (handler *taskHandler) createRelation(response http.ResponseWriter, request
 		writeError(response, http.StatusBadRequest, "INVALID_RELATION", "请选择要关联的 Task")
 		return
 	}
-	if err := handler.relations.LinkTasks(request.Context(), request.PathValue("taskID"), input.TaskID); err != nil {
+	if err := handler.relations.LinkTasksTyped(request.Context(), request.PathValue("taskID"), input.TaskID, input.Type); err != nil {
 		writeTaskError(response, err)
 		return
 	}
@@ -377,11 +433,15 @@ func (handler *taskHandler) createRelation(response http.ResponseWriter, request
 }
 
 func (handler *taskHandler) deleteRelation(response http.ResponseWriter, request *http.Request) {
-	if err := handler.relations.UnlinkTasks(
-		request.Context(),
-		request.PathValue("taskID"),
-		request.PathValue("relatedTaskID"),
-	); err != nil {
+	relationType := relation.Type(strings.ToUpper(strings.TrimSpace(request.URL.Query().Get("type"))))
+	if relationType == "" {
+		relationType = relation.TypeRelatesTo
+	}
+	sourceID, targetID := request.PathValue("taskID"), request.PathValue("relatedTaskID")
+	if request.URL.Query().Get("direction") == string(relation.DirectionIncoming) {
+		sourceID, targetID = targetID, sourceID
+	}
+	if err := handler.relations.UnlinkTaskRelation(request.Context(), sourceID, targetID, relationType); err != nil {
 		writeTaskError(response, err)
 		return
 	}
@@ -421,7 +481,13 @@ func (handler *taskHandler) create(response http.ResponseWriter, request *http.R
 }
 
 func (handler *taskHandler) list(response http.ResponseWriter, request *http.Request) {
-	tasks, err := handler.store.List(request.Context())
+	var tasks []task.Task
+	var err error
+	if request.URL.Query().Get("include_archived") == "true" {
+		tasks, err = handler.store.ListIncludingArchived(request.Context())
+	} else {
+		tasks, err = handler.store.List(request.Context())
+	}
 	if err != nil {
 		writeError(response, http.StatusInternalServerError, "TASK_LIST_FAILED", "读取 Task 列表失败")
 		return
@@ -468,6 +534,8 @@ func writeTaskError(response http.ResponseWriter, err error) {
 		writeError(response, http.StatusBadRequest, "INVALID_RELATION", "Task 不能关联自身")
 	case errors.Is(err, storage.ErrTaskFeedbackConflict):
 		writeError(response, http.StatusConflict, "TASK_FEEDBACK_CONFLICT", "当前反馈状态不允许该操作，请刷新后重试")
+	case errors.Is(err, storage.ErrTaskArchiveState), errors.Is(err, storage.ErrTaskEditState):
+		writeError(response, http.StatusConflict, "TASK_COMMAND_CONFLICT", err.Error())
 	default:
 		var transitionErr *task.TransitionError
 		if errors.As(err, &transitionErr) {
@@ -479,6 +547,10 @@ func writeTaskError(response http.ResponseWriter, err error) {
 }
 
 func decodeJSON(response http.ResponseWriter, request *http.Request, destination any) error {
+	mediaType, _, err := mime.ParseMediaType(request.Header.Get("Content-Type"))
+	if err != nil || mediaType != "application/json" {
+		return errors.New("content type must be application/json")
+	}
 	request.Body = http.MaxBytesReader(response, request.Body, maxRequestBodyBytes)
 	decoder := json.NewDecoder(request.Body)
 	decoder.DisallowUnknownFields()

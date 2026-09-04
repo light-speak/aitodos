@@ -8,6 +8,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/light-speak/aitodos/internal/storage"
 )
 
 func TestInitializeCreatesProjectLocalState(t *testing.T) {
@@ -120,6 +122,44 @@ func TestWorkerSettingsPersistInLocalConfig(t *testing.T) {
 	}
 	if settings := loaded.WorkerSettings(); !settings.Enabled || settings.MaxWorkers != 3 {
 		t.Fatalf("reloaded worker settings = %#v", settings)
+	}
+	if loaded.AgentAdapter() != "" {
+		t.Fatalf("AgentAdapter() = %q", loaded.AgentAdapter())
+	}
+}
+
+func TestLoadRejectsUnsupportedConfigVersionAndGitIdentityMismatch(t *testing.T) {
+	repoRoot := initGitRepository(t)
+	initialized, _, err := Initialize(context.Background(), repoRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	projectConfig, err := os.ReadFile(initialized.Paths.ProjectConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(initialized.Paths.ProjectConfig, []byte(strings.Replace(string(projectConfig), "version = 1", "version = 2", 1)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(context.Background(), repoRoot); err == nil || !strings.Contains(err.Error(), "配置版本") {
+		t.Fatalf("Load() error = %v, want unsupported config version", err)
+	}
+	if err := os.WriteFile(initialized.Paths.ProjectConfig, projectConfig, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	database, err := storage.OpenExisting(context.Background(), initialized.Paths.Database)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE project_metadata SET git_common_dir = '/different/.git' WHERE id = 1"); err != nil {
+		database.Close()
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(context.Background(), repoRoot); err == nil || !strings.Contains(err.Error(), "Git 身份不匹配") {
+		t.Fatalf("Load() error = %v, want Git identity mismatch", err)
 	}
 }
 
@@ -239,7 +279,7 @@ func assertDatabaseInitialized(t *testing.T, databasePath string, instanceID str
 	if err := database.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
 		t.Fatalf("read schema version: %v", err)
 	}
-	if version != 33 {
-		t.Fatalf("schema version = %d, want 33", version)
+	if version != 45 {
+		t.Fatalf("schema version = %d, want 45", version)
 	}
 }

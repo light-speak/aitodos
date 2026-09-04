@@ -1,9 +1,9 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { ActivityIcon, RefreshCwIcon, TerminalIcon } from 'lucide-react'
 
-import { errorMessage, retryTask } from '../api/client'
+import { ApiError, errorMessage, getRunExperiences, getRunMCPCalls, getRunResources, getRunSummary, recordExperienceOutcome, retryTask } from '../api/client'
 import { useTaskRuns } from '../features/runs/useTaskRuns'
-import type { AgentRun, RunArtifact, RunLog, RunStatus, RunUsage, Task } from '../types'
+import type { AgentRun, ExperienceOutcome, ExperienceRecall, MCPAuditEvent, RunArtifact, RunClosure, RunLog, RunResourceLease, RunStatus, RunSummary, RunUsage, Task } from '../types'
 import { Badge } from './ui/badge'
 import { Button } from './ui/button'
 import { Dialog, DialogContent, DialogDescription, DialogHeader, DialogTitle } from './ui/dialog'
@@ -128,6 +128,7 @@ function RunDetailContent({ state }: { state: RunPanelState }) {
 				{run.failure_kind ? <Detail label="失败类型" value={run.failure_kind} mono /> : null}
 				{run.failure_message ? <div className="sm:col-span-2"><Detail label="失败信息" value={run.failure_message} /></div> : null}
 			</div>
+			{detail.closure ? <RunClosurePanel closure={detail.closure} /> : null}
 			{detail.workspace_snapshot ? (
 				<div className="rounded-xl border p-4">
 					<h4 className="mb-3 text-sm font-semibold">Workspace Finalization</h4>
@@ -140,9 +141,78 @@ function RunDetailContent({ state }: { state: RunPanelState }) {
 				</div>
 			) : null}
 			{detail.usage ? <UsageSummary usage={detail.usage} /> : null}
+			<RunObservability run={run} />
 			<RunLogs artifacts={detail.artifacts} state={state} />
 		</div>
 	)
+}
+
+function RunClosurePanel({ closure }: { closure: RunClosure }) {
+	const reached = closure.stop_reason === 'GOAL_REACHED'
+	return <div className={`rounded-xl border p-4 ${reached ? 'border-emerald-200 bg-emerald-50/50' : 'border-amber-200 bg-amber-50/50'}`}>
+		<div className="flex flex-wrap items-center gap-2"><h4 className="text-sm font-semibold">诚实收口</h4><Badge variant="outline">{stopReasonLabel(closure.stop_reason)}</Badge></div>
+		<p className="mt-2 text-sm">{closure.summary}</p>
+		<div className="mt-3 grid gap-3 sm:grid-cols-2">
+			{closure.completed.length > 0 ? <ClosureList label="已完成" items={closure.completed} /> : null}
+			{closure.verified.length > 0 ? <div><p className="text-xs text-muted-foreground">已验证</p><ul className="mt-1 grid gap-1 text-xs">{closure.verified.map((item) => <li key={`${item.claim}:${item.evidence}`}><span className="font-medium">{item.claim}</span><span className="block text-muted-foreground">{item.evidence}</span></li>)}</ul></div> : null}
+			{closure.unverified.length > 0 ? <ClosureList label="未验证" items={closure.unverified} /> : null}
+			{closure.remaining_risks.length > 0 ? <ClosureList label="剩余风险" items={closure.remaining_risks} /> : null}
+		</div>
+		{closure.next_action ? <p className="mt-3 text-xs"><span className="text-muted-foreground">下一步：</span>{closure.next_action}</p> : null}
+	</div>
+}
+
+function ClosureList({ label, items }: { label: string; items: string[] }) {
+	return <div><p className="text-xs text-muted-foreground">{label}</p><ul className="mt-1 list-disc space-y-1 pl-4 text-xs">{items.map((item) => <li key={item}>{item}</li>)}</ul></div>
+}
+
+function stopReasonLabel(reason: RunClosure['stop_reason']): string {
+	return ({
+		GOAL_REACHED: '达到目标', DISCUSSION_REQUIRED: '需要继续讨论', NEEDS_INPUT: '等待回答',
+		ENVIRONMENT_BLOCKED: '环境阻塞', POLICY_BLOCKED: '权限阻塞', LIMIT_REACHED: '达到本轮边界',
+		PROCESS_FAILED: '执行失败', CANCELLED: '已取消', TIMED_OUT: '已超时', LOST: '状态丢失',
+	})[reason]
+}
+
+function RunObservability({ run }: { run: AgentRun }) {
+	const [data, setData] = useState<{ summary?: RunSummary; calls: MCPAuditEvent[]; resources: RunResourceLease[]; experiences: ExperienceRecall[] } | null>(null)
+	const [error, setError] = useState<unknown>(null)
+	useEffect(() => {
+		const controller = new AbortController()
+		const summary = getRunSummary(run.id, controller.signal).catch((cause: unknown) => {
+			if (cause instanceof ApiError && cause.status === 404) return undefined
+			throw cause
+		})
+		void Promise.all([summary, getRunMCPCalls(run.id, controller.signal), getRunResources(run.id, controller.signal), getRunExperiences(run.id, controller.signal)]).then(
+			([runSummary, calls, resources, experiences]) => setData({ ...(runSummary ? { summary: runSummary } : {}), calls, resources, experiences }),
+			(cause: unknown) => { if (!controller.signal.aborted) setError(cause) },
+		)
+		return () => controller.abort()
+	}, [run.id])
+	if (error) return <p className="rounded-lg border border-destructive/20 bg-destructive/5 p-3 text-sm text-destructive" role="alert">无法读取 Run 审计：{errorMessage(error)}</p>
+	if (data === null) return <p className="text-sm text-muted-foreground">正在读取 Run 摘要与工具审计…</p>
+	async function recordOutcome(recallID: string, outcome: Exclude<ExperienceOutcome, 'PENDING'>) {
+		setError(null)
+		try {
+			await recordExperienceOutcome(recallID, outcome)
+			setData((current) => current === null ? current : {
+				...current, experiences: current.experiences.map((item) => item.recall_id === recallID ? { ...item, outcome } : item),
+			})
+		} catch (cause: unknown) {
+			setError(cause)
+		}
+	}
+	return <div className="rounded-xl border p-4">
+		<h4 className="mb-3 text-sm font-semibold">摘要、经验与 MCP 审计</h4>
+		{data.summary ? <p className="text-sm">{data.summary.summary} · 测试通过 {data.summary.passed_tests}，失败 {data.summary.failed_tests}</p> : <p className="text-sm text-muted-foreground">Run 完成后生成确定性摘要。</p>}
+		{data.experiences.length > 0 ? <div className="mt-4"><p className="text-xs font-medium">本次召回经验</p><ul className="mt-2 space-y-2">{data.experiences.map((item) => <li key={item.recall_id} className="rounded-lg bg-muted/40 p-3 text-xs"><div className="flex flex-wrap items-center gap-2"><span className="font-medium">{item.experience.title}</span><Badge variant="outline">匹配 {Math.round(item.score.final_score * 100)}%</Badge><span className="text-muted-foreground">{item.experience.summary}</span></div><div className="mt-2 flex flex-wrap items-center gap-1"><span className="mr-1 text-muted-foreground">这条经验：</span>{(['HELPFUL', 'IGNORED', 'HARMFUL'] as const).map((outcome) => <Button key={outcome} type="button" size="sm" variant={item.outcome === outcome ? 'secondary' : 'ghost'} onClick={() => { void recordOutcome(item.recall_id, outcome) }}>{experienceOutcomeLabel(outcome)}</Button>)}</div></li>)}</ul></div> : <p className="mt-3 text-xs text-muted-foreground">本次 Run 没有召回项目经验。</p>}
+		{data.calls.length > 0 ? <ul className="mt-3 space-y-1 text-xs">{data.calls.map((call) => <li key={call.id} className="flex flex-wrap items-center gap-2"><Badge variant="outline">{call.phase}</Badge><span className="font-mono">{call.server_name}/{call.tool_name}</span><span className="text-muted-foreground">参数字段：{call.argument_keys.join(', ') || '无'}</span></li>)}</ul> : <p className="mt-3 text-xs text-muted-foreground">本次 Run 没有可观测的 MCP 调用。</p>}
+		{data.resources.map((resource) => <p key={resource.id} className={`mt-2 text-xs ${resource.state === 'ABANDONED' ? 'text-destructive' : 'text-muted-foreground'}`}>浏览器资源 {resource.provider_name}：{resource.state}{resource.cleanup_reason ? ` · ${resource.cleanup_reason}` : ''}</p>)}
+	</div>
+}
+
+function experienceOutcomeLabel(outcome: Exclude<ExperienceOutcome, 'PENDING'>): string {
+	return ({ HELPFUL: '有帮助', IGNORED: '无关', HARMFUL: '造成误导' })[outcome]
 }
 
 function UsageSummary({ usage }: { usage: RunUsage }) {

@@ -2,6 +2,7 @@ package storage
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/agentprofile"
@@ -96,5 +97,79 @@ func TestAgentProfileStoreCreatesImmutableRevision(t *testing.T) {
 	}
 	if history[1].Instructions != profile.CurrentRevision.Instructions {
 		t.Fatal("creating revision changed revision 1")
+	}
+	loadedRevision, err := store.GetRevision(ctx, created.CurrentRevision.ID)
+	if err != nil || loadedRevision.ID != created.CurrentRevision.ID || len(loadedRevision.ToolPolicy.Skills) != 1 {
+		t.Fatalf("GetRevision() = %#v, %v", loadedRevision, err)
+	}
+	if _, err := store.GetRevision(ctx, "missing"); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing GetRevision() error = %v", err)
+	}
+}
+
+func TestAgentProfileStoreConfiguresAllUnconfiguredCodexProfilesAtomically(t *testing.T) {
+	ctx := context.Background()
+	store := NewAgentProfileStore(openTaskTestDatabase(t))
+
+	configured, err := store.ConfigureCodexDefaults(ctx, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configured) != 5 {
+		t.Fatalf("profiles = %d", len(configured))
+	}
+	for _, profile := range configured {
+		revision := profile.CurrentRevision
+		if revision.Revision != 2 || revision.Adapter != "codex-app-server" || revision.Command != "codex" || revision.Model != "" {
+			t.Fatalf("configured profile = %#v", profile)
+		}
+	}
+
+	again, err := store.ConfigureCodexDefaults(ctx, "codex")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, profile := range again {
+		if profile.CurrentRevision.Revision != 2 {
+			t.Fatalf("idempotent profile = %#v", profile)
+		}
+	}
+	if _, err := store.ConfigureCodexDefaults(ctx, ""); err == nil {
+		t.Fatal("empty command accepted")
+	}
+}
+
+func TestAgentProfileStoreReturnsErrorsAfterDatabaseClose(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	store := NewAgentProfileStore(database)
+	if _, err := store.Get(ctx, "missing"); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing profile error = %v", err)
+	}
+	if _, err := store.GetByRole(ctx, agentprofile.Role("UNKNOWN")); err != ErrAgentProfileNotFound {
+		t.Fatalf("missing role error = %v", err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	calls := []func() error{
+		func() error { _, err := store.List(ctx); return err },
+		func() error { _, err := store.GetByRole(ctx, agentprofile.RolePlanner); return err },
+		func() error { _, err := store.Get(ctx, "profile"); return err },
+		func() error { _, err := store.GetRevision(ctx, "revision"); return err },
+		func() error {
+			_, err := store.CreateRevision(ctx, "profile", agentprofile.RevisionInput{
+				Instructions: "职责", Adapter: "generic", Command: "agent",
+				MaxInputTokens: 1000, ReservedOutputTokens: 100, RecentMessageLimit: 1, RetrievalLimit: 1, TimeoutSeconds: 60,
+			})
+			return err
+		},
+		func() error { _, err := store.ConfigureCodexDefaults(ctx, "codex"); return err },
+		func() error { _, err := store.ListRevisions(ctx, "profile"); return err },
+	}
+	for index, call := range calls {
+		if err := call(); err == nil || strings.TrimSpace(err.Error()) == "" {
+			t.Fatalf("closed database call %d error = %v", index, err)
+		}
 	}
 }

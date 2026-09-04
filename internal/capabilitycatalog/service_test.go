@@ -107,6 +107,77 @@ func TestServiceRequiresRegisteredCodexMCP(t *testing.T) {
 	}
 }
 
+func TestServiceListsCatalogAndReadsAbsoluteSkill(t *testing.T) {
+	root := t.TempDir()
+	skillDirectory := filepath.Join(root, "skill")
+	if err := os.MkdirAll(skillDirectory, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	content := []byte("# Review\n\n只读检查。\n")
+	if err := os.WriteFile(filepath.Join(skillDirectory, "SKILL.md"), content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	service := New(root, "codex", storage.NewCapabilityStore(openCatalogDatabase(t, root)))
+	created, err := service.AddSkill(context.Background(), capability.SkillInput{Name: "审查", SourcePath: skillDirectory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	read, hash, err := ReadSkillContent(root, skillDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(read) != string(content) || hash != created.ContentSHA256 {
+		t.Fatalf("read = %q, hash = %q", read, hash)
+	}
+	catalog, err := service.List(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(catalog.Skills) != 1 || catalog.Skills[0].ID != created.ID {
+		t.Fatalf("catalog = %#v", catalog)
+	}
+}
+
+func TestServiceRejectsInvalidSkillFilesAndMissingCodexCommand(t *testing.T) {
+	root := t.TempDir()
+	store := storage.NewCapabilityStore(openCatalogDatabase(t, root))
+	service := New(root, "", store)
+	if _, err := service.AddMCPServer(context.Background(), capability.MCPServerInput{
+		Name: "浏览器", ConfigName: "playwright",
+	}); err == nil {
+		t.Fatal("AddMCPServer() should require a Codex command")
+	}
+
+	regularFile := filepath.Join(root, "not-a-directory")
+	if err := os.WriteFile(regularFile, []byte("content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	for _, sourcePath := range []string{"missing", regularFile} {
+		if _, err := service.AddSkill(context.Background(), capability.SkillInput{Name: "无效", SourcePath: sourcePath}); err == nil {
+			t.Fatalf("AddSkill(%q) should fail", sourcePath)
+		}
+	}
+
+	tooLarge := filepath.Join(root, "too-large")
+	if err := os.Mkdir(tooLarge, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.Create(filepath.Join(tooLarge, "SKILL.md"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Truncate(maxSkillBytes + 1); err != nil {
+		file.Close()
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := service.AddSkill(context.Background(), capability.SkillInput{Name: "过大", SourcePath: tooLarge}); err == nil {
+		t.Fatal("AddSkill() should reject an oversized SKILL.md")
+	}
+}
+
 func openCatalogDatabase(t *testing.T, root string) *sql.DB {
 	t.Helper()
 	database, err := storage.Open(context.Background(), filepath.Join(root, ".ats", "state.db"), storage.ProjectMetadata{

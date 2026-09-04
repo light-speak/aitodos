@@ -29,6 +29,9 @@ func TestTransitionAllowsDocumentedCommands(t *testing.T) {
 		{name: "answer implementation clarification", current: StatusBlocked, command: CommandResumeImplementation, want: StatusReady},
 		{name: "answer revision clarification", current: StatusBlocked, command: CommandResumeRevision, want: StatusChangesRequested},
 		{name: "sync accepted task with target", current: StatusAccepted, command: CommandSyncTarget, want: StatusChangesRequested},
+		{name: "revise accepted task", current: StatusAccepted, command: CommandRequestChanges, want: StatusChangesRequested},
+		{name: "cancel ready task", current: StatusReady, command: CommandCancelTask, want: StatusCancelled},
+		{name: "cancel blocked task", current: StatusBlocked, command: CommandCancelTask, want: StatusCancelled},
 	}
 
 	for _, test := range tests {
@@ -63,6 +66,11 @@ func TestTransitionRejectsEveryUndocumentedCombination(t *testing.T) {
 		{string(StatusBlocked), string(CommandResumeImplementation)}:    true,
 		{string(StatusBlocked), string(CommandResumeRevision)}:          true,
 		{string(StatusAccepted), string(CommandSyncTarget)}:             true,
+		{string(StatusAccepted), string(CommandRequestChanges)}:         true,
+		{string(StatusReady), string(CommandCancelTask)}:                true,
+		{string(StatusReview), string(CommandCancelTask)}:               true,
+		{string(StatusChangesRequested), string(CommandCancelTask)}:     true,
+		{string(StatusBlocked), string(CommandCancelTask)}:              true,
 	}
 
 	for _, status := range AllStatuses() {

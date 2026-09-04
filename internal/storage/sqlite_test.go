@@ -54,8 +54,8 @@ func TestOpenEnablesRequiredPragmasAndMigrates(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 33 {
-		t.Fatalf("schema version = %d, want 33", version)
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 }
 
@@ -217,8 +217,8 @@ CREATE TABLE schema_migrations (
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != 33 {
-		t.Fatalf("schema version = %d, want 33", version)
+	if version != currentSchemaVersion {
+		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
 	}
 	if _, err := NewTopicStore(upgraded).Create(ctx, topic.CreateInput{Title: "迁移后的 Topic"}); err != nil {
 		t.Fatalf("create Topic after migration: %v", err)
@@ -272,7 +272,7 @@ CREATE TABLE schema_migrations (
 	if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").Scan(&artifactTable); err != nil {
 		t.Fatalf("find artifacts table: %v", err)
 	}
-	for _, table := range []string{"message_task_links", "topic_task_links", "task_links"} {
+	for _, table := range []string{"message_task_links", "topic_task_links", "task_relations"} {
 		var name string
 		if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name); err != nil {
 			t.Fatalf("find table %s: %v", table, err)

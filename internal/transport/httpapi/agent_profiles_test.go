@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -74,6 +75,64 @@ func TestAgentProfileRoutesRejectPermissionOverride(t *testing.T) {
 			"timeout_seconds":3600,
 			"workspace_policy":"WRITE_TASK"
 		}`, http.StatusBadRequest)
+}
+
+func TestAgentProfileRoutesConfigureCodexDefaults(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterAgentProfileRoutes(mux, storage.NewAgentProfileStore(database), func(command string) (string, error) {
+		if command != "codex" {
+			t.Fatalf("probe command = %q", command)
+		}
+		return "/usr/local/bin/codex", nil
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/agent-profiles/configure-codex", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	var profiles []agentprofile.Profile
+	if err := json.NewDecoder(response.Body).Decode(&profiles); err != nil {
+		t.Fatal(err)
+	}
+	if len(profiles) != 5 || profiles[0].CurrentRevision.Command != "/usr/local/bin/codex" {
+		t.Fatalf("profiles = %#v", profiles)
+	}
+}
+
+func TestAgentProfileRoutesReportMissingCodex(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	mux := http.NewServeMux()
+	RegisterAgentProfileRoutes(mux, storage.NewAgentProfileStore(database), func(string) (string, error) {
+		return "", errors.New("missing")
+	})
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	request, err := http.NewRequest(http.MethodPost, server.URL+"/api/agent-profiles/configure-codex", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response, err := server.Client().Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusConflict {
+		t.Fatalf("status = %d", response.StatusCode)
+	}
+	requestAgentProfile(t, server.Client(), http.MethodPost,
+		server.URL+"/api/agent-profiles/profile-planner/revisions", `{`, http.StatusBadRequest)
 }
 
 func requestAgentProfiles(t *testing.T, client *http.Client, url string) []agentprofile.Profile {

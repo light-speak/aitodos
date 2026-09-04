@@ -44,6 +44,7 @@ type Task struct {
 	Version                int64       `json:"version"`
 	CreatedAt              time.Time   `json:"created_at"`
 	UpdatedAt              time.Time   `json:"updated_at"`
+	ArchivedAt             *time.Time  `json:"archived_at,omitempty"`
 }
 
 // CreateInput 是创建 Task 时允许由用户提供的字段。
@@ -61,6 +62,32 @@ type CreateInput struct {
 // UpdateTitleInput 是人工锁定标题的领域输入。
 type UpdateTitleInput struct {
 	Title string `json:"title"`
+}
+
+// UpdateDetailsInput 是人工修订 Task 执行输入的领域命令。
+type UpdateDetailsInput struct {
+	Description        string `json:"description"`
+	AcceptanceCriteria string `json:"acceptance_criteria"`
+	Priority           int    `json:"priority"`
+}
+
+// Normalized 清理 Task 执行输入。
+func (input UpdateDetailsInput) Normalized() UpdateDetailsInput {
+	input.Description = strings.TrimSpace(input.Description)
+	input.AcceptanceCriteria = strings.TrimSpace(input.AcceptanceCriteria)
+	return input
+}
+
+// Validate 校验 Task 执行输入规模。
+func (input UpdateDetailsInput) Validate() error {
+	input = input.Normalized()
+	if utf8.RuneCountInString(input.Description) > 20000 || utf8.RuneCountInString(input.AcceptanceCriteria) > 20000 {
+		return errors.New("description and acceptance criteria must not exceed 20000 characters")
+	}
+	if input.Priority < 0 || input.Priority > 3 {
+		return errors.New("priority must be between P0 and P3")
+	}
+	return nil
 }
 
 // UpdateTargetBranchInput 是 Workspace 创建前允许修改的目标分支。
@@ -163,6 +190,10 @@ const (
 	EventTitleChanged EventType = "TASK_TITLE_CHANGED"
 	// EventTargetBranchChanged 表示 Workspace 创建前更换了目标分支。
 	EventTargetBranchChanged EventType = "TASK_TARGET_BRANCH_CHANGED"
+	// EventDetailsChanged 表示人工修订了描述、验收标准或优先级。
+	EventDetailsChanged EventType = "TASK_DETAILS_CHANGED"
+	// EventArchived 表示终态 Task 已从默认工作视图归档。
+	EventArchived EventType = "TASK_ARCHIVED"
 )
 
 // Event 是 Task 聚合内按序追加的审计记录。

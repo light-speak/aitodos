@@ -32,16 +32,40 @@ type Plan struct {
 
 // Revision 是创建后不可修改的计划内容快照。
 type Revision struct {
-	ID                 string      `json:"id"`
-	PlanID             string      `json:"plan_id"`
-	Revision           int64       `json:"revision"`
-	Summary            string      `json:"summary"`
-	Rationale          string      `json:"rationale"`
-	Risks              string      `json:"risks"`
-	SourceRunID        string      `json:"source_run_id,omitempty"`
-	PreviousRevisionID string      `json:"previous_revision_id,omitempty"`
-	Drafts             []TaskDraft `json:"drafts"`
-	CreatedAt          time.Time   `json:"created_at"`
+	ID                 string               `json:"id"`
+	PlanID             string               `json:"plan_id"`
+	Revision           int64                `json:"revision"`
+	Summary            string               `json:"summary"`
+	Rationale          string               `json:"rationale"`
+	Risks              string               `json:"risks"`
+	Readiness          *ReadinessAssessment `json:"readiness,omitempty"`
+	SourceRunID        string               `json:"source_run_id,omitempty"`
+	PreviousRevisionID string               `json:"previous_revision_id,omitempty"`
+	Drafts             []TaskDraft          `json:"drafts"`
+	CreatedAt          time.Time            `json:"created_at"`
+}
+
+// ReadinessStatus 表示 Planner 是否已有足够信息提交方案审核。
+type ReadinessStatus string
+
+const (
+	ReadinessNeedsDiscussion ReadinessStatus = "NEEDS_DISCUSSION"
+	ReadinessReadyForReview  ReadinessStatus = "READY_FOR_REVIEW"
+)
+
+// Alternative 记录形成方案前实际考虑过的可行方向及其取舍。
+type Alternative struct {
+	Title    string `json:"title"`
+	Tradeoff string `json:"tradeoff"`
+}
+
+// ReadinessAssessment 保存 Planner 对收敛充分度的结构化判断。
+type ReadinessAssessment struct {
+	Status        ReadinessStatus `json:"status"`
+	Confidence    float64         `json:"confidence"`
+	Assumptions   []string        `json:"assumptions"`
+	OpenQuestions []string        `json:"open_questions"`
+	Alternatives  []Alternative   `json:"alternatives"`
 }
 
 // TaskDraft 是 Plan Revision 中尚不可执行的 Task 草案。
@@ -79,8 +103,9 @@ type RevisionInput struct {
 // PlanningResult 是规划 Agent 一轮讨论后提交的结构化结果。
 // Reply 始终写回 Topic；Plan 仅在信息充分时提供，并继续等待人工批准。
 type PlanningResult struct {
-	Reply string         `json:"reply"`
-	Plan  *RevisionInput `json:"plan,omitempty"`
+	Reply     string               `json:"reply"`
+	Readiness *ReadinessAssessment `json:"readiness"`
+	Plan      *RevisionInput       `json:"plan,omitempty"`
 }
 
 // Validate 校验 Agent 回复和可选方案草案。
@@ -88,6 +113,18 @@ func (result PlanningResult) Validate() error {
 	result = result.Normalized()
 	if result.Reply == "" || utf8.RuneCountInString(result.Reply) > 20000 {
 		return errors.New("planning reply 不能为空且最长 20000 个字符")
+	}
+	if result.Readiness == nil {
+		return errors.New("planning readiness 不能为空")
+	}
+	if err := result.Readiness.Validate(); err != nil {
+		return err
+	}
+	if result.Plan == nil && result.Readiness.Status != ReadinessNeedsDiscussion {
+		return errors.New("没有 Plan 时 readiness 必须为 NEEDS_DISCUSSION")
+	}
+	if result.Plan != nil && result.Readiness.Status != ReadinessReadyForReview {
+		return errors.New("提交 Plan 时 readiness 必须为 READY_FOR_REVIEW")
 	}
 	if result.Plan != nil {
 		return result.Plan.Validate()
@@ -98,11 +135,80 @@ func (result PlanningResult) Validate() error {
 // Normalized 清理规划结果文本。
 func (result PlanningResult) Normalized() PlanningResult {
 	result.Reply = strings.TrimSpace(result.Reply)
+	if result.Readiness != nil {
+		normalized := result.Readiness.Normalized()
+		result.Readiness = &normalized
+	}
 	if result.Plan != nil {
 		normalized := result.Plan.Normalized()
 		result.Plan = &normalized
 	}
 	return result
+}
+
+// Validate 校验充分度判断必须与未决问题一致。
+func (assessment ReadinessAssessment) Validate() error {
+	assessment = assessment.Normalized()
+	if assessment.Status != ReadinessNeedsDiscussion && assessment.Status != ReadinessReadyForReview {
+		return errors.New("planning readiness status 无效")
+	}
+	if assessment.Confidence <= 0 || assessment.Confidence > 1 {
+		return errors.New("planning readiness confidence 必须大于 0 且不超过 1")
+	}
+	if err := validateReadinessStrings(assessment.Assumptions, "assumptions"); err != nil {
+		return err
+	}
+	if err := validateReadinessStrings(assessment.OpenQuestions, "open_questions"); err != nil {
+		return err
+	}
+	if assessment.Status == ReadinessNeedsDiscussion && len(assessment.OpenQuestions) == 0 {
+		return errors.New("NEEDS_DISCUSSION 必须列出未决问题")
+	}
+	if assessment.Status == ReadinessReadyForReview && len(assessment.OpenQuestions) > 0 {
+		return errors.New("READY_FOR_REVIEW 不能保留阻塞性未决问题")
+	}
+	if len(assessment.Alternatives) > 10 {
+		return errors.New("alternatives 最多 10 项")
+	}
+	for _, alternative := range assessment.Alternatives {
+		if alternative.Title == "" || alternative.Tradeoff == "" || utf8.RuneCountInString(alternative.Title) > 200 || utf8.RuneCountInString(alternative.Tradeoff) > 1000 {
+			return errors.New("alternative 标题和取舍不能为空且不能超过长度限制")
+		}
+	}
+	return nil
+}
+
+// Normalized 清理充分度判断中的文本。
+func (assessment ReadinessAssessment) Normalized() ReadinessAssessment {
+	assessment.Assumptions = normalizeReadinessStrings(assessment.Assumptions)
+	assessment.OpenQuestions = normalizeReadinessStrings(assessment.OpenQuestions)
+	for index := range assessment.Alternatives {
+		assessment.Alternatives[index].Title = strings.TrimSpace(assessment.Alternatives[index].Title)
+		assessment.Alternatives[index].Tradeoff = strings.TrimSpace(assessment.Alternatives[index].Tradeoff)
+	}
+	return assessment
+}
+
+func normalizeReadinessStrings(values []string) []string {
+	result := make([]string, 0, len(values))
+	for _, value := range values {
+		if normalized := strings.TrimSpace(value); normalized != "" {
+			result = append(result, normalized)
+		}
+	}
+	return result
+}
+
+func validateReadinessStrings(values []string, field string) error {
+	if len(values) > 20 {
+		return errors.New(field + " 最多 20 项")
+	}
+	for _, value := range values {
+		if utf8.RuneCountInString(value) > 1000 {
+			return errors.New(field + " 单项最长 1000 个字符")
+		}
+	}
+	return nil
 }
 
 // TaskDraftInput 是待审核 Task 草案输入。

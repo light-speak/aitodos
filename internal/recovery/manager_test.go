@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"os/exec"
 	"strings"
 	"testing"
@@ -48,6 +49,117 @@ func TestStartLeavesIdentityMatchedRunnerActive(t *testing.T) {
 	current, err := storage.NewRunStore(database).Get(context.Background(), claim.Run.ID)
 	if err != nil || current.Status != run.StatusRunning {
 		t.Fatalf("live run = %#v, %v", current, err)
+	}
+}
+
+func TestStartTerminatesTrackedAgentAndReleasesBrowserResources(t *testing.T) {
+	currentProject, database, claim := recoveryRun(t)
+	store := storage.NewRunStore(database)
+	identity := strings.Repeat("b", 64)
+	if err := store.AttachAgentProcess(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 456, identity); err != nil {
+		t.Fatal(err)
+	}
+	audit := storage.NewMCPAuditStore(database)
+	if _, err := audit.OpenResourceLease(context.Background(), claim.Run.ID, "BROWSER_SESSION", "playwright"); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(currentProject, database)
+	manager.matchesProcess = func(context.Context, int, string) bool { return false }
+	terminated := false
+	manager.terminateAgent = func(_ context.Context, pid int, expected string) error {
+		terminated = pid == 456 && expected == identity
+		return nil
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := audit.ListRunResourceLeases(context.Background(), claim.Run.ID)
+	if err != nil || !terminated || len(leases) != 1 || leases[0].State != "RELEASED" {
+		t.Fatalf("terminated=%v leases=%#v err=%v", terminated, leases, err)
+	}
+}
+
+func TestReconcileTrackedMarksRunnerLostAfterItExits(t *testing.T) {
+	currentProject, database, claim := recoveryRun(t)
+	alive := true
+	manager := New(currentProject, database)
+	manager.matchesProcess = func(context.Context, int, string) bool { return alive }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(manager.tracked) != 1 {
+		t.Fatalf("tracked = %#v", manager.tracked)
+	}
+	alive = false
+	manager.reconcileTracked(context.Background())
+	if len(manager.tracked) != 0 {
+		t.Fatalf("tracked after exit = %#v", manager.tracked)
+	}
+	loaded, err := storage.NewRunStore(database).Get(context.Background(), claim.Run.ID)
+	if err != nil || loaded.Status != run.StatusLost {
+		t.Fatalf("run = %#v, %v", loaded, err)
+	}
+}
+
+func TestStartMarksFinalizationRecoveryFailureLost(t *testing.T) {
+	currentProject, database, claim := recoveryRun(t)
+	store := storage.NewRunStore(database)
+	if _, err := store.MarkFinalizing(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(currentProject, database)
+	manager.matchesProcess = func(context.Context, int, string) bool { return false }
+	manager.recoverFinalization = func(context.Context, *project.Project, *sql.DB, storage.RecoveryRun) error {
+		return errors.New("artifact unavailable")
+	}
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := store.Get(context.Background(), claim.Run.ID)
+	if err != nil || loaded.Status != run.StatusLost || loaded.FailureCode != "FINALIZATION_RECOVERY_FAILED" {
+		t.Fatalf("run = %#v, %v", loaded, err)
+	}
+}
+
+func TestAgentCleanupFailureAbandonsBrowserResource(t *testing.T) {
+	currentProject, database, claim := recoveryRun(t)
+	store := storage.NewRunStore(database)
+	identity := strings.Repeat("b", 64)
+	if err := store.AttachAgentProcess(context.Background(), claim.Run.ID, claim.ClaimToken, claim.Run.LeaseGeneration, 456, identity); err != nil {
+		t.Fatal(err)
+	}
+	audit := storage.NewMCPAuditStore(database)
+	if _, err := audit.OpenResourceLease(context.Background(), claim.Run.ID, "BROWSER_SESSION", "playwright"); err != nil {
+		t.Fatal(err)
+	}
+	manager := New(currentProject, database)
+	manager.matchesProcess = func(context.Context, int, string) bool { return false }
+	manager.terminateAgent = func(context.Context, int, string) error { return errors.New("identity mismatch") }
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	leases, err := audit.ListRunResourceLeases(context.Background(), claim.Run.ID)
+	if err != nil || len(leases) != 1 || leases[0].State != "ABANDONED" {
+		t.Fatalf("leases = %#v, %v", leases, err)
+	}
+	loaded, err := store.Get(context.Background(), claim.Run.ID)
+	if err != nil || !strings.Contains(loaded.FailureMessage, "Agent 资源未能确认关闭") {
+		t.Fatalf("run = %#v, %v", loaded, err)
+	}
+}
+
+func TestIsActive(t *testing.T) {
+	for _, status := range []run.Status{run.StatusClaimed, run.StatusStarting, run.StatusRunning, run.StatusFinalizing} {
+		if !isActive(status) {
+			t.Fatalf("isActive(%q) = false", status)
+		}
+	}
+	for _, status := range []run.Status{run.StatusSucceeded, run.StatusFailed, run.StatusLost, run.StatusCancelled} {
+		if isActive(status) {
+			t.Fatalf("isActive(%q) = true", status)
+		}
 	}
 }
 

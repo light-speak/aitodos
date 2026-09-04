@@ -169,6 +169,32 @@ INSERT INTO runs(
 	t.Cleanup(server.Close)
 
 	assertRunResponseContains(t, server.URL+"/api/runs?status=RUNNING&purpose=IMPLEMENTATION&limit=1", `"id":"run-cancel"`)
+	pageResponse, err := server.Client().Get(server.URL + "/api/runs?limit=1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var firstPage runPage
+	if err := json.NewDecoder(pageResponse.Body).Decode(&firstPage); err != nil {
+		pageResponse.Body.Close()
+		t.Fatal(err)
+	}
+	pageResponse.Body.Close()
+	if len(firstPage.Items) != 1 || firstPage.NextCursor == "" {
+		t.Fatalf("first page = %#v", firstPage)
+	}
+	nextResponse, err := server.Client().Get(server.URL + "/api/runs?limit=1&cursor=" + firstPage.NextCursor)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var nextPage runPage
+	if err := json.NewDecoder(nextResponse.Body).Decode(&nextPage); err != nil {
+		nextResponse.Body.Close()
+		t.Fatal(err)
+	}
+	nextResponse.Body.Close()
+	if len(nextPage.Items) != 1 || nextPage.Items[0].ID == firstPage.Items[0].ID {
+		t.Fatalf("next page = %#v after %#v", nextPage, firstPage)
+	}
 	response, err := server.Client().Get(server.URL + "/api/runs?active=true&limit=10")
 	if err != nil {
 		t.Fatal(err)
@@ -201,6 +227,64 @@ INSERT INTO runs(
 	events, err := store.ListEvents(t.Context(), "run-cancel", 0, 10)
 	if err != nil || len(events) != 1 || events[0].Type != domainrun.EventCancelRequested {
 		t.Fatalf("cancel events = %#v, %v", events, err)
+	}
+
+	for _, test := range []struct {
+		method string
+		path   string
+		body   string
+		status int
+	}{
+		{method: http.MethodGet, path: "/api/runs?limit=0", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/api/runs?active=true&status=RUNNING", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/api/runs?cursor=invalid", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/api/runs/missing", status: http.StatusNotFound},
+		{method: http.MethodGet, path: "/api/runs/run-cancel/logs?stream=trace", status: http.StatusBadRequest},
+		{method: http.MethodGet, path: "/api/runs/run-cancel/logs?stream=stdout", status: http.StatusNotFound},
+		{method: http.MethodPost, path: "/api/runs/missing/cancel", body: `{}`, status: http.StatusNotFound},
+		{method: http.MethodPost, path: "/api/runs/run-finished/cancel", body: `{}`, status: http.StatusConflict},
+		{method: http.MethodPost, path: "/api/runs/run-cancel/cancel", body: `{"reason":"` + strings.Repeat("x", 1001) + `"}`, status: http.StatusBadRequest},
+	} {
+		request, err := http.NewRequestWithContext(t.Context(), test.method, server.URL+test.path, bytes.NewBufferString(test.body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if test.body != "" {
+			request.Header.Set("Content-Type", "application/json")
+		}
+		response, err := server.Client().Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		response.Body.Close()
+		if response.StatusCode != test.status {
+			t.Fatalf("%s %s status = %d, want %d", test.method, test.path, response.StatusCode, test.status)
+		}
+	}
+}
+
+func TestReadManagedRunArtifactRejectsUnsafeOrCorruptFiles(t *testing.T) {
+	root := t.TempDir()
+	content := []byte("log\n")
+	path := filepath.Join(root, "run.log")
+	if err := os.WriteFile(path, content, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hash := sha256.Sum256(content)
+	valid := domainrun.Artifact{RelativePath: "run.log", Size: int64(len(content)), SHA256: hex.EncodeToString(hash[:])}
+	if loaded, err := readManagedRunArtifact(root, valid); err != nil || !bytes.Equal(loaded, content) {
+		t.Fatalf("valid artifact = %q, %v", loaded, err)
+	}
+	for _, artifact := range []domainrun.Artifact{
+		{RelativePath: "../outside.log", Size: 1, SHA256: strings.Repeat("a", 64)},
+		{RelativePath: "run.log", Size: maxRunLogReadBytes + 1, SHA256: strings.Repeat("a", 64)},
+		{RelativePath: "missing.log", Size: 1, SHA256: strings.Repeat("a", 64)},
+		{RelativePath: "run.log", Size: int64(len(content) + 1), SHA256: hex.EncodeToString(hash[:])},
+		{RelativePath: "run.log", Size: int64(len(content)), SHA256: strings.Repeat("a", 64)},
+	} {
+		if _, err := readManagedRunArtifact(root, artifact); err == nil {
+			t.Fatalf("unsafe/corrupt artifact accepted: %#v", artifact)
+		}
 	}
 }
 

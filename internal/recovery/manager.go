@@ -22,6 +22,7 @@ type Manager struct {
 	database            *sql.DB
 	store               *storage.RunStore
 	matchesProcess      func(context.Context, int, string) bool
+	terminateAgent      func(context.Context, int, string) error
 	recoverFinalization func(context.Context, *project.Project, *sql.DB, storage.RecoveryRun) error
 	tracked             map[string]storage.RecoveryRun
 	mutex               sync.Mutex
@@ -32,7 +33,8 @@ func New(currentProject *project.Project, database *sql.DB) *Manager {
 	return &Manager{
 		project: currentProject, database: database, store: storage.NewRunStore(database),
 		matchesProcess: processidentity.Matches, recoverFinalization: runner.RecoverFinalization,
-		tracked: make(map[string]storage.RecoveryRun),
+		terminateAgent: processidentity.TerminateGroup,
+		tracked:        make(map[string]storage.RecoveryRun),
 	}
 }
 
@@ -61,6 +63,7 @@ func (manager *Manager) reconcile(ctx context.Context, item storage.RecoveryRun)
 	if item.RunnerPID > 0 && manager.matchesProcess(ctx, item.RunnerPID, item.RunnerIdentity) {
 		return true, nil
 	}
+	cleanupErr := manager.cleanupAgentResources(ctx, item)
 	if item.Run.Status == run.StatusFinalizing {
 		if err := manager.recoverFinalization(ctx, manager.project, manager.database, item); err == nil {
 			return false, nil
@@ -68,7 +71,26 @@ func (manager *Manager) reconcile(ctx context.Context, item storage.RecoveryRun)
 			return false, manager.markLost(ctx, item, "FINALIZATION_RECOVERY_FAILED", err.Error())
 		}
 	}
-	return false, manager.markLost(ctx, item, "RUNNER_LOST", "无法确认旧 Runner 存活；为避免重复调用 AI，Run 已停止并等待人工处理")
+	message := "无法确认旧 Runner 存活；为避免重复调用 AI，Run 已停止并等待人工处理"
+	if cleanupErr != nil {
+		message += "；Agent 资源未能确认关闭：" + cleanupErr.Error()
+	}
+	return false, manager.markLost(ctx, item, "RUNNER_LOST", message)
+}
+
+func (manager *Manager) cleanupAgentResources(ctx context.Context, item storage.RecoveryRun) error {
+	cleanupErr := error(nil)
+	if item.AgentPID > 0 {
+		cleanupErr = manager.terminateAgent(ctx, item.AgentPID, item.AgentIdentity)
+	}
+	reason := "旧 Runner 已退出，Agent 进程组已关闭"
+	if cleanupErr != nil {
+		reason = "旧 Runner 已退出，但 Agent 进程组身份或关闭状态无法确认"
+	}
+	if err := storage.NewMCPAuditStore(manager.database).ReleaseRunResources(ctx, item.Run.ID, cleanupErr != nil, reason); err != nil {
+		return errors.Join(cleanupErr, err)
+	}
+	return cleanupErr
 }
 
 func (manager *Manager) markLost(ctx context.Context, item storage.RecoveryRun, code, message string) error {

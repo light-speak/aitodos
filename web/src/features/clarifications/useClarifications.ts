@@ -1,17 +1,17 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { answerClarification, getOpenClarifications, getTaskClarifications } from '../../api/client'
-import type { Clarification, ClarificationAnswerInput, Task } from '../../types'
+import { answerClarification, getOpenClarifications, getTaskClarifications, getTopicClarifications } from '../../api/client'
+import type { Clarification, ClarificationAnswerInput, Task, Topic } from '../../types'
 
 interface ClarificationState {
 	open: Clarification[]
 	history: Clarification[]
-	historyTaskID: string | null
+	historySubject: string | null
 	error: unknown
 }
 
-export function useClarifications(taskID: string | null, polling: boolean) {
-	const [state, setState] = useState<ClarificationState>({ open: [], history: [], historyTaskID: null, error: null })
+export function useClarifications(taskID: string | null, topicID: string | null, polling: boolean) {
+	const [state, setState] = useState<ClarificationState>({ open: [], history: [], historySubject: null, error: null })
 	const [reloadToken, setReloadToken] = useState(0)
 	const [answeringID, setAnsweringID] = useState<string | null>(null)
 	const reload = useCallback(() => setReloadToken((current) => current + 1), [])
@@ -35,22 +35,24 @@ export function useClarifications(taskID: string | null, polling: boolean) {
 	}, [polling, reloadToken])
 
 	useEffect(() => {
-		if (taskID === null) return
-		const selectedTaskID = taskID
+		const subject = taskID !== null ? `TASK:${taskID}` : topicID !== null ? `TOPIC:${topicID}` : null
+		if (subject === null) return
 		const controller = new AbortController()
 		async function loadHistory() {
 			try {
-				const history = await getTaskClarifications(selectedTaskID, controller.signal)
-				if (!controller.signal.aborted) setState((current) => ({ ...current, history, historyTaskID: selectedTaskID, error: null }))
+				const history = taskID !== null
+					? await getTaskClarifications(taskID, controller.signal)
+					: await getTopicClarifications(topicID!, controller.signal)
+				if (!controller.signal.aborted) setState((current) => ({ ...current, history, historySubject: subject, error: null }))
 			} catch (error: unknown) {
-				if (!controller.signal.aborted) setState((current) => ({ ...current, history: [], historyTaskID: selectedTaskID, error }))
+				if (!controller.signal.aborted) setState((current) => ({ ...current, history: [], historySubject: subject, error }))
 			}
 		}
 		void loadHistory()
 		return () => controller.abort()
-	}, [reloadToken, taskID])
+	}, [reloadToken, taskID, topicID])
 
-	const answer = useCallback(async (item: Clarification, input: Omit<ClarificationAnswerInput, 'expected_version'>): Promise<Task> => {
+	const answer = useCallback(async (item: Clarification, input: Omit<ClarificationAnswerInput, 'expected_version'>): Promise<{ task?: Task; topic?: Topic }> => {
 		setAnsweringID(item.id)
 		try {
 			const result = await answerClarification(item.id, { ...input, expected_version: item.version })
@@ -59,7 +61,7 @@ export function useClarifications(taskID: string | null, polling: boolean) {
 				open: current.open.filter((candidate) => candidate.id !== item.id),
 				history: current.history.map((candidate) => candidate.id === item.id ? result.clarification : candidate),
 			}))
-			return result.task
+			return { task: result.task, topic: result.topic }
 		} finally {
 			setAnsweringID(null)
 		}
@@ -67,10 +69,10 @@ export function useClarifications(taskID: string | null, polling: boolean) {
 
 	return useMemo(() => ({
 		open: state.open,
-		history: state.historyTaskID === taskID ? state.history : [],
+		history: state.historySubject === (taskID !== null ? `TASK:${taskID}` : topicID !== null ? `TOPIC:${topicID}` : null) ? state.history : [],
 		error: state.error,
 		answeringID,
 		reload,
 		answer,
-	}), [answer, answeringID, reload, state, taskID])
+	}), [answer, answeringID, reload, state, taskID, topicID])
 }

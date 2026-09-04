@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { lazy, Suspense, useEffect, useMemo, useRef, useState } from 'react'
 import { ActivityIcon, AlertCircleIcon, BotIcon, GaugeIcon, ListTodoIcon, MessageSquareTextIcon, RefreshCwIcon } from 'lucide-react'
 
 import { errorMessage } from './api/client'
@@ -9,7 +9,6 @@ import { KanbanBoard } from './components/KanbanBoard'
 import { ReleaseDialog } from './components/ReleaseDialog'
 import { RepositoryDialog } from './components/RepositoryDialog'
 import { ProgressPage } from './components/ProgressPage'
-import { ProjectSearchDialog } from './components/ProjectSearchDialog'
 import { ProjectCapabilitiesPanel } from './components/ProjectCapabilitiesPanel'
 import { TaskDetailsDialog } from './components/TaskDetailsDialog'
 import { TopicDetailsDialog } from './components/TopicDetailsDialog'
@@ -41,6 +40,11 @@ import type { SearchItem, TaskFeedbackIntent } from './types'
 
 type AppView = 'topics' | 'tasks' | 'runs' | 'progress' | 'agents'
 
+const ProjectSearchDialog = lazy(async () => {
+	const module = await import('./components/ProjectSearchDialog')
+	return { default: module.ProjectSearchDialog }
+})
+
 export default function App() {
   const board = useTaskBoard()
 	const [view, setView] = useState<AppView>('topics')
@@ -69,7 +73,7 @@ export default function App() {
   const workspace = useTaskWorkspace(selectedTaskID)
 	const quality = useTaskQuality(selectedTaskID)
 	const assessment = useTaskAssessment(selectedTaskID)
-	const clarifications = useClarifications(selectedTaskID, board.project?.workers_enabled ?? false)
+	const clarifications = useClarifications(selectedTaskID, selectedTopicID, board.project?.workers_enabled ?? false)
 	const approvals = useApprovals(board.project?.workers_enabled ?? false)
 	const notifications = useBrowserNotifications(board.project?.root, board.project?.workers_enabled ?? false, approvals.items, clarifications.open)
 	const progress = useProjectProgress(view === 'progress')
@@ -79,6 +83,10 @@ export default function App() {
 	const topicPlanning = useTopicPlanning(selectedTopic, board.project?.workers_enabled ?? false)
 	const agentActivity = useAgentActivity(board.project !== null)
 	const projectSearch = useProjectSearch()
+	const loadRetrievalEvals = projectSearch.loadEvals
+	useEffect(() => {
+		if (showSearch) void loadRetrievalEvals()
+	}, [loadRetrievalEvals, showSearch])
 	const selectedTaskActiveRun = useMemo(
 		() => agentActivity.runs.find((run) => run.task_id === selectedTaskID) ?? null,
 		[agentActivity.runs, selectedTaskID],
@@ -239,16 +247,21 @@ export default function App() {
 		) : view === 'progress' ? (
 			<ProgressPage {...progress} onReload={progress.reload} />
 		) : (
-			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} /></>
+			<><ProjectCapabilitiesPanel catalog={capabilities.catalog} loading={capabilities.loading} adding={capabilities.adding} error={capabilities.error} onReload={capabilities.reload} onAddSkill={capabilities.addSkill} onRefreshSkill={capabilities.refreshSkill} onAddMCPServer={capabilities.addMCPServer} /><AgentProfilesPage profiles={agents.profiles} capabilities={capabilities.catalog} loading={agents.loading} error={agents.error} saving={agents.saving} onReload={agents.reload} onSave={agents.save} onConfigureDefaults={agents.configureDefaults} /></>
 		)}
       </main>
-		{showSearch ? <ProjectSearchDialog
+		{showSearch ? <Suspense fallback={null}><ProjectSearchDialog
 			items={projectSearch.items} loading={projectSearch.loading} error={projectSearch.error}
 			nextCursor={projectSearch.nextCursor}
+			evalCases={projectSearch.evalCases} evalRuns={projectSearch.evalRuns}
+			evalLoading={projectSearch.evalLoading} evalError={projectSearch.evalError}
 			onClose={() => { setShowSearch(false); projectSearch.reset() }}
 			onSearch={(input) => { void projectSearch.search(input) }}
 			onLoadMore={() => { void projectSearch.loadMore() }} onOpenItem={openSearchItem}
-		/> : null}
+			onAddEvalResult={(input) => { void projectSearch.addEvalResult(input) }}
+			onRemoveEvalResult={(caseID, documentID) => { void projectSearch.removeEvalResult(caseID, documentID) }}
+			onRunEval={(k) => { void projectSearch.runEval(k) }}
+		/></Suspense> : null}
       {creating ? (
         <CreateItemDialog
 			repository={git.repository}
@@ -318,7 +331,7 @@ export default function App() {
 		onReloadClarifications={clarifications.reload}
 		onAnswerClarification={async (item, input) => {
 			const updated = await clarifications.answer(item, input)
-			board.updateTask(updated)
+			if (updated.task) board.updateTask(updated.task)
 		}}
 		onUpdateTitle={async (title) => {
 			const updated = await assessment.updateTitle(selectedTask, title)
@@ -326,6 +339,16 @@ export default function App() {
 		}}
 		onUpdateTargetBranch={async (targetBranch) => {
 			await board.updateTargetBranch(selectedTask, targetBranch)
+		}}
+		onUpdateDetails={async (input) => {
+			await board.updateTaskDetails(selectedTask, input)
+		}}
+		onCancelTask={async () => {
+			await board.cancelTask(selectedTask)
+		}}
+		onArchiveTask={async () => {
+			await board.archiveTask(selectedTask)
+			setSelectedTaskID(null)
 		}}
 			onWorkspaceChanged={() => {
 			workspace.reload()
@@ -345,13 +368,21 @@ export default function App() {
           submitting={discussion.submitting}
           discussionError={discussion.error}
           relationError={associations.error}
-          pendingRelationTaskIDs={associations.pendingTaskIDs}
+		  pendingRelationTaskIDs={associations.pendingTaskIDs}
+		  clarifications={clarifications.history}
+		  clarificationError={clarifications.error}
+		  answeringClarificationID={clarifications.answeringID}
           onClose={() => setSelectedTopicID(null)}
           onReloadDiscussion={discussion.reload}
           onSendMessage={sendMessage}
           onAddRelation={associations.add}
           onRemoveRelation={associations.remove}
-          onOpenTask={openTask}
+		  onOpenTask={openTask}
+		  onReloadClarifications={clarifications.reload}
+		  onAnswerClarification={async (item, input) => {
+			  const updated = await clarifications.answer(item, input)
+			  if (updated.topic) board.updateTopic(updated.topic)
+		  }}
 			plan={topicPlan.plan}
 			planLoading={topicPlan.loading}
 			planSubmitting={topicPlan.submitting}
@@ -405,13 +436,16 @@ export default function App() {
 				items={clarifications.open}
 				approvals={approvals.items}
 				tasks={board.tasks}
+				topics={board.topics}
 				answeringID={clarifications.answeringID}
 				decidingApprovalID={approvals.decidingID}
 				onClose={() => setShowClarifications(false)}
 				onOpenTask={(taskID) => { setShowClarifications(false); openTask(taskID) }}
+				onOpenTopic={(topicID) => { setShowClarifications(false); openTopic(topicID) }}
 				onAnswer={async (item, input) => {
 					const updated = await clarifications.answer(item, input)
-					board.updateTask(updated)
+					if (updated.task) board.updateTask(updated.task)
+					if (updated.topic) board.updateTopic(updated.topic)
 				}}
 				onDecideApproval={approvals.decide}
 			/>

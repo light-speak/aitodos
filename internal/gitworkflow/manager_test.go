@@ -371,6 +371,103 @@ func TestManagerAbortsSyncConflictBeforeRevision(t *testing.T) {
 	}
 }
 
+func TestManagerRecoversCompletedAndInterruptedIntegrations(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+
+	completedTask, completedReview, completedWorkspace := createAcceptedTask(t, manager, database, "恢复已完成集成", "completed.txt", "done\n")
+	targetBefore := git(t, repository.Root, "rev-parse", "main")
+	completedAttempt, err := manager.integrations.Reserve(ctx, integration.ReserveInput{
+		TaskID: completedTask.ID, ReviewID: completedReview.ID, Operation: integration.OperationIntegrate,
+		TargetBranch: "main", SourceCommitSHA: completedReview.CommitSHA, TargetBeforeSHA: targetBefore,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository.Root, "merge", "--ff-only", completedReview.CommitSHA)
+
+	interruptedTask, interruptedReview, _ := createAcceptedTask(t, manager, database, "恢复中断集成", "interrupted.txt", "pending\n")
+	interruptedAttempt, err := manager.integrations.Reserve(ctx, integration.ReserveInput{
+		TaskID: interruptedTask.ID, ReviewID: interruptedReview.ID, Operation: integration.OperationIntegrate,
+		TargetBranch: "main", SourceCommitSHA: interruptedReview.CommitSHA, TargetBeforeSHA: completedReview.CommitSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if err := manager.RecoverIntegrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	completed, err := manager.integrations.Get(ctx, completedAttempt.ID)
+	if err != nil || completed.Status != integration.StatusSucceeded || completed.TargetAfterSHA != completedReview.CommitSHA {
+		t.Fatalf("completed recovery = %#v, %v", completed, err)
+	}
+	if completedWorkspace.HeadSHA != completedReview.CommitSHA {
+		t.Fatalf("completed workspace = %#v", completedWorkspace)
+	}
+	interrupted, err := manager.integrations.Get(ctx, interruptedAttempt.ID)
+	if err != nil || interrupted.Status != integration.StatusFailed || interrupted.FailureKind != "INTERRUPTED" {
+		t.Fatalf("interrupted recovery = %#v, %v", interrupted, err)
+	}
+}
+
+func TestManagerRecoversCompletedTargetSync(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	accepted, review, item := createAcceptedTask(t, manager, database, "恢复目标同步", "feature.txt", "task\n")
+	if err := os.WriteFile(filepath.Join(repository.Root, "target.txt"), []byte("target\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, repository.Root, "add", "target.txt")
+	runGit(t, repository.Root, "commit", "--quiet", "-m", "advance target for recovery")
+	targetSHA := git(t, repository.Root, "rev-parse", "main")
+	attempt, err := manager.integrations.Reserve(ctx, integration.ReserveInput{
+		TaskID: accepted.ID, ReviewID: review.ID, Operation: integration.OperationSync,
+		TargetBranch: "main", SourceCommitSHA: review.CommitSHA, TargetBeforeSHA: targetSHA,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGit(t, item.Path, "merge", "--no-edit", targetSHA)
+
+	if err := manager.RecoverIntegrations(ctx); err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := manager.integrations.Get(ctx, attempt.ID)
+	if err != nil || recovered.Status != integration.StatusSynced || recovered.WorkspaceAfterSHA == review.CommitSHA {
+		t.Fatalf("sync recovery = %#v, %v", recovered, err)
+	}
+	updated, err := storage.NewTaskStore(database).Get(ctx, accepted.ID)
+	if err != nil || updated.Status != task.StatusChangesRequested {
+		t.Fatalf("task after recovery = %#v, %v", updated, err)
+	}
+}
+
+func TestManagerRecordsAlreadyContainedIntegrationAndQueriesIt(t *testing.T) {
+	ctx := context.Background()
+	repository, database := initializeRepository(t)
+	manager := New(repository, database)
+	accepted, review, _ := createAcceptedTask(t, manager, database, "记录已包含提交", "contained.txt", "contained\n")
+	if latest, err := manager.TaskIntegration(ctx, accepted.ID); err != nil || latest != nil {
+		t.Fatalf("initial TaskIntegration() = %#v, %v", latest, err)
+	}
+	runGit(t, repository.Root, "merge", "--ff-only", review.CommitSHA)
+	result, err := manager.IntegrateTask(ctx, accepted.ID)
+	if err != nil || result.Status != integration.StatusSucceeded || result.TargetAfterSHA != review.CommitSHA {
+		t.Fatalf("IntegrateTask() = %#v, %v", result, err)
+	}
+	latest, err := manager.TaskIntegration(ctx, accepted.ID)
+	if err != nil || latest == nil || latest.ID != result.ID {
+		t.Fatalf("TaskIntegration() = %#v, %v", latest, err)
+	}
+	reviews, err := manager.ListTaskReviews(ctx, accepted.ID)
+	if err != nil || len(reviews) != 1 || reviews[0].CommitSHA != review.CommitSHA {
+		t.Fatalf("ListTaskReviews() = %#v, %v", reviews, err)
+	}
+}
+
 func createAcceptedTask(
 	t *testing.T,
 	manager *Manager,

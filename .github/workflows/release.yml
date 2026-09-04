@@ -1,0 +1,44 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+      - name: Build release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp/release
+          build_date=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          for target in linux/amd64 linux/arm64 darwin/amd64 darwin/arm64; do
+            os=${target%/*}
+            arch=${target#*/}
+            name="ats_${VERSION}_${os}_${arch}"
+            CGO_ENABLED=0 GOOS="$os" GOARCH="$arch" go build \
+              -trimpath \
+              -ldflags "-s -w -X github.com/light-speak/aitodos/internal/buildinfo.Version=${VERSION} -X github.com/light-speak/aitodos/internal/buildinfo.Commit=${COMMIT} -X github.com/light-speak/aitodos/internal/buildinfo.Date=${build_date}" \
+              -o ".tmp/release/${name}/ats" ./cmd/ats
+            tar -C ".tmp/release/${name}" -czf ".tmp/release/${name}.tar.gz" ats
+          done
+          cd .tmp/release
+          sha256sum ./*.tar.gz > checksums.txt
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "${{ github.ref_name }}" .tmp/release/*.tar.gz .tmp/release/checksums.txt --verify-tag --generate-notes

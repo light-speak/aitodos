@@ -30,10 +30,14 @@ func TestQualityRoutesCreateEvidenceAndReadProgress(t *testing.T) {
 	testCase := requestTestCase(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/test-cases", `{
 		"title":"浏览器流程","description":"打开进度页","required":true,"sort_order":0
 	}`, http.StatusCreated)
-	requestQuality(t, server.Client(), http.MethodPost,
+	createdResult := requestTestResult(t, server.Client(), http.MethodPost,
 		server.URL+"/api/tasks/"+created.ID+"/test-cases/"+testCase.ID+"/results", `{
-			"outcome":"PASSED","evidence_kind":"COMMAND","summary":"E2E 通过","command":"pnpm test"
+			"outcome":"PASSED","summary":"E2E 通过"
 		}`, http.StatusCreated)
+	if createdResult.EvidenceKind != quality.EvidenceHuman || createdResult.Command != "" ||
+		createdResult.ArtifactRef != "" || createdResult.SourceRunID != "" || createdResult.ExitCode != nil {
+		t.Fatalf("HTTP evidence must be human-owned: %#v", createdResult)
+	}
 
 	response, err := server.Client().Get(server.URL + "/api/tasks/" + created.ID + "/quality")
 	if err != nil {
@@ -59,6 +63,40 @@ func TestQualityRoutesCreateEvidenceAndReadProgress(t *testing.T) {
 	}
 	if progress.EstimatedTasks != 1 || progress.RequiredTests != 1 || progress.VerifiedPassedTests != 1 {
 		t.Fatalf("progress = %#v", progress)
+	}
+}
+
+func TestQualityRoutesRejectInvalidAndAgentOnlyEvidence(t *testing.T) {
+	database := openHTTPTestDatabase(t)
+	created, err := storage.NewTaskStore(database).Create(t.Context(), task.CreateInput{Title: "校验测试证据"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mux := http.NewServeMux()
+	RegisterQualityRoutes(mux, storage.NewQualityStore(database))
+	server := httptest.NewServer(mux)
+	t.Cleanup(server.Close)
+
+	requestQuality(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/estimates", `{`, http.StatusBadRequest)
+	requestQuality(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/estimates", `{"points":0}`, http.StatusBadRequest)
+	requestQuality(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/test-cases", `{"title":""}`, http.StatusBadRequest)
+	testCase := requestTestCase(t, server.Client(), http.MethodPost, server.URL+"/api/tasks/"+created.ID+"/test-cases", `{"title":"自动验证","required":true}`, http.StatusCreated)
+	requestQuality(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/test-cases/"+testCase.ID+"/results",
+		`{"outcome":"PASSED","evidence_kind":"AGENT_REPORT","summary":"声称通过"}`, http.StatusBadRequest)
+	requestQuality(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/test-cases/"+testCase.ID+"/results",
+		`{"outcome":"PASSED","evidence_kind":"COMMAND","summary":"伪造命令","command":"go test ./...","exit_code":0}`, http.StatusBadRequest)
+	requestQuality(t, server.Client(), http.MethodPost,
+		server.URL+"/api/tasks/"+created.ID+"/test-cases/"+testCase.ID+"/results", `{`, http.StatusBadRequest)
+
+	response, err := server.Client().Get(server.URL + "/api/tasks/missing/quality")
+	if err != nil {
+		t.Fatal(err)
+	}
+	response.Body.Close()
+	if response.StatusCode != http.StatusNotFound {
+		t.Fatalf("missing quality status = %d", response.StatusCode)
 	}
 }
 
@@ -95,6 +133,28 @@ func requestTestCase(t *testing.T, client *http.Client, method string, url strin
 		t.Fatalf("%s %s status = %d, want %d", method, url, response.StatusCode, wantStatus)
 	}
 	var result quality.TestCase
+	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func requestTestResult(t *testing.T, client *http.Client, method string, url string, body string, wantStatus int) quality.TestResult {
+	t.Helper()
+	request, err := http.NewRequest(method, url, bytes.NewBufferString(body))
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header.Set("Content-Type", "application/json")
+	response, err := client.Do(request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.StatusCode != wantStatus {
+		t.Fatalf("%s %s status = %d, want %d", method, url, response.StatusCode, wantStatus)
+	}
+	var result quality.TestResult
 	if err := json.NewDecoder(response.Body).Decode(&result); err != nil {
 		t.Fatal(err)
 	}
