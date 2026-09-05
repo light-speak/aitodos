@@ -112,6 +112,11 @@ func (manager *Manager) ReviewTask(
 	if _, err := task.Transition(current.Status, input.Command()); err != nil {
 		return task.Task{}, task.Review{}, err
 	}
+	if input.Decision == task.ReviewAccepted {
+		if err := manager.quality.EnsureRequiredTestsPassed(ctx, taskID); err != nil {
+			return task.Task{}, task.Review{}, err
+		}
+	}
 	commitSHA := ""
 	item, err := manager.TaskWorkspace(ctx, taskID)
 	if err != nil {
@@ -165,6 +170,7 @@ type RepositoryInfo struct {
 type Manager struct {
 	project      *project.Project
 	tasks        *storage.TaskStore
+	quality      *storage.QualityStore
 	workspaces   *storage.WorkspaceStore
 	releases     *storage.ReleaseStore
 	integrations *storage.IntegrationStore
@@ -173,7 +179,7 @@ type Manager struct {
 // New 创建 Git Workflow Manager。
 func New(currentProject *project.Project, database *sql.DB) *Manager {
 	return &Manager{
-		project: currentProject, tasks: storage.NewTaskStore(database),
+		project: currentProject, tasks: storage.NewTaskStore(database), quality: storage.NewQualityStore(database),
 		workspaces: storage.NewWorkspaceStore(database), releases: storage.NewReleaseStore(database),
 		integrations: storage.NewIntegrationStore(database),
 	}

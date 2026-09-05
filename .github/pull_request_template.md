@@ -5,6 +5,7 @@
 ## 验证
 
 - [ ] `go test ./...`
+- [ ] `go mod verify`
 - [ ] `go vet ./...`
 - [ ] `gofmt` 无未格式化文件
 - [ ] `pnpm --dir web lint`
@@ -16,4 +17,3 @@
 ## 风险
 
 - 说明迁移、兼容性、安全、恢复或 Git Workspace 风险；没有则写“无”。
-
