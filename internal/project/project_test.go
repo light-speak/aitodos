@@ -275,11 +275,11 @@ func assertDatabaseInitialized(t *testing.T, databasePath string, instanceID str
 		t.Fatalf("stored instance ID = %q, want %q", storedID, instanceID)
 	}
 
-	var version int
-	if err := database.QueryRow("SELECT MAX(version) FROM schema_migrations").Scan(&version); err != nil {
-		t.Fatalf("read schema version: %v", err)
+	var epoch, version int
+	if err := database.QueryRow("SELECT epoch, version FROM schema_metadata WHERE id = 1").Scan(&epoch, &version); err != nil {
+		t.Fatalf("read schema identity: %v", err)
 	}
-	if version != 45 {
-		t.Fatalf("schema version = %d, want 45", version)
+	if epoch != 1 || version != 1 {
+		t.Fatalf("schema identity = %d/%d, want 1/1", epoch, version)
 	}
 }

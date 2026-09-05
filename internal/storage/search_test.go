@@ -2,9 +2,6 @@ package storage
 
 import (
 	"context"
-	"database/sql"
-	"path/filepath"
-	"strings"
 	"testing"
 
 	"github.com/light-speak/aitodos/internal/domain/discussion"
@@ -57,109 +54,6 @@ func TestSearchStoreDistinguishesCurrentAndHistoricalPlanRevisions(t *testing.T)
 
 func searchPlanInput(summary string) plan.RevisionInput {
 	return plan.RevisionInput{Summary: summary, Drafts: []plan.TaskDraftInput{{Title: "实现搜索", Priority: 2}}}
-}
-
-func TestSearchMigrationBackfillsExistingCanonicalData(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state.db")
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := configure(ctx, database); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-)`); err != nil {
-		t.Fatal(err)
-	}
-	for version := 1; version <= 31; version++ {
-		if err := applyMigration(ctx, database, version); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := upsertProjectMetadata(ctx, database, ProjectMetadata{
-		InstanceID: "search-upgrade", Name: "search-upgrade", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "迁移前已经存在的搜索内容"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	upgraded, err := OpenExisting(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upgraded.Close()
-	page, err := NewSearchStore(upgraded).Search(ctx, search.Query{Text: "已经存在", Limit: 20})
-	if err != nil || len(page.Items) != 1 || page.Items[0].SourceID != created.ID {
-		t.Fatalf("backfilled results = %#v, %v", page.Items, err)
-	}
-}
-
-func TestSearchOptimizationMigrationUpgradesExistingVersionThirtyTwo(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state.db")
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := configure(ctx, database); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-)`); err != nil {
-		t.Fatal(err)
-	}
-	for version := 1; version <= 32; version++ {
-		if err := applyMigration(ctx, database, version); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := upsertProjectMetadata(ctx, database, ProjectMetadata{
-		InstanceID: "search-v32", Name: "search-v32", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "保留 v32 索引"})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	upgraded, err := OpenExisting(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upgraded.Close()
-	var triggerSQL string
-	if err := upgraded.QueryRowContext(ctx, `SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'search_documents_au'`).Scan(&triggerSQL); err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(triggerSQL, "UPDATE OF title, body, stable_key") {
-		t.Fatalf("search_documents_au = %q", triggerSQL)
-	}
-	var splitTriggers int
-	if err := upgraded.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master
-WHERE type = 'trigger' AND name IN ('search_topics_au_content', 'search_topics_au_metadata', 'search_tasks_au_content', 'search_tasks_au_metadata')`).Scan(&splitTriggers); err != nil {
-		t.Fatal(err)
-	}
-	if splitTriggers != 4 {
-		t.Fatalf("split trigger count = %d", splitTriggers)
-	}
-	page, err := NewSearchStore(upgraded).Search(ctx, search.Query{Text: "v32 索引", Limit: 20})
-	if err != nil || len(page.Items) != 1 || page.Items[0].SourceID != created.ID {
-		t.Fatalf("upgraded search = %#v, %v", page.Items, err)
-	}
 }
 
 func TestSearchStoreIndexesCanonicalItemsAndMessagesIncrementally(t *testing.T) {

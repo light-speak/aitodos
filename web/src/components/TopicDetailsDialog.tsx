@@ -1,9 +1,10 @@
-import type { ComponentProps } from 'react'
-import { LoaderCircleIcon, TextIcon, XIcon } from 'lucide-react'
+import { useState, type ComponentProps } from 'react'
+import { LoaderCircleIcon, TargetIcon, TextIcon, XIcon } from 'lucide-react'
 
-import type { Clarification, ClarificationAnswerInput, DiscussionMessage, Task, TaskAssociation, TaskFeedbackIntent, TaskRelationType, Topic, TopicStatus } from '../types'
+import type { Clarification, ClarificationAnswerInput, CreateObjectiveInput, DiscussionMessage, ObjectiveView, Task, TaskAssociation, TaskFeedbackIntent, TaskRelationType, Topic, TopicStatus } from '../types'
 import { TaskClarificationsPanel } from './ClarificationsPanel'
 import { DiscussionComposer, DiscussionMessages } from './DiscussionPanel'
+import { CreateObjectiveDialog } from './CreateObjectiveDialog'
 import { MarkdownContent } from './MarkdownContent'
 import { PlanPanel } from './PlanPanel'
 import { RelatedTasks } from './RelatedTasks'
@@ -49,6 +50,8 @@ interface TopicDetailsDialogProps {
 	onSubmitPlan: ComponentProps<typeof PlanPanel>['onSubmit']
 	onRejectPlan: ComponentProps<typeof PlanPanel>['onReject']
 	onApprovePlan: ComponentProps<typeof PlanPanel>['onApprove']
+	objective: ObjectiveView | null
+	onCreateObjective: (input: CreateObjectiveInput) => Promise<void>
 }
 
 const statusLabels: Record<TopicStatus, { phase: string; detail?: string }> = {
@@ -61,6 +64,8 @@ const statusLabels: Record<TopicStatus, { phase: string; detail?: string }> = {
 
 export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
   const { topic, tasks, messages, associations, onClose, onOpenTask } = props
+	const [creatingObjective, setCreatingObjective] = useState(false)
+	const isObjectiveRoot = props.objective?.objective.root_topic_id === topic.id
   return (
     <Sheet open onOpenChange={(open) => { if (!open) onClose() }}>
       <SheetContent
@@ -73,12 +78,16 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
               <SheetDescription className="font-mono text-xs">{topic.key}</SheetDescription>
               <SheetTitle className="text-xl leading-7">{topic.title}</SheetTitle>
             </div>
-            <Button variant="ghost" size="icon-sm" type="button" aria-label="关闭" onClick={onClose}><XIcon /></Button>
+			<div className="flex items-center gap-2">
+				{props.objective === null ? <Button variant="outline" size="sm" type="button" onClick={() => setCreatingObjective(true)}><TargetIcon />设为长期目标</Button> : null}
+				<Button variant="ghost" size="icon-sm" type="button" aria-label="关闭" onClick={onClose}><XIcon /></Button>
+			</div>
           </div>
           <div className="flex flex-wrap items-center gap-2">
             <Badge variant="secondary">{statusLabels[topic.status].phase}</Badge>
             {statusLabels[topic.status].detail ? <Badge variant="outline">{statusLabels[topic.status].detail}</Badge> : null}
 			{props.planningRun && ['CLAIMED', 'STARTING', 'RUNNING', 'FINALIZING'].includes(props.planningRun.status) ? <Badge variant="outline" className="gap-1.5 border-violet-200 bg-violet-50 text-violet-700"><LoaderCircleIcon className="size-3.5 animate-spin" />Agent 分析中</Badge> : null}
+			{isObjectiveRoot ? <Badge variant="outline" className="gap-1.5"><TargetIcon className="size-3.5" />长期目标根议题</Badge> : null}
           </div>
         </SheetHeader>
 
@@ -155,6 +164,7 @@ export function TopicDetailsDialog(props: TopicDetailsDialogProps) {
 				</div>
 			</section>
 		</div>
+		<CreateObjectiveDialog topic={topic} open={creatingObjective} onClose={() => setCreatingObjective(false)} onCreate={props.onCreateObjective} />
       </SheetContent>
     </Sheet>
   )

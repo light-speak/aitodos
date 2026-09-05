@@ -6,6 +6,7 @@ import { AppHeader } from './components/AppHeader'
 import { AgentProfilesPage } from './components/AgentProfilesPage'
 import { CreateItemDialog } from './components/CreateItemDialog'
 import { KanbanBoard } from './components/KanbanBoard'
+import { ObjectiveBar } from './components/ObjectiveBar'
 import { ReleaseDialog } from './components/ReleaseDialog'
 import { RepositoryDialog } from './components/RepositoryDialog'
 import { ProgressPage } from './components/ProgressPage'
@@ -213,6 +214,7 @@ export default function App() {
 		onOpenSearch={() => setShowSearch(true)}
         onCreate={() => setCreating(true)}
       />
+	  {board.objective ? <ObjectiveBar value={board.objective} onOpenTopic={openTopic} onCommand={board.commandObjective} /> : null}
       <main className="min-w-0 py-6">
         <div className="flex flex-col gap-4 px-4 pb-5 sm:px-6 lg:flex-row lg:items-end lg:justify-between lg:px-8">
           <div>
@@ -410,6 +412,8 @@ export default function App() {
 				board.reload()
 				associations.reload()
 			}}
+			objective={board.objective}
+			onCreateObjective={async (input) => { await board.createObjective(input) }}
         />
       ) : null}
       {showReleases && git.repository ? (

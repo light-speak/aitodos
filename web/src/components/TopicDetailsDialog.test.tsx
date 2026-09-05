@@ -12,8 +12,9 @@ const topic: Topic = {
 
 describe('TopicDetailsDialog', () => {
 	it('把讨论和执行拆成独立工作区，并将输入框留在讨论区', () => {
-		render(<TopicDetailsDialog
-			topic={topic}
+			render(<TopicDetailsDialog
+				topic={topic}
+				objective={null}
 			tasks={[]}
 			messages={[]}
 			associations={[]}
@@ -47,8 +48,9 @@ describe('TopicDetailsDialog', () => {
 			onRequestPlanning={vi.fn().mockResolvedValue(undefined)}
 			onSubmitPlan={vi.fn().mockResolvedValue(undefined)}
 			onRejectPlan={vi.fn().mockResolvedValue(undefined)}
-			onApprovePlan={vi.fn().mockResolvedValue(undefined)}
-		/>)
+				onApprovePlan={vi.fn().mockResolvedValue(undefined)}
+				onCreateObjective={vi.fn().mockResolvedValue(undefined)}
+			/>)
 
 		const discussion = screen.getByRole('region', { name: '讨论区' })
 		const execution = screen.getByRole('region', { name: '执行区' })

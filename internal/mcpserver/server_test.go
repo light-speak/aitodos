@@ -14,6 +14,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/experience"
 	"github.com/light-speak/aitodos/internal/domain/knowledge"
+	"github.com/light-speak/aitodos/internal/domain/objective"
 	"github.com/light-speak/aitodos/internal/domain/relation"
 	"github.com/light-speak/aitodos/internal/domain/task"
 	"github.com/light-speak/aitodos/internal/domain/topic"
@@ -106,6 +107,39 @@ func TestServerReadsExperienceDetails(t *testing.T) {
 	encoded, _ := json.Marshal(result)
 	if !bytes.Contains(encoded, []byte("保留命令退出码")) {
 		t.Fatalf("experience = %s", encoded)
+	}
+}
+
+func TestServerReadsCurrentObjectiveAndCheckpoints(t *testing.T) {
+	database := openMCPTestDatabase(t)
+	rootTopic, err := storage.NewTopicStore(database).Create(t.Context(), topic.CreateInput{Title: "生产目标"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	objectiveStore := storage.NewObjectiveStore(database)
+	created, err := objectiveStore.Create(t.Context(), objective.CreateInput{
+		RootTopicID: rootTopic.ID, Statement: "达到生产可用", CompletionCriteria: []string{"测试通过"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := objectiveStore.AppendCheckpoint(t.Context(), created.Objective.ID, created.Objective.Version, objective.CheckpointInput{
+		Summary: "已完成测试", StopReason: objective.StopProgress, NextAction: "继续验收",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	server := New(database)
+	current, err := server.getCurrentObjective(t.Context(), json.RawMessage(`{}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	checkpoints, err := server.getObjectiveCheckpoints(t.Context(), encodeArguments(t, map[string]any{"objective_id": created.Objective.ID}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, _ := json.Marshal(map[string]any{"current": current, "checkpoints": checkpoints})
+	if !bytes.Contains(encoded, []byte("达到生产可用")) || !bytes.Contains(encoded, []byte("已完成测试")) {
+		t.Fatalf("objective MCP result = %s", encoded)
 	}
 }
 

@@ -276,4 +276,20 @@ SELECT 'EXPERIENCE:' || id, 'EXPERIENCE', id,
        CASE WHEN topic_id IS NOT NULL THEN 'TOPIC' ELSE 'TASK' END, COALESCE(topic_id, task_id),
        experience_key, title, summary || char(10) || guidance || char(10) || applicability,
        status, CASE WHEN status = 'ACTIVE' THEN 1 ELSE 0 END, updated_at FROM experience_records`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'OBJECTIVE:' || objectives.id, 'OBJECTIVE', objectives.id, 'TOPIC', objectives.root_topic_id,
+       objectives.objective_key, revisions.statement,
+       revisions.scope || char(10) || revisions.constraints_json || char(10) || revisions.completion_criteria_json,
+       objectives.status, CASE WHEN objectives.status IN ('ACTIVE', 'PAUSED') THEN 1 ELSE 0 END, objectives.updated_at
+FROM objectives JOIN objective_revisions revisions ON revisions.id = objectives.current_revision_id`,
+	`INSERT INTO search_documents(id, kind, source_id, subject_kind, subject_id, stable_key, title, body, status, is_current, updated_at)
+SELECT 'CHECKPOINT:' || checkpoints.id, 'CHECKPOINT', checkpoints.id, 'TOPIC', objectives.root_topic_id,
+       objectives.objective_key || '#checkpoint-' || checkpoints.sequence,
+       objectives.objective_key || ' Checkpoint ' || checkpoints.sequence,
+       checkpoints.summary || char(10) || checkpoints.criteria_json || char(10) || checkpoints.completed_json || char(10) ||
+       checkpoints.remaining_json || char(10) || checkpoints.risks_json || char(10) || checkpoints.next_action,
+       checkpoints.stop_reason,
+       CASE WHEN checkpoints.sequence = (SELECT MAX(latest.sequence) FROM objective_checkpoints latest WHERE latest.objective_id = checkpoints.objective_id) THEN 1 ELSE 0 END,
+       checkpoints.created_at
+FROM objective_checkpoints checkpoints JOIN objectives ON objectives.id = checkpoints.objective_id`,
 }

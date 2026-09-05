@@ -287,6 +287,10 @@ func (server *Server) executeTool(ctx context.Context, name string, arguments js
 		return server.getExperience(ctx, arguments)
 	case "get_recalled_experiences":
 		return server.getRecalledExperiences(ctx, arguments)
+	case "get_current_objective":
+		return server.getCurrentObjective(ctx, arguments)
+	case "get_objective_checkpoints":
+		return server.getObjectiveCheckpoints(ctx, arguments)
 	default:
 		return nil, fmt.Errorf("未知或不可写的工具 %q", name)
 	}
@@ -364,6 +368,22 @@ func (server *Server) getRecalledExperiences(ctx context.Context, arguments json
 		return nil, err
 	}
 	return storage.NewExperienceStore(server.database).ListRunRecalls(ctx, id)
+}
+
+func (server *Server) getCurrentObjective(ctx context.Context, _ json.RawMessage) (any, error) {
+	view, err := storage.NewObjectiveStore(server.database).GetCurrent(ctx)
+	if errors.Is(err, storage.ErrObjectiveNotFound) {
+		return nil, nil
+	}
+	return view, err
+}
+
+func (server *Server) getObjectiveCheckpoints(ctx context.Context, arguments json.RawMessage) (any, error) {
+	id, err := requiredString(arguments, "objective_id")
+	if err != nil {
+		return nil, err
+	}
+	return storage.NewObjectiveStore(server.database).ListCheckpoints(ctx, id)
 }
 
 func requiredSubject(arguments json.RawMessage) (string, string, error) {
@@ -504,7 +524,7 @@ func toolDefinitions() []toolDefinition {
 			"required": []string{"subject_kind", "subject_id"}}
 	}
 	return []toolDefinition{
-		{Name: "search_items", Description: "全文搜索当前项目的规范条目、讨论、决策、经验、摘要、标签和 CI 检查。",
+		{Name: "search_items", Description: "全文搜索当前项目的长期目标、检查点、规范条目、讨论、决策、经验、摘要、标签和 CI 检查。",
 			InputSchema: map[string]any{"type": "object", "additionalProperties": false, "properties": map[string]any{
 				"text": map[string]string{"type": "string"}, "kinds": map[string]any{"type": "array", "items": map[string]string{"type": "string"}},
 				"statuses": map[string]any{"type": "array", "items": map[string]string{"type": "string"}}, "only_current": map[string]string{"type": "boolean"},
@@ -526,5 +546,8 @@ func toolDefinitions() []toolDefinition {
 		{Name: "get_clarifications", Description: "读取 Topic 或 Task 的结构化问题和人工答案。", InputSchema: subject(nil)},
 		{Name: "get_experience", Description: "按 ID 读取一条经验的完整指导、适用条件、证据状态和统计。", InputSchema: identifier("experience_id")},
 		{Name: "get_recalled_experiences", Description: "读取一个 Run 实际召回的经验及当时的可解释评分。", InputSchema: identifier("run_id")},
+		{Name: "get_current_objective", Description: "读取当前活跃或暂停的长期目标、完成条件、最近检查点和派生进度。",
+			InputSchema: map[string]any{"type": "object", "additionalProperties": false}},
+		{Name: "get_objective_checkpoints", Description: "读取长期目标的不可变检查点历史。", InputSchema: identifier("objective_id")},
 	}
 }

@@ -104,10 +104,26 @@ const runningRun = {
 	created_at: '2026-08-20T01:00:00Z', updated_at: '2026-08-20T01:00:02Z',
 }
 
+const objectiveView = {
+	objective: {
+		id: 'objective-1', key: 'OBJ-0001', root_topic_id: 'topic-1', status: 'ACTIVE',
+		current_revision_id: 'objective-revision-1', max_continuations: 20, continuation_count: 0,
+		version: 1, created_at: '2026-09-05T00:00:00Z', updated_at: '2026-09-05T00:00:00Z',
+	},
+	revision: {
+		id: 'objective-revision-1', objective_id: 'objective-1', revision: 1,
+		statement: '完成生产级交付', scope: '当前项目', constraints: ['不自动 push'],
+		completion_criteria: [{ id: 'criterion-1', description: '全部测试通过' }],
+		created_at: '2026-09-05T00:00:00Z',
+	},
+	progress: { criteria_total: 1, criteria_satisfied: 0, tasks_total: 2, tasks_accepted: 1 },
+}
+
 let openClarifications: unknown[] = []
 let openApprovals: unknown[] = []
 let activeRuns: unknown[] = []
 let schedulerError = ''
+let currentObjective: unknown = null
 
 const fetchMock = vi.fn<typeof fetch>((input, init) => {
   const url = typeof input === 'string' ? input : input instanceof URL ? input.href : input.url
@@ -124,6 +140,20 @@ const fetchMock = vi.fn<typeof fetch>((input, init) => {
 		scheduler_error: schedulerError,
     }))
   }
+	if (url === '/api/objective' && method === 'GET') {
+		return Promise.resolve(Response.json(currentObjective))
+	}
+	if (url === '/api/objectives' && method === 'POST') {
+		currentObjective = objectiveView
+		return Promise.resolve(Response.json(currentObjective, { status: 201 }))
+	}
+	if (url === '/api/objectives/objective-1/pause' && method === 'POST') {
+		currentObjective = {
+			...objectiveView,
+			objective: { ...objectiveView.objective, status: 'PAUSED', version: 2 },
+		}
+		return Promise.resolve(Response.json(currentObjective))
+	}
 	if (url === '/api/project/workers' && method === 'POST') {
 		return Promise.resolve(Response.json({
 			name: 'AiTodos', root: '/projects/aitodos', agent: 'codex',
@@ -404,6 +434,7 @@ describe('App', () => {
 		openApprovals = []
 		activeRuns = []
 		schedulerError = ''
+		currentObjective = null
   })
 
 	it('在顶部暴露 Worker 调度异常', async () => {

@@ -26,7 +26,7 @@ export type TopicStatus = (typeof topicStatuses)[number]
 export const searchKinds = [
 	'TOPIC', 'TASK', 'MESSAGE', 'PLAN_REVISION', 'CLARIFICATION',
 	'DECISION', 'RUN_SUMMARY', 'CI_CHECK', 'LABEL',
-	'EXPERIENCE',
+	'EXPERIENCE', 'OBJECTIVE', 'CHECKPOINT',
 ] as const
 
 export type SearchKind = (typeof searchKinds)[number]
@@ -149,6 +149,74 @@ export interface Topic {
   version: number
   created_at: string
   updated_at: string
+}
+
+export type ObjectiveStatus = 'ACTIVE' | 'PAUSED' | 'ACHIEVED' | 'CANCELLED'
+export type ObjectiveCommand = 'pause' | 'resume' | 'achieve' | 'cancel'
+export type ObjectiveCriterionStatus = 'SATISFIED' | 'UNSATISFIED' | 'UNKNOWN'
+
+export interface ObjectiveCriterion {
+	id: string
+	description: string
+}
+
+export interface ObjectiveRevision {
+	id: string
+	objective_id: string
+	revision: number
+	statement: string
+	scope: string
+	constraints: string[]
+	completion_criteria: ObjectiveCriterion[]
+	previous_revision_id?: string
+	created_at: string
+}
+
+export interface ObjectiveCheckpoint {
+	id: string
+	objective_id: string
+	sequence: number
+	source_run_id?: string
+	summary: string
+	criteria: Array<{ criterion_id: string; status: ObjectiveCriterionStatus; evidence: string }>
+	completed: string[]
+	remaining: string[]
+	risks: string[]
+	stop_reason: 'PROGRESS' | 'NEEDS_INPUT' | 'REVIEW_REQUIRED' | 'LIMIT_REACHED' | 'READY_TO_COMPLETE' | 'NO_PROGRESS'
+	next_action: string
+	created_at: string
+}
+
+export interface ObjectiveView {
+	objective: {
+		id: string
+		key: string
+		root_topic_id: string
+		status: ObjectiveStatus
+		current_revision_id: string
+		max_continuations: number
+		continuation_count: number
+		version: number
+		created_at: string
+		updated_at: string
+		completed_at?: string
+	}
+	revision: ObjectiveRevision
+	latest_checkpoint?: ObjectiveCheckpoint
+	progress: {
+		criteria_total: number
+		criteria_satisfied: number
+		tasks_total: number
+		tasks_accepted: number
+	}
+}
+
+export interface CreateObjectiveInput {
+	root_topic_id: string
+	statement: string
+	scope: string
+	constraints: string[]
+	completion_criteria: string[]
 }
 
 export type PlanStatus = 'IN_REVIEW' | 'CHANGES_REQUESTED' | 'APPROVED'

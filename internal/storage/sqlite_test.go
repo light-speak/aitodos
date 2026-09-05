@@ -3,66 +3,74 @@ package storage
 import (
 	"context"
 	"database/sql"
-	"fmt"
+	"errors"
 	"path/filepath"
 	"sync"
 	"testing"
-
-	"github.com/light-speak/aitodos/internal/domain/agentprofile"
-	"github.com/light-speak/aitodos/internal/domain/topic"
 )
 
-func TestOpenEnablesRequiredPragmasAndMigrates(t *testing.T) {
+func TestOpenEnablesRequiredPragmasAndCreatesBaseline(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	metadata := ProjectMetadata{
-		InstanceID:   "instance-1",
-		Name:         "example",
-		RepoRoot:     "/tmp/example",
-		GitCommonDir: "/tmp/example/.git",
+		InstanceID: "instance-1", Name: "example",
+		RepoRoot: "/repo/example", GitCommonDir: "/repo/example/.git",
 	}
-
-	database, err := Open(context.Background(), path, metadata)
+	database, err := Open(t.Context(), path, metadata)
 	if err != nil {
-		t.Fatalf("Open() error = %v", err)
+		t.Fatal(err)
 	}
 	defer database.Close()
 
 	var journalMode string
-	if err := database.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil {
-		t.Fatal(err)
+	if err := database.QueryRow("PRAGMA journal_mode").Scan(&journalMode); err != nil || journalMode != "wal" {
+		t.Fatalf("journal mode = %q, %v; want wal", journalMode, err)
 	}
-	if journalMode != "wal" {
-		t.Fatalf("journal mode = %q, want wal", journalMode)
-	}
-
 	var foreignKeys int
-	if err := database.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil {
+	if err := database.QueryRow("PRAGMA foreign_keys").Scan(&foreignKeys); err != nil || foreignKeys != 1 {
+		t.Fatalf("foreign_keys = %d, %v; want 1", foreignKeys, err)
+	}
+	loaded, err := ReadProjectMetadata(t.Context(), database)
+	if err != nil || loaded != metadata {
+		t.Fatalf("metadata = %#v, %v; want %#v", loaded, err, metadata)
+	}
+	epoch, version, err := schemaIdentity(t.Context(), database)
+	if err != nil || epoch != currentSchemaEpoch || version != currentSchemaVersion {
+		t.Fatalf("schema = %d/%d, %v; want %d/%d", epoch, version, err, currentSchemaEpoch, currentSchemaVersion)
+	}
+	for _, table := range []string{
+		"topics", "tasks", "runs", "search_documents", "objectives",
+		"objective_revisions", "objective_checkpoints", "objective_events",
+	} {
+		var found string
+		if err := database.QueryRow(
+			"SELECT name FROM sqlite_schema WHERE type = 'table' AND name = ?", table,
+		).Scan(&found); err != nil {
+			t.Fatalf("find baseline table %s: %v", table, err)
+		}
+	}
+	var profiles, defaults int
+	if err := database.QueryRow("SELECT COUNT(*) FROM agent_profiles").Scan(&profiles); err != nil {
 		t.Fatal(err)
 	}
-	if foreignKeys != 1 {
-		t.Fatalf("foreign_keys = %d, want 1", foreignKeys)
+	if err := database.QueryRow("SELECT COUNT(*) FROM project_agent_defaults").Scan(&defaults); err != nil {
+		t.Fatal(err)
 	}
-
-	loaded, err := ReadProjectMetadata(context.Background(), database)
-	if err != nil {
-		t.Fatalf("ReadProjectMetadata() error = %v", err)
+	if profiles != 5 || defaults != 5 {
+		t.Fatalf("default agent configuration = %d profiles, %d defaults; want 5 and 5", profiles, defaults)
 	}
-	if loaded != metadata {
-		t.Fatalf("metadata = %#v, want %#v", loaded, metadata)
-	}
-
-	version, err := schemaVersion(context.Background(), database)
+	rows, err := database.Query("PRAGMA foreign_key_check")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if version != currentSchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
+	defer rows.Close()
+	if rows.Next() {
+		t.Fatal("baseline contains a foreign key violation")
 	}
 }
 
 func TestOpenExistingWaitsForConcurrentWALConfiguration(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	database, err := Open(context.Background(), path, ProjectMetadata{
+	database, err := Open(t.Context(), path, ProjectMetadata{
 		InstanceID: "concurrent", Name: "concurrent", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
 	})
 	if err != nil {
@@ -98,258 +106,100 @@ func TestOpenExistingWaitsForConcurrentWALConfiguration(t *testing.T) {
 	}
 }
 
-func TestMigrationsSixteenAndSeventeenPreserveRunAndQualityForeignKeys(t *testing.T) {
-	ctx := context.Background()
+func TestOpenCreatesOneBaselineUnderConcurrentInitialization(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := configure(ctx, database); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-)`); err != nil {
-		t.Fatal(err)
-	}
-	for version := 1; version <= 15; version++ {
-		if err := applyMigration(ctx, database, version); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if err := upsertProjectMetadata(ctx, database, ProjectMetadata{
-		InstanceID: "migration-16", Name: "example", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
-	}); err != nil {
-		t.Fatal(err)
-	}
-	now := "2026-08-20T00:00:00Z"
-	if _, err := database.ExecContext(ctx, `
-INSERT INTO tasks(
-    id, task_key, title, description, acceptance_criteria, status, priority,
-    target_branch, base_commit_sha, current_workspace_id, latest_run_id,
-    created_at, updated_at, version
-) VALUES ('task-migration', 'ATS-MIGRATE', '保留迁移数据', '', '', 'REVIEW', 2,
-          '', '', '', 'run-migration', ?, ?, 2);
-INSERT INTO task_events(id, task_id, sequence, event_type, payload_json, occurred_at)
-VALUES ('event-migration', 'task-migration', 1, 'TASK_CREATED', '{}', ?);
-INSERT INTO runs(
-    id, purpose, topic_id, task_id, status, profile_revision_id, retry_of_run_id,
-    claim_token_hash, lease_generation, lease_expires_at, run_nonce,
-    queued_at, claimed_at, started_at, finished_at, exit_code,
-    failure_kind, failure_code, failure_message, created_at, updated_at
-) VALUES ('run-migration', 'IMPLEMENTATION', NULL, 'task-migration', 'SUCCEEDED',
-          'profile-implementer-r1', NULL, 'hash', 1, ?, 'nonce', ?, ?, ?, ?, 0,
-          '', '', '', ?, ?);
-INSERT INTO run_artifacts(id, run_id, kind, relative_path, sha256, size, truncated, created_at)
-VALUES ('artifact-migration', 'run-migration', 'PROMPT', 'runs/migration/prompt.md', 'abc', 3, 0, ?);
-INSERT INTO task_estimates(
-    id, task_id, revision, points, remaining_points, confidence, rationale,
-    source, source_run_id, created_at
-) VALUES ('estimate-migration', 'task-migration', 1, 3, 3, 0.7, '迁移测试',
-          'AI', 'run-migration', ?)`,
-		now, now, now, now, now, now, now, now, now, now, now, now,
-	); err != nil {
-		t.Fatal(err)
-	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
-	}
-
-	upgraded, err := OpenExisting(ctx, path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer upgraded.Close()
-	if _, err := NewRunStore(upgraded).Get(ctx, "run-migration"); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := NewAgentProfileStore(upgraded).GetByRole(ctx, agentprofile.RoleTriager); err != nil {
-		t.Fatal(err)
-	}
-	rows, err := upgraded.QueryContext(ctx, "PRAGMA foreign_key_check")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer rows.Close()
-	if rows.Next() {
-		t.Fatal("migration 16 left a foreign key violation")
-	}
-}
-
-func TestOpenExistingMigratesVersionTwoDatabaseToTopics(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "state.db")
-	database, err := sql.Open("sqlite", path)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := configure(ctx, database); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.ExecContext(ctx, `
-CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
-)`); err != nil {
-		t.Fatal(err)
-	}
-	for version := 1; version <= 2; version++ {
-		if err := applyMigration(ctx, database, version); err != nil {
-			t.Fatal(err)
-		}
-	}
 	metadata := ProjectMetadata{
-		InstanceID: "instance-v2", Name: "example", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
+		InstanceID: "concurrent-init", Name: "concurrent", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
 	}
-	if err := upsertProjectMetadata(ctx, database, metadata); err != nil {
-		t.Fatal(err)
+	const writers = 4
+	start := make(chan struct{})
+	errorsFound := make(chan error, writers)
+	var group sync.WaitGroup
+	for range writers {
+		group.Add(1)
+		go func() {
+			defer group.Done()
+			<-start
+			opened, openErr := Open(context.Background(), path, metadata)
+			if openErr == nil {
+				openErr = opened.Close()
+			}
+			errorsFound <- openErr
+		}()
 	}
-	if err := database.Close(); err != nil {
-		t.Fatal(err)
+	close(start)
+	group.Wait()
+	close(errorsFound)
+	for openErr := range errorsFound {
+		if openErr != nil {
+			t.Fatalf("Open() concurrent initialization error = %v", openErr)
+		}
 	}
-
-	upgraded, err := OpenExisting(ctx, path)
+	database, err := OpenExisting(t.Context(), path)
 	if err != nil {
-		t.Fatalf("OpenExisting() error = %v", err)
-	}
-	defer upgraded.Close()
-	version, err := schemaVersion(ctx, upgraded)
-	if err != nil {
 		t.Fatal(err)
 	}
-	if version != currentSchemaVersion {
-		t.Fatalf("schema version = %d, want %d", version, currentSchemaVersion)
-	}
-	if _, err := NewTopicStore(upgraded).Create(ctx, topic.CreateInput{Title: "迁移后的 Topic"}); err != nil {
-		t.Fatalf("create Topic after migration: %v", err)
+	defer database.Close()
+	var rows int
+	if err := database.QueryRow("SELECT COUNT(*) FROM schema_metadata WHERE id = 1").Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("schema metadata rows = %d, %v", rows, err)
 	}
 }
 
-func TestOpenExistingMigratesVersionThreeDatabaseToDiscussionTables(t *testing.T) {
-	ctx := context.Background()
+func TestSchemaInitializationLockHonorsContextCancellation(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db.init.lock")
+	first, err := acquireSchemaLock(t.Context(), path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer releaseSchemaLock(first)
+	cancelled, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	second, err := acquireSchemaLock(cancelled, path)
+	if second != nil {
+		releaseSchemaLock(second)
+		t.Fatal("cancelled lock acquisition unexpectedly succeeded")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("lock error = %v, want context.Canceled", err)
+	}
+}
+
+func TestOpenExistingRejectsPreReleaseMigrationDatabase(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "state.db")
 	database, err := sql.Open("sqlite", path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := configure(ctx, database); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := database.ExecContext(ctx, `
-CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY,
-    applied_at TEXT NOT NULL
-)`); err != nil {
-		t.Fatal(err)
-	}
-	for version := 1; version <= 3; version++ {
-		if err := applyMigration(ctx, database, version); err != nil {
-			t.Fatal(err)
-		}
-	}
-	metadata := ProjectMetadata{
-		InstanceID: "instance-v3", Name: "example", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
-	}
-	if err := upsertProjectMetadata(ctx, database, metadata); err != nil {
+	if _, err := database.Exec(`
+CREATE TABLE schema_migrations(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL);
+INSERT INTO schema_migrations(version, applied_at) VALUES (45, '2026-09-05T00:00:00Z')`); err != nil {
 		t.Fatal(err)
 	}
 	if err := database.Close(); err != nil {
 		t.Fatal(err)
 	}
-
-	upgraded, err := OpenExisting(ctx, path)
-	if err != nil {
-		t.Fatalf("OpenExisting() error = %v", err)
-	}
-	defer upgraded.Close()
-	for _, table := range []string{"threads", "messages"} {
-		var name string
-		if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name); err != nil {
-			t.Fatalf("find table %s: %v", table, err)
-		}
-	}
-	var artifactTable string
-	if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'artifacts'").Scan(&artifactTable); err != nil {
-		t.Fatalf("find artifacts table: %v", err)
-	}
-	for _, table := range []string{"message_task_links", "topic_task_links", "task_relations"} {
-		var name string
-		if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name); err != nil {
-			t.Fatalf("find table %s: %v", table, err)
-		}
-	}
-	for _, table := range []string{"workspaces", "releases", "task_reviews"} {
-		var name string
-		if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name); err != nil {
-			t.Fatalf("find table %s: %v", table, err)
-		}
+	if _, err := OpenExisting(t.Context(), path); !errors.Is(err, ErrLegacySchema) {
+		t.Fatalf("OpenExisting() error = %v, want ErrLegacySchema", err)
 	}
 }
 
-func TestEveryHistoricalSchemaVersionUpgradesToCurrent(t *testing.T) {
-	for startingVersion := 1; startingVersion < currentSchemaVersion; startingVersion++ {
-		t.Run(fmt.Sprintf("v%d", startingVersion), func(t *testing.T) {
-			ctx := t.Context()
-			path := filepath.Join(t.TempDir(), "state.db")
-			database, err := sql.Open("sqlite", path)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if err := configure(ctx, database); err != nil {
-				database.Close()
-				t.Fatal(err)
-			}
-			if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (
-    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
-)`); err != nil {
-				database.Close()
-				t.Fatal(err)
-			}
-			for version := 1; version <= startingVersion; version++ {
-				if err := applyMigration(ctx, database, version); err != nil {
-					database.Close()
-					t.Fatalf("prepare schema v%d: %v", version, err)
-				}
-			}
-			metadata := ProjectMetadata{
-				InstanceID:   fmt.Sprintf("upgrade-v%d", startingVersion),
-				Name:         "upgrade-test",
-				RepoRoot:     "/repo",
-				GitCommonDir: "/repo/.git",
-			}
-			if err := upsertProjectMetadata(ctx, database, metadata); err != nil {
-				database.Close()
-				t.Fatal(err)
-			}
-			if err := database.Close(); err != nil {
-				t.Fatal(err)
-			}
-
-			upgraded, err := OpenExisting(ctx, path)
-			if err != nil {
-				t.Fatalf("upgrade schema v%d: %v", startingVersion, err)
-			}
-			defer upgraded.Close()
-			version, err := schemaVersion(ctx, upgraded)
-			if err != nil || version != currentSchemaVersion {
-				t.Fatalf("schema version = %d, %v; want %d", version, err, currentSchemaVersion)
-			}
-			loaded, err := ReadProjectMetadata(ctx, upgraded)
-			if err != nil || loaded != metadata {
-				t.Fatalf("metadata = %#v, %v; want %#v", loaded, err, metadata)
-			}
-			rows, err := upgraded.QueryContext(ctx, "PRAGMA foreign_key_check")
-			if err != nil {
-				t.Fatal(err)
-			}
-			if rows.Next() {
-				rows.Close()
-				t.Fatal("upgrade left a foreign key violation")
-			}
-			if err := rows.Close(); err != nil {
-				t.Fatal(err)
-			}
-		})
+func TestOpenExistingRejectsDifferentSchemaIdentity(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "state.db")
+	database, err := Open(t.Context(), path, ProjectMetadata{
+		InstanceID: "future", Name: "future", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := database.Exec("UPDATE schema_metadata SET version = 2 WHERE id = 1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := database.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := OpenExisting(t.Context(), path); !errors.Is(err, ErrUnsupportedSchema) {
+		t.Fatalf("OpenExisting() error = %v, want ErrUnsupportedSchema", err)
 	}
 }

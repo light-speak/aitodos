@@ -1,17 +1,18 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 
-import { archiveTask, cancelTask, createTask, createTopic, getProject, getTasks, getTopics, updateTaskDetails, updateTaskTargetBranch, updateWorkerSettings } from '../../api/client'
-import type { CreateTaskInput, CreateTopicInput, ProjectInfo, Task, Topic, UpdateTaskDetailsInput } from '../../types'
+import { archiveTask, cancelTask, commandObjective, createObjective, createTask, createTopic, getCurrentObjective, getProject, getTasks, getTopics, updateTaskDetails, updateTaskTargetBranch, updateWorkerSettings } from '../../api/client'
+import type { CreateObjectiveInput, CreateTaskInput, CreateTopicInput, ObjectiveCommand, ObjectiveView, ProjectInfo, Task, Topic, UpdateTaskDetailsInput } from '../../types'
 
 interface BoardState {
   project: ProjectInfo | null
   topics: Topic[]
   tasks: Task[]
+	objective: ObjectiveView | null
   loading: boolean
   error: unknown
 }
 
-const initialState: BoardState = { project: null, topics: [], tasks: [], loading: true, error: null }
+const initialState: BoardState = { project: null, topics: [], tasks: [], objective: null, loading: true, error: null }
 const workerRefreshIntervalMs = 2_000
 
 export function useTaskBoard() {
@@ -22,7 +23,7 @@ export function useTaskBoard() {
   useEffect(() => {
     const controller = new AbortController()
     void loadBoard(controller.signal).then(
-      ({ project, topics, tasks }) => setState({ project, topics, tasks, loading: false, error: null }),
+		({ project, topics, tasks, objective }) => setState({ project, topics, tasks, objective, loading: false, error: null }),
       (error: unknown) => {
         if (!controller.signal.aborted) {
           setState((current) => ({ ...current, loading: false, error }))
@@ -39,8 +40,8 @@ export function useTaskBoard() {
     const timer = window.setInterval(() => {
       if (loading) return
       loading = true
-		void Promise.all([getProject(controller.signal), getTopics(controller.signal), getTasks(controller.signal)]).then(
-			([project, topics, tasks]) => setState((current) => ({ ...current, project, topics, tasks })),
+		void Promise.all([getProject(controller.signal), getTopics(controller.signal), getTasks(controller.signal), getCurrentObjective(controller.signal)]).then(
+			([project, topics, tasks, objective]) => setState((current) => ({ ...current, project, topics, tasks, objective })),
         (error: unknown) => {
           if (!controller.signal.aborted) {
             setState((current) => ({ ...current, error }))
@@ -74,6 +75,19 @@ export function useTaskBoard() {
 			setUpdatingWorkers(false)
 		}
 	}, [])
+
+	const createLongObjective = useCallback(async (input: CreateObjectiveInput) => {
+		const objective = await createObjective(input)
+		setState((current) => ({ ...current, objective }))
+		return objective
+	}, [])
+
+	const controlObjective = useCallback(async (command: ObjectiveCommand) => {
+		if (state.objective === null) return null
+		const updated = await commandObjective(state.objective.objective.id, command, state.objective.objective.version)
+		setState((current) => ({ ...current, objective: updated.objective.status === 'ACTIVE' || updated.objective.status === 'PAUSED' ? updated : null }))
+		return updated
+	}, [state.objective])
 
   const reload = useCallback(() => {
     setState((current) => ({ ...current, loading: true, error: null }))
@@ -119,6 +133,8 @@ export function useTaskBoard() {
       createTask: create,
       createTopic: createNewTopic,
 		updateWorkers,
+			createObjective: createLongObjective,
+			commandObjective: controlObjective,
 			updateTask,
 			updateTopic,
 			updateTargetBranch: changeTargetBranch,
@@ -127,7 +143,7 @@ export function useTaskBoard() {
 			archiveTask: archiveCurrentTask,
       reload,
     }),
-		[archiveCurrentTask, cancelCurrentTask, changeTargetBranch, changeTaskDetails, create, createNewTopic, reload, state, updateTask, updateTopic, updateWorkers, updatingWorkers],
+		[archiveCurrentTask, cancelCurrentTask, changeTargetBranch, changeTaskDetails, controlObjective, create, createLongObjective, createNewTopic, reload, state, updateTask, updateTopic, updateWorkers, updatingWorkers],
   )
 }
 
@@ -136,8 +152,8 @@ function replaceTopic(items: Topic[], updated: Topic): Topic[] {
 }
 
 async function loadBoard(signal: AbortSignal) {
-  const [project, topics, tasks] = await Promise.all([getProject(signal), getTopics(signal), getTasks(signal)])
-  return { project, topics, tasks }
+	const [project, topics, tasks, objective] = await Promise.all([getProject(signal), getTopics(signal), getTasks(signal), getCurrentObjective(signal)])
+	return { project, topics, tasks, objective }
 }
 
 function replaceTask(tasks: Task[], updated: Task): Task[] {

@@ -28,6 +28,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/capability"
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/experience"
+	"github.com/light-speak/aitodos/internal/domain/objective"
 	"github.com/light-speak/aitodos/internal/domain/plan"
 	"github.com/light-speak/aitodos/internal/domain/quality"
 	domainrun "github.com/light-speak/aitodos/internal/domain/run"
@@ -448,6 +449,11 @@ func buildPlanningPrompt(
 		{Source: "Current Topic", Content: formatTopic(currentTopic), Required: true, Priority: 0},
 		{Source: "Machine Result Contract", Content: machineResultContract(currentRun.Purpose), Required: true, Priority: 0},
 	}
+	if objectiveChunk, found, objectiveErr := objectiveContextChunk(ctx, database, currentRun.TopicID, ""); objectiveErr != nil {
+		return "", contextbuilder.Manifest{}, objectiveErr
+	} else if found {
+		chunks = append(chunks, objectiveChunk)
+	}
 	policyJSON, err := json.MarshalIndent(toolPolicy, "", "  ")
 	if err != nil {
 		return "", contextbuilder.Manifest{}, fmt.Errorf("encode tool policy context: %w", err)
@@ -522,6 +528,11 @@ func buildTaskPrompt(
 		{Source: "Agent Role Instructions", Content: revision.Instructions, Required: true, Priority: 0},
 		{Source: "Current Task", Content: formatTask(currentTask), Required: true, Priority: 0},
 		{Source: "Machine Result Contract", Content: machineResultContract(currentRun.Purpose), Required: true, Priority: 0},
+	}
+	if objectiveChunk, found, objectiveErr := objectiveContextChunk(ctx, database, "", currentRun.TaskID); objectiveErr != nil {
+		return "", contextbuilder.Manifest{}, objectiveErr
+	} else if found {
+		chunks = append(chunks, objectiveChunk)
 	}
 	policyJSON, err := json.MarshalIndent(toolPolicy, "", "  ")
 	if err != nil {
@@ -608,6 +619,30 @@ func buildTaskPrompt(
 	}
 	budget := revision.MaxInputTokens - revision.ReservedOutputTokens
 	return contextbuilder.Assemble(chunks, budget)
+}
+
+func objectiveContextChunk(ctx context.Context, database *sql.DB, topicID, taskID string) (contextbuilder.Chunk, bool, error) {
+	store := storage.NewObjectiveStore(database)
+	var current objective.View
+	var err error
+	if topicID != "" {
+		current, err = store.GetForTopic(ctx, topicID)
+	} else {
+		current, err = store.GetForTask(ctx, taskID)
+	}
+	if errors.Is(err, storage.ErrObjectiveNotFound) {
+		return contextbuilder.Chunk{}, false, nil
+	}
+	if err != nil {
+		return contextbuilder.Chunk{}, false, fmt.Errorf("load current long-term objective: %w", err)
+	}
+	encoded, err := json.MarshalIndent(current, "", "  ")
+	if err != nil {
+		return contextbuilder.Chunk{}, false, fmt.Errorf("encode current long-term objective: %w", err)
+	}
+	return contextbuilder.Chunk{
+		Source: "Current Long-Term Objective", Content: string(encoded), Required: true, Priority: 0,
+	}, true, nil
 }
 
 func recallTopicExperiences(

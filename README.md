@@ -25,6 +25,7 @@ Topic 讨论
 主要能力：
 
 - Topic、Plan Revision、Task 和关联讨论的持久化管理。
+- 绑定根 Topic 的长期目标：用不可变完成条件和 Checkpoint 跨 Run、Session、Plan 与多个 Task 保持方向。
 - Planning、Implementation、Revision 和 Review 职责分离的 Agent Run。
 - 项目级 Worker 调度、优先级、取消、恢复与结构化人工问答。
 - 每个 Task 长期复用独立 Git worktree，主工作区不运行 Agent。
@@ -42,10 +43,10 @@ Topic 讨论
 ```text
 人类意图与讨论
       ↓
-Topic → Plan Revision → Task → Agent Run → Review / Integration
-  │                         │
-  ├── Decision              ├── Prompt + Context Manifest
-  └── Experience Ledger ←───┴── Test / Usage / Recall Evidence
+Objective → root Topic → Plan Revision → Task → Agent Run → Review / Integration
+                 │                         │
+                 ├── Decision              ├── Prompt + Context Manifest
+                 └── Experience Ledger ←───┴── Test / Usage / Recall Evidence
 ```
 
 ### 经验账本与证据召回
@@ -109,6 +110,8 @@ pnpm --dir web build
 ```
 
 `ats init` 会在当前项目创建 `.ats/`，用于保存项目配置、本地数据库、Artifact、runtime metadata 和 Task worktree。`ats start` 始终以前台模式运行，不会自动打开浏览器；终端关闭后服务随之停止。
+
+首个稳定版发布前使用单一数据库基线，不兼容更早的开发数据库。检测到旧开发 Schema 时命令会停止并提示重新初始化，不会自动删除 `.ats`；需要保留的数据应先使用对应旧版本备份。
 
 可用命令：
 

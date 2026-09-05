@@ -78,6 +78,9 @@ import type {
 	RetrievalEvalCase,
 	CreateRetrievalEvalCaseInput,
 	RetrievalEvalRun,
+	ObjectiveView,
+	CreateObjectiveInput,
+	ObjectiveCommand,
 } from '../types'
 
 interface RequestOptions {
@@ -100,6 +103,21 @@ export class ApiError extends Error {
 
 export async function getProject(signal?: AbortSignal): Promise<ProjectInfo> {
   return parseProject(await requestJSON('/api/project', { signal }))
+}
+
+export async function getCurrentObjective(signal?: AbortSignal): Promise<ObjectiveView | null> {
+	const value = await requestJSON('/api/objective', { signal })
+	return value === null ? null : parseObjectiveView(value)
+}
+
+export async function createObjective(input: CreateObjectiveInput): Promise<ObjectiveView> {
+	return parseObjectiveView(await requestJSON('/api/objectives', { method: 'POST', body: input }))
+}
+
+export async function commandObjective(id: string, command: ObjectiveCommand, expectedVersion: number): Promise<ObjectiveView> {
+	return parseObjectiveView(await requestJSON(`/api/objectives/${encodeURIComponent(id)}/${command}`, {
+		method: 'POST', body: { expected_version: expectedVersion },
+	}))
 }
 
 export async function configureCodexAgentDefaults(): Promise<AgentProfile[]> {
@@ -713,6 +731,84 @@ function parseProject(value: unknown): ProjectInfo {
 		workers_enabled: value.workers_enabled, max_workers: value.max_workers,
 		scheduler_failures: value.scheduler_failures, scheduler_error: value.scheduler_error,
 	}
+}
+
+function parseObjectiveView(value: unknown): ObjectiveView {
+	if (!isRecord(value) || !isRecord(value.objective) || !isRecord(value.revision) || !isRecord(value.progress)) {
+		throw new ApiError('长期目标格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const item = value.objective
+	const revision = value.revision
+	const progress = value.progress
+	if (!hasStringFields(item, ['id', 'key', 'root_topic_id', 'current_revision_id', 'created_at', 'updated_at']) ||
+		!isObjectiveStatus(item.status) || !hasNumberFields(item, ['max_continuations', 'continuation_count', 'version']) ||
+		!hasStringFields(revision, ['id', 'objective_id', 'statement', 'scope', 'created_at']) ||
+		typeof revision.revision !== 'number' || !isStringArray(revision.constraints) || !Array.isArray(revision.completion_criteria) ||
+		!hasNumberFields(progress, ['criteria_total', 'criteria_satisfied', 'tasks_total', 'tasks_accepted'])) {
+		throw new ApiError('长期目标格式无效', 502, 'INVALID_RESPONSE')
+	}
+	const objective = {
+		id: item.id as string, key: item.key as string, root_topic_id: item.root_topic_id as string,
+		status: item.status, current_revision_id: item.current_revision_id as string,
+		max_continuations: item.max_continuations as number, continuation_count: item.continuation_count as number,
+		version: item.version as number, created_at: item.created_at as string, updated_at: item.updated_at as string,
+		...(typeof item.completed_at === 'string' ? { completed_at: item.completed_at } : {}),
+	}
+	return {
+		objective,
+		revision: {
+			id: revision.id as string, objective_id: revision.objective_id as string, revision: revision.revision,
+			statement: revision.statement as string, scope: revision.scope as string,
+			constraints: revision.constraints, completion_criteria: revision.completion_criteria.map(parseObjectiveCriterion),
+			created_at: revision.created_at as string,
+			...(typeof revision.previous_revision_id === 'string' ? { previous_revision_id: revision.previous_revision_id } : {}),
+		},
+		progress: {
+			criteria_total: progress.criteria_total as number, criteria_satisfied: progress.criteria_satisfied as number,
+			tasks_total: progress.tasks_total as number, tasks_accepted: progress.tasks_accepted as number,
+		},
+		...(value.latest_checkpoint === undefined ? {} : { latest_checkpoint: parseObjectiveCheckpoint(value.latest_checkpoint) }),
+	}
+}
+
+function parseObjectiveCriterion(value: unknown): ObjectiveView['revision']['completion_criteria'][number] {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'description'])) {
+		throw new ApiError('长期目标完成条件格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return { id: value.id as string, description: value.description as string }
+}
+
+function parseObjectiveCheckpoint(value: unknown): NonNullable<ObjectiveView['latest_checkpoint']> {
+	if (!isRecord(value) || !hasStringFields(value, ['id', 'objective_id', 'summary', 'stop_reason', 'next_action', 'created_at']) ||
+		typeof value.sequence !== 'number' || !Array.isArray(value.criteria) ||
+		!isStringArray(value.completed) || !isStringArray(value.remaining) || !isStringArray(value.risks) ||
+		!isObjectiveStopReason(value.stop_reason)) {
+		throw new ApiError('长期目标检查点格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return {
+		id: value.id as string, objective_id: value.objective_id as string, sequence: value.sequence,
+		summary: value.summary as string, criteria: value.criteria.map(parseObjectiveCriterionResult),
+		completed: value.completed, remaining: value.remaining, risks: value.risks,
+		stop_reason: value.stop_reason, next_action: value.next_action as string, created_at: value.created_at as string,
+		...(typeof value.source_run_id === 'string' ? { source_run_id: value.source_run_id } : {}),
+	}
+}
+
+function parseObjectiveCriterionResult(value: unknown): NonNullable<ObjectiveView['latest_checkpoint']>['criteria'][number] {
+	if (!isRecord(value) || !hasStringFields(value, ['criterion_id', 'evidence']) ||
+		(value.status !== 'SATISFIED' && value.status !== 'UNSATISFIED' && value.status !== 'UNKNOWN')) {
+		throw new ApiError('长期目标证据格式无效', 502, 'INVALID_RESPONSE')
+	}
+	return { criterion_id: value.criterion_id as string, status: value.status, evidence: value.evidence as string }
+}
+
+function isObjectiveStatus(value: unknown): value is ObjectiveView['objective']['status'] {
+	return value === 'ACTIVE' || value === 'PAUSED' || value === 'ACHIEVED' || value === 'CANCELLED'
+}
+
+function isObjectiveStopReason(value: unknown): value is NonNullable<ObjectiveView['latest_checkpoint']>['stop_reason'] {
+	return value === 'PROGRESS' || value === 'NEEDS_INPUT' || value === 'REVIEW_REQUIRED' ||
+		value === 'LIMIT_REACHED' || value === 'READY_TO_COMPLETE' || value === 'NO_PROGRESS'
 }
 
 function parseProjectProgress(value: unknown): ProjectProgress {

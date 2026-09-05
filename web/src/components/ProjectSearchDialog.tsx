@@ -140,5 +140,6 @@ function kindLabel(kind: SearchKind): string {
 	return ({
 		TOPIC: 'Topic', TASK: 'Task', MESSAGE: '消息', PLAN_REVISION: 'Plan', CLARIFICATION: '待确认',
 		DECISION: '决策', RUN_SUMMARY: 'Run 摘要', CI_CHECK: 'CI', LABEL: '标签', EXPERIENCE: '经验',
+		OBJECTIVE: '长期目标', CHECKPOINT: '目标检查点',
 	})[kind]
 }

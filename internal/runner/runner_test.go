@@ -18,6 +18,7 @@ import (
 	"github.com/light-speak/aitodos/internal/domain/clarification"
 	"github.com/light-speak/aitodos/internal/domain/discussion"
 	"github.com/light-speak/aitodos/internal/domain/experience"
+	"github.com/light-speak/aitodos/internal/domain/objective"
 	"github.com/light-speak/aitodos/internal/domain/quality"
 	"github.com/light-speak/aitodos/internal/domain/run"
 	"github.com/light-speak/aitodos/internal/domain/task"
@@ -36,6 +37,52 @@ func TestProcessResultKeepsLogTruncationSeparate(t *testing.T) {
 	if !result.StdoutTruncated || result.StderrTruncated || bytes.Equal(result.Stdout, result.Stderr) {
 		t.Fatalf("process result = %#v", result)
 	}
+}
+
+func TestObjectiveContextChunkKeepsDurableGoalInTopicAndTaskRuns(t *testing.T) {
+	database := openRunnerTestDatabase(t)
+	rootTopic, err := storage.NewTopicStore(database).Create(t.Context(), topic.CreateInput{Title: "生产交付"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	linkedTask, err := storage.NewTaskStore(database).Create(t.Context(), task.CreateInput{Title: "完成恢复演练"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := storage.NewRelationStore(database).LinkTopicTask(t.Context(), rootTopic.ID, linkedTask.ID); err != nil {
+		t.Fatal(err)
+	}
+	created, err := storage.NewObjectiveStore(database).Create(t.Context(), objective.CreateInput{
+		RootTopicID: rootTopic.ID, Statement: "达到生产可用", CompletionCriteria: []string{"恢复演练通过"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = storage.NewObjectiveStore(database).AppendCheckpoint(t.Context(), created.Objective.ID, created.Objective.Version, objective.CheckpointInput{
+		Summary: "测试已通过", Remaining: []string{"恢复演练"}, StopReason: objective.StopProgress, NextAction: "运行恢复演练",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, subject := range []struct{ topicID, taskID string }{{topicID: rootTopic.ID}, {taskID: linkedTask.ID}} {
+		chunk, found, err := objectiveContextChunk(t.Context(), database, subject.topicID, subject.taskID)
+		if err != nil || !found || !chunk.Required || !strings.Contains(chunk.Content, "达到生产可用") || !strings.Contains(chunk.Content, "恢复演练") {
+			t.Fatalf("chunk = %#v, found = %v, err = %v", chunk, found, err)
+		}
+	}
+}
+
+func openRunnerTestDatabase(t *testing.T) *sql.DB {
+	t.Helper()
+	database, err := storage.Open(t.Context(), filepath.Join(t.TempDir(), "state.db"), storage.ProjectMetadata{
+		InstanceID: "runner-test", Name: "test", RepoRoot: "/repo", GitCommonDir: "/repo/.git",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	return database
 }
 
 func TestRecoverFinalizationReplaysWorkspaceAndTerminalState(t *testing.T) {

@@ -117,6 +117,7 @@ func newHandler(currentProject *project.Project, metadata Metadata, database *sq
 	relationStore := storage.NewRelationStore(database)
 	gitManager := gitworkflow.New(currentProject, database)
 	httpapi.RegisterTopicRoutes(mux, storage.NewTopicStore(database), discussionStore, relationStore)
+	httpapi.RegisterObjectiveRoutes(mux, storage.NewObjectiveStore(database))
 	httpapi.RegisterPlanRoutes(mux, storage.NewPlanStore(database))
 	taskStore := storage.NewTaskStore(database)
 	assessmentStore := storage.NewAssessmentStore(database)
