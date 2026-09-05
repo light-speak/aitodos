@@ -299,6 +299,23 @@ optimized_media_type, optimized_relative_path, optimized_size, optimized_sha256,
 	}
 }
 
+func TestDoctorJSONReportsOutputFailure(t *testing.T) {
+	repoRoot := initializeCLIProject(t)
+	restoreWorkingDirectory(t, repoRoot)
+
+	var stderr bytes.Buffer
+	code := Run(context.Background(), []string{"doctor", "--json"}, failingDoctorWriter{}, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "输出完整性检查 JSON") {
+		t.Fatalf("doctor --json code = %d, stderr = %q", code, stderr.String())
+	}
+}
+
+type failingDoctorWriter struct{}
+
+func (failingDoctorWriter) Write([]byte) (int, error) {
+	return 0, fmt.Errorf("拒绝写入")
+}
+
 func decodeDoctorReport(t *testing.T, content []byte) struct {
 	SchemaVersion     int      `json:"schema_version"`
 	ProjectInstanceID string   `json:"project_instance_id"`
