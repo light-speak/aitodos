@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -283,5 +284,72 @@ CREATE TABLE schema_migrations (
 		if err := upgraded.QueryRowContext(ctx, "SELECT name FROM sqlite_master WHERE type = 'table' AND name = ?", table).Scan(&name); err != nil {
 			t.Fatalf("find table %s: %v", table, err)
 		}
+	}
+}
+
+func TestEveryHistoricalSchemaVersionUpgradesToCurrent(t *testing.T) {
+	for startingVersion := 1; startingVersion < currentSchemaVersion; startingVersion++ {
+		t.Run(fmt.Sprintf("v%d", startingVersion), func(t *testing.T) {
+			ctx := t.Context()
+			path := filepath.Join(t.TempDir(), "state.db")
+			database, err := sql.Open("sqlite", path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := configure(ctx, database); err != nil {
+				database.Close()
+				t.Fatal(err)
+			}
+			if _, err := database.ExecContext(ctx, `CREATE TABLE schema_migrations (
+    version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
+)`); err != nil {
+				database.Close()
+				t.Fatal(err)
+			}
+			for version := 1; version <= startingVersion; version++ {
+				if err := applyMigration(ctx, database, version); err != nil {
+					database.Close()
+					t.Fatalf("prepare schema v%d: %v", version, err)
+				}
+			}
+			metadata := ProjectMetadata{
+				InstanceID:   fmt.Sprintf("upgrade-v%d", startingVersion),
+				Name:         "upgrade-test",
+				RepoRoot:     "/repo",
+				GitCommonDir: "/repo/.git",
+			}
+			if err := upsertProjectMetadata(ctx, database, metadata); err != nil {
+				database.Close()
+				t.Fatal(err)
+			}
+			if err := database.Close(); err != nil {
+				t.Fatal(err)
+			}
+
+			upgraded, err := OpenExisting(ctx, path)
+			if err != nil {
+				t.Fatalf("upgrade schema v%d: %v", startingVersion, err)
+			}
+			defer upgraded.Close()
+			version, err := schemaVersion(ctx, upgraded)
+			if err != nil || version != currentSchemaVersion {
+				t.Fatalf("schema version = %d, %v; want %d", version, err, currentSchemaVersion)
+			}
+			loaded, err := ReadProjectMetadata(ctx, upgraded)
+			if err != nil || loaded != metadata {
+				t.Fatalf("metadata = %#v, %v; want %#v", loaded, err, metadata)
+			}
+			rows, err := upgraded.QueryContext(ctx, "PRAGMA foreign_key_check")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if rows.Next() {
+				rows.Close()
+				t.Fatal("upgrade left a foreign key violation")
+			}
+			if err := rows.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }

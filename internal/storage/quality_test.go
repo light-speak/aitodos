@@ -87,6 +87,33 @@ func TestRequiredTestEvidenceGatesTaskAcceptance(t *testing.T) {
 	}
 }
 
+func TestQualityStoreEnsuresRequiredTestsPassed(t *testing.T) {
+	ctx := context.Background()
+	database := openTaskTestDatabase(t)
+	created, err := NewTaskStore(database).Create(ctx, task.CreateInput{Title: "验证公开门禁"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store := NewQualityStore(database)
+	testCase, err := store.CreateTestCase(ctx, created.ID, quality.TestCaseInput{
+		Title: "关键回归", Required: true, CreatedBy: quality.TestCreatorHuman,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureRequiredTestsPassed(ctx, created.ID); !errors.Is(err, ErrRequiredTestsNotPassed) {
+		t.Fatalf("missing evidence error = %v", err)
+	}
+	if _, err := store.AddTestResult(ctx, created.ID, testCase.ID, quality.TestResultInput{
+		Outcome: quality.OutcomePassed, EvidenceKind: quality.EvidenceHuman, Summary: "人工确认通过",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.EnsureRequiredTestsPassed(ctx, created.ID); err != nil {
+		t.Fatalf("verified evidence error = %v", err)
+	}
+}
+
 func TestLegacyCommandWithoutExitCodeDoesNotPassVerification(t *testing.T) {
 	ctx := context.Background()
 	database := openTaskTestDatabase(t)

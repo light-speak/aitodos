@@ -11,13 +11,42 @@ permissions:
 jobs:
   release:
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
           cache: true
+      - uses: pnpm/action-setup@v6
+        with:
+          version: 11.9.0
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22.22.2
+          cache: pnpm
+          cache-dependency-path: web/pnpm-lock.yaml
+      - name: Validate release tag
+        env:
+          VERSION: ${{ github.ref_name }}
+        run: |
+          if [[ ! "$VERSION" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "::error::Invalid SemVer release tag: $VERSION"
+            exit 1
+          fi
+      - name: Qualify source tree
+        run: |
+          set -euo pipefail
+          go mod verify
+          go test ./... -timeout=15m
+          go vet ./...
+          test -z "$(gofmt -l cmd internal)"
+          pnpm --dir web install --frozen-lockfile
+          pnpm --dir web lint
+          pnpm --dir web typecheck
+          pnpm --dir web test
+          pnpm --dir web build
+          test -z "$(git status --porcelain -- internal/webui/dist)"
       - name: Build release archives
         env:
           VERSION: ${{ github.ref_name }}
@@ -38,6 +67,27 @@ jobs:
           done
           cd .tmp/release
           sha256sum ./*.tar.gz > checksums.txt
+      - name: Verify release archives
+        env:
+          VERSION: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          cd .tmp/release
+          sha256sum --check checksums.txt
+          for archive in ./*.tar.gz; do
+            test "$(tar -tzf "$archive")" = "ats"
+          done
+          mkdir smoke
+          tar -C smoke -xzf "ats_${VERSION}_linux_amd64.tar.gz"
+          output=$(./smoke/ats version)
+          case "$output" in
+            *"ats ${VERSION}"*"commit ${COMMIT}"*) ;;
+            *)
+              echo "::error::Unexpected version output: $output"
+              exit 1
+              ;;
+          esac
       - name: Publish GitHub release
         env:
           GH_TOKEN: ${{ github.token }}

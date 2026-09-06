@@ -31,7 +31,7 @@ jobs:
         run: |
           total=$(go tool cover -func=.tmp/coverage.out | awk '/^total:/ {gsub("%", "", $3); print $3}')
           echo "Total Go coverage: ${total}%"
-          awk -v total="$total" 'BEGIN { if (total + 0 < 74.0) exit 1 }'
+          awk -v total="$total" 'BEGIN { if (total + 0 < 78.0) exit 1 }'
       - name: Upload coverage to Codecov
         uses: codecov/codecov-action@v7
         with:
@@ -54,7 +54,8 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
-      - run: go test -race ./...
+      - run: go mod verify
+      - run: go test -race ./... -timeout=15m
       - run: go vet ./...
       - name: Check formatting
         run: test -z "$(gofmt -l cmd internal)"

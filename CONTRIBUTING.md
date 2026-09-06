@@ -14,6 +14,7 @@ AiTodos 使用 `main` 作为稳定分支。初始发布完成后，所有公共�
 
 ```sh
 go test ./...
+go mod verify
 go vet ./...
 test -z "$(gofmt -l cmd internal)"
 mkdir -p .tmp && go build -o .tmp/ats ./cmd/ats
